@@ -167,6 +167,9 @@ func TestWindowsNativeChangeModePreservesDriverStateAndUsesExactFlags(t *testing
 			if api.changedMode.DmPosition != (pointL{X: 123, Y: 456}) || api.changedMode.DmDisplayFlags != 77 {
 				t.Fatalf("driver state was not preserved: %#v", api.changedMode)
 			}
+			if want := uint16(unsafe.Sizeof(devMode{})); api.changedMode.DmSize != want {
+				t.Fatalf("ChangeDisplaySettingsExW DEVMODEW.dmSize=%d, want %d", api.changedMode.DmSize, want)
+			}
 		})
 	}
 }

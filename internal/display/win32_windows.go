@@ -152,6 +152,9 @@ func (n *windowsNative) changeMode(deviceName string, mode domain.Mode, test boo
 	if test {
 		flags = cdsTest
 	}
+	// Re-assert dmSize from the struct's own size rather than trust that GDI
+	// left EnumDisplaySettingsW's caller-supplied buffer size intact.
+	dm.DmSize = uint16(unsafe.Sizeof(dm))
 	result := n.api.changeDisplaySettingsEx(deviceNamePtr, &dm, flags)
 	if result != dispChangeSuccessful {
 		return fmt.Errorf("ChangeDisplaySettingsExW(%s): %s", deviceName, describeResult(result))
