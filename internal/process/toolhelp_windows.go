@@ -3,7 +3,6 @@ package process
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -35,7 +34,7 @@ func (c *toolhelpChecker) Running(target string) (bool, error) {
 		return false, fmt.Errorf("Process32First: %w", err)
 	}
 	for {
-		if strings.EqualFold(windows.UTF16ToString(entry.ExeFile[:]), target) {
+		if matchesExecutable(windows.UTF16ToString(entry.ExeFile[:]), target) {
 			return true, nil
 		}
 		err := windows.Process32Next(snapshot, &entry)

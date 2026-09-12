@@ -7,11 +7,10 @@ type Checker interface {
 	Running(executableName string) (bool, error)
 }
 
-func containsExecutable(names []string, target string) bool {
-	for _, name := range names {
-		if strings.EqualFold(name, target) {
-			return true
-		}
-	}
-	return false
+// matchesExecutable reports whether one process-snapshot entry names the watched
+// executable. The comparison is exact and case-insensitive: Windows process names
+// are case-insensitive, and a prefix or substring match would also fire on
+// unrelated Riot executables.
+func matchesExecutable(name, target string) bool {
+	return strings.EqualFold(name, target)
 }

@@ -15,6 +15,9 @@ type fakeWin32 struct {
 	current            devMode
 	displayDeviceSizes []uint32
 	enumSettingsCalls  int
+	enumSettingsDevice string
+	enumSettingsMode   uint32
+	enumSettingsSizes  []uint16
 	changeDevice       string
 	changedMode        devMode
 	changeFlags        uint32
@@ -41,8 +44,11 @@ func (f *fakeWin32) enumDisplayDevices(
 	return true, nil
 }
 
-func (f *fakeWin32) enumDisplaySettings(_ *uint16, _ uint32, mode *devMode) (bool, error) {
+func (f *fakeWin32) enumDisplaySettings(deviceName *uint16, modeNumber uint32, mode *devMode) (bool, error) {
 	f.enumSettingsCalls++
+	f.enumSettingsDevice = windows.UTF16PtrToString(deviceName)
+	f.enumSettingsMode = modeNumber
+	f.enumSettingsSizes = append(f.enumSettingsSizes, mode.DmSize)
 	*mode = f.current
 	return true, nil
 }
@@ -160,6 +166,45 @@ func TestWindowsNativeChangeModePreservesDriverStateAndUsesExactFlags(t *testing
 			}
 			if api.changedMode.DmPosition != (pointL{X: 123, Y: 456}) || api.changedMode.DmDisplayFlags != 77 {
 				t.Fatalf("driver state was not preserved: %#v", api.changedMode)
+			}
+		})
+	}
+}
+
+// Both Win32 read paths must name the resolved device, ask for the live mode with
+// ENUM_CURRENT_SETTINGS, and declare the DEVMODEW buffer size before the call.
+// Getting any of the three wrong would read another display or a short buffer.
+func TestWindowsNativeEnumUsesResolvedDeviceCurrentSettingsAndBufferSize(t *testing.T) {
+	const device = `\.\DISPLAY4`
+	gameMode := domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
+
+	for name, read := range map[string]func(*windowsNative) error{
+		"currentMode": func(n *windowsNative) error {
+			_, err := n.currentMode(device)
+			return err
+		},
+		"changeMode": func(n *windowsNative) error {
+			return n.changeMode(device, gameMode, true)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeWin32{}
+			if err := read(&windowsNative{api: api}); err != nil {
+				t.Fatal(err)
+			}
+			if api.enumSettingsCalls != 1 {
+				t.Fatalf("EnumDisplaySettingsW calls=%d", api.enumSettingsCalls)
+			}
+			if api.enumSettingsDevice != device {
+				t.Errorf("lpszDeviceName=%q, want %q", api.enumSettingsDevice, device)
+			}
+			if api.enumSettingsMode != enumCurrentSettings {
+				t.Errorf("iModeNum=%#x, want ENUM_CURRENT_SETTINGS (%#x)",
+					api.enumSettingsMode, enumCurrentSettings)
+			}
+			want := uint16(unsafe.Sizeof(devMode{}))
+			if len(api.enumSettingsSizes) != 1 || api.enumSettingsSizes[0] != want {
+				t.Errorf("input DEVMODEW.dmSize=%v, want [%d]", api.enumSettingsSizes, want)
 			}
 		})
 	}

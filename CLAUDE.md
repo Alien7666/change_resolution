@@ -64,4 +64,6 @@ Remove-Item Env:RUN_DISPLAY_INTEGRATION
 
 ## Legacy Python scripts
 
-`res.py`, `res-auto.py`, `res-2k.py` and their `.spec`/`build`/`dist` artifacts are the pre-refactor implementation. They are superseded by the Go tool above and are scheduled for deletion in plan Task 7 once the Go replacement passes tests and builds — do not extend them.
+The pre-refactor Python/PyInstaller implementation is gone: `res.py`, `res-auto.py`, their `.spec` files and the committed `build/`/`dist/` artifacts were deleted in plan Task 7, and `build/`/`dist/` are now ignored. Do not reintroduce them.
+
+`res-2k.py` and `res-2k.spec` may still exist in the working tree as the user's own untracked local files. They are not part of this project — do not extend, build, or delete them.

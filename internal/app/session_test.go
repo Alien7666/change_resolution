@@ -461,3 +461,91 @@ func TestRefreshKeepsTargetNotFoundSentinelInSnapshotErr(t *testing.T) {
 		t.Fatalf("snapshot = %+v, Err lost display.ErrTargetNotFound", got)
 	}
 }
+
+// The delayed restore is the only display change the user never triggers directly,
+// so it must run once, no earlier than the profile delay, and with the saved mode.
+func TestGameExitRestoresSavedModeAfterDelay(t *testing.T) {
+	f := newFixture(t)
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.display.takeCalls()
+
+	if got := f.poll(t, 0, 1, processResult{running: true}); got.State != StateGameRunning {
+		t.Fatalf("running snapshot = %+v", got)
+	}
+	for _, second := range []int{2, 3, 4} {
+		if got := f.poll(t, 0, second, processResult{}); got.State != StateRestorePending {
+			t.Fatalf("at %ds: snapshot = %+v", second, got)
+		}
+	}
+	if calls := f.display.takeCalls(); len(calls) != 0 {
+		t.Fatalf("display changed before the delay elapsed: %+v", calls)
+	}
+
+	got := f.poll(t, 0, 5, processResult{})
+	calls := f.display.takeCalls()
+	assertOperations(t, calls, "resolve", "test", "apply")
+	if calls[1].mode != f.original || calls[2].mode != f.original {
+		t.Fatalf("automatic restore used the wrong mode: %+v", calls)
+	}
+	if got.Managed || got.FourByThree || got.CurrentMode != f.original || got.State != StateNative {
+		t.Fatalf("restored snapshot = %+v", got)
+	}
+	if !f.clock.tickers[0].isStopped() {
+		t.Fatal("watcher kept running after the automatic restore")
+	}
+}
+
+// A game that reappears inside the restore window cancels the pending restore and
+// restarts the delay from the new absence.
+func TestGameReturningDuringRestoreWindowCancelsRestore(t *testing.T) {
+	f := newFixture(t)
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.display.takeCalls()
+
+	f.poll(t, 0, 1, processResult{running: true})
+	f.poll(t, 0, 2, processResult{})
+	if got := f.poll(t, 0, 3, processResult{running: true}); got.State != StateGameRunning {
+		t.Fatalf("returning game snapshot = %+v", got)
+	}
+	// The original deadline was 5s; nothing may restore at or after it.
+	for _, second := range []int{4, 5, 6} {
+		if got := f.poll(t, 0, second, processResult{}); got.State != StateRestorePending {
+			t.Fatalf("at %ds: snapshot = %+v", second, got)
+		}
+	}
+	if calls := f.display.takeCalls(); len(calls) != 0 {
+		t.Fatalf("cancelled restore still changed the display: %+v", calls)
+	}
+
+	got := f.poll(t, 0, 7, processResult{})
+	assertOperations(t, f.display.takeCalls(), "resolve", "test", "apply")
+	if got.Managed || got.CurrentMode != f.original || got.State != StateNative {
+		t.Fatalf("restored snapshot = %+v", got)
+	}
+}
+
+// 4:3 stays applied for as long as the game never shows up: the watcher only ever
+// arms a restore after it has seen the process at least once.
+func TestGameNeverAppearingLeavesModeUnchanged(t *testing.T) {
+	f := newFixture(t)
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.display.takeCalls()
+
+	for _, second := range []int{1, 2, 3, 4, 5, 10, 100} {
+		if got := f.poll(t, 0, second, processResult{}); got.State != StateWaitingForGame {
+			t.Fatalf("at %ds: snapshot = %+v", second, got)
+		}
+	}
+	if calls := f.display.takeCalls(); len(calls) != 0 {
+		t.Fatalf("unseen game triggered a display change: %+v", calls)
+	}
+	if got := f.s.Snapshot(); !got.Managed || !got.FourByThree {
+		t.Fatalf("snapshot = %+v", got)
+	}
+}
