@@ -2,11 +2,13 @@ package app
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Alien7666/change_resolution/internal/display"
 	"github.com/Alien7666/change_resolution/internal/domain"
 )
 
@@ -425,5 +427,37 @@ func TestManualDisableFreshReadsInsteadOfTrustingStaleSnapshot(t *testing.T) {
 	assertOperations(t, f.display.takeCalls(), "resolve", "current")
 	if f.s.Snapshot().FourByThree {
 		t.Fatal("stale observed mode retained")
+	}
+}
+
+// The UI disables the 4:3 control by testing Snapshot.Err with errors.Is, so every
+// wrapper between display.Controller and Snapshot.Err must preserve the sentinel.
+func TestEnableKeepsUnsupportedModeSentinelInSnapshotErr(t *testing.T) {
+	f := newFixture(t)
+	rejection := fmt.Errorf("%w: ChangeDisplaySettingsExW: display mode is not supported",
+		display.ErrModeNotSupported)
+	f.display.setFailure("test", rejection)
+
+	err := f.s.Enable()
+	if !errors.Is(err, display.ErrModeNotSupported) {
+		t.Fatalf("Enable error = %v, lost display.ErrModeNotSupported", err)
+	}
+	got := f.s.Snapshot()
+	if got.State != StateError || !errors.Is(got.Err, display.ErrModeNotSupported) {
+		t.Fatalf("snapshot = %+v, Err lost display.ErrModeNotSupported", got)
+	}
+	if got.Managed || got.FourByThree {
+		t.Fatalf("snapshot = %+v", got)
+	}
+}
+
+// Resolve failures must keep reaching the UI as display.ErrTargetNotFound.
+func TestRefreshKeepsTargetNotFoundSentinelInSnapshotErr(t *testing.T) {
+	f := newFixture(t)
+	f.display.setFailure("resolve", fmt.Errorf("%w: %s", display.ErrTargetNotFound, f.profile.MonitorHardwareID))
+
+	got := f.s.Refresh()
+	if got.State != StateError || !errors.Is(got.Err, display.ErrTargetNotFound) {
+		t.Fatalf("snapshot = %+v, Err lost display.ErrTargetNotFound", got)
 	}
 }

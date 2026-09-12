@@ -99,3 +99,40 @@ func TestTestAndApplyUseOnlyResolvedDevice(t *testing.T) {
 		}
 	}
 }
+
+func TestTestModeWrapsPreflightRejectionWithSentinel(t *testing.T) {
+	rejection := errors.New(`ChangeDisplaySettingsExW(\.\DISPLAY1): display mode is not supported`)
+	api := &fakeNative{changeErr: rejection}
+	c := newController(api)
+	target := domain.Target{DeviceName: `\.\DISPLAY1`, HardwareID: `MONITOR\XMI27B2\0009`}
+	mode := domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
+
+	err := c.TestMode(target, mode)
+	if !errors.Is(err, ErrModeNotSupported) {
+		t.Fatalf("err=%v does not wrap ErrModeNotSupported", err)
+	}
+	if !errors.Is(err, rejection) {
+		t.Fatalf("err=%v lost the underlying Win32 diagnostic", err)
+	}
+	if len(api.changes) != 1 || !api.changes[0].test {
+		t.Fatalf("changes=%#v", api.changes)
+	}
+}
+
+// A failed apply must stay distinguishable from an unsupported mode: only the
+// pre-flight rejection disables the 4:3 control, a one-off apply failure is retryable.
+func TestApplyModeFailureIsNotReportedAsUnsupportedMode(t *testing.T) {
+	failure := errors.New("driver failed the display mode change")
+	api := &fakeNative{changeErr: failure}
+	c := newController(api)
+	target := domain.Target{DeviceName: `\.\DISPLAY1`, HardwareID: `MONITOR\XMI27B2\0009`}
+	mode := domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
+
+	err := c.ApplyMode(target, mode)
+	if !errors.Is(err, failure) {
+		t.Fatalf("err=%v", err)
+	}
+	if errors.Is(err, ErrModeNotSupported) {
+		t.Fatalf("apply failure reported as unsupported mode: %v", err)
+	}
+}

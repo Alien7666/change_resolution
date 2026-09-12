@@ -39,12 +39,6 @@ const (
 	windowHeight = 240
 )
 
-// testModeFailurePrefix mirrors the operation label app.Session attaches when the
-// pre-flight CDS_TEST rejects the profile 4:3 mode. It is the only signal the UI
-// receives that the target mode itself is unsupported rather than an apply that
-// merely failed once, so it decides whether the 4:3 toggle stays disabled.
-const testModeFailurePrefix = "test display mode: "
-
 // window owns every Walk object. All of its fields are read and written on the
 // Walk UI thread only.
 type window struct {
@@ -350,7 +344,7 @@ func (w *window) updateAvailability(snapshot app.Snapshot) {
 	switch {
 	case errors.Is(snapshot.Err, display.ErrTargetNotFound):
 		w.unavailableReason = "找不到 " + monitorName + "，已停用 4:3 切換。"
-	case snapshot.Err != nil && strings.HasPrefix(snapshot.Err.Error(), testModeFailurePrefix):
+	case errors.Is(snapshot.Err, display.ErrModeNotSupported):
 		w.unavailableReason = "顯示器不支援 1920×1440 @ 180 Hz，已停用 4:3 切換。"
 	case snapshot.Err == nil && snapshot.Target.DeviceName != "":
 		w.unavailableReason = ""
