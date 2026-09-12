@@ -1,0 +1,5 @@
+.tools/
+.venv/
+*.syso
+dist/
+build/
