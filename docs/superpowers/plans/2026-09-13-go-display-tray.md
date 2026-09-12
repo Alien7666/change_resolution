@@ -58,7 +58,7 @@
 **Interfaces:**
 - Produces: `domain.Mode`, `domain.Target`, `domain.Profile`, `domain.DefaultProfile()`.
 
-- [ ] **Step 1: Install and verify the Go toolchain**
+- [x] **Step 1: Install and verify the Go toolchain**
 
 Run:
 
@@ -69,7 +69,7 @@ winget install --exact --id GoLang.Go --version 1.27.1 --accept-source-agreement
 
 Expected: `go version go1.27.1 windows/amd64`. If `winget` reports the package is already installed, use the existing Go 1.27.x executable.
 
-- [ ] **Step 2: Initialize the module and ignore generated content**
+- [x] **Step 2: Initialize the module and ignore generated content**
 
 Create `go.mod`:
 
@@ -89,7 +89,7 @@ dist/
 build/
 ```
 
-- [ ] **Step 3: Write the failing profile test**
+- [x] **Step 3: Write the failing profile test**
 
 Create `internal/domain/profile_test.go`:
 
@@ -115,13 +115,13 @@ func TestDefaultProfile(t *testing.T) {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it fails**
+- [x] **Step 4: Run the test to verify it fails**
 
 Run: `go test ./internal/domain`
 
 Expected: FAIL because `DefaultProfile`, `Mode`, and `Profile` do not exist.
 
-- [ ] **Step 5: Implement the profile types**
+- [x] **Step 5: Implement the profile types**
 
 Create `internal/domain/profile.go`:
 
@@ -163,7 +163,7 @@ func DefaultProfile() Profile {
 }
 ```
 
-- [ ] **Step 6: Verify and commit the bootstrap**
+- [x] **Step 6: Verify and commit the bootstrap**
 
 Run:
 
@@ -191,7 +191,7 @@ Expected: tests PASS and the commit contains only module/profile bootstrap files
 - Consumes: `domain.Mode`, `domain.Target`.
 - Produces: `display.Controller` with `ResolveTarget`, `CurrentMode`, `TestMode`, and `ApplyMode`; `display.NewWindowsController()`.
 
-- [ ] **Step 1: Add Windows dependencies**
+- [x] **Step 1: Add Windows dependencies**
 
 Run:
 
@@ -203,7 +203,7 @@ go mod tidy
 
 Expected: `go.mod` and `go.sum` pin `github.com/lxn/win` and `golang.org/x/sys`.
 
-- [ ] **Step 2: Write failing controller tests**
+- [x] **Step 2: Write failing controller tests**
 
 Create `internal/display/controller_test.go` with a fake native adapter and these exact cases:
 
@@ -246,13 +246,13 @@ func TestTestAndApplyUseOnlyResolvedDevice(t *testing.T) {
 
 Define `fakeNative`, `nativeChange`, and the `nativeAPI` methods in the same test file so no production test hook is exported.
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `go test ./internal/display`
 
 Expected: FAIL because `newController`, `ResolveTarget`, `TestMode`, and `ApplyMode` do not exist.
 
-- [ ] **Step 4: Implement the controller boundary**
+- [x] **Step 4: Implement the controller boundary**
 
 Create `internal/display/controller.go` with these public contracts:
 
@@ -310,7 +310,7 @@ func (c *controller) ApplyMode(target domain.Target, mode domain.Mode) error {
 }
 ```
 
-- [ ] **Step 5: Implement the Windows adapter**
+- [x] **Step 5: Implement the Windows adapter**
 
 Create `internal/display/win32_windows.go`. Use `win.EnumDisplayDevices` twice: first for attached desktop adapters, then for their monitor device. Convert UTF-16 fields with `windows.UTF16ToString`. Use `win.EnumDisplaySettings` with `ENUM_CURRENT_SETTINGS` for the current mode. For changes, copy the current `win.DEVMODE`, set `DmPelsWidth`, `DmPelsHeight`, `DmDisplayFrequency`, `DmBitsPerPel`, and set exactly these field flags:
 
@@ -329,7 +329,7 @@ if result != win.DISP_CHANGE_SUCCESSFUL {
 
 Do not set `DM_POSITION`, `CDS_SET_PRIMARY`, or `CDS_UPDATEREGISTRY`. Implement `describeResult` for all documented `DISP_CHANGE_*` values so errors remain actionable without exposing sensitive data.
 
-- [ ] **Step 6: Add a safe opt-in integration test**
+- [x] **Step 6: Add a safe opt-in integration test**
 
 Create `internal/display/integration_windows_test.go`:
 
@@ -355,7 +355,7 @@ func TestWindowsControllerCanTestMiMonitorMode(t *testing.T) {
 
 This test must use `CDS_TEST` only and must not change the display.
 
-- [ ] **Step 7: Verify and commit display control**
+- [x] **Step 7: Verify and commit display control**
 
 Run:
 
@@ -380,7 +380,7 @@ Expected: unit and safe integration tests PASS; all display changes target the d
 **Interfaces:**
 - Produces: `process.Checker` with `Running(executableName string) (bool, error)` and `process.NewToolhelpChecker()`.
 
-- [ ] **Step 1: Write the failing name-matching tests**
+- [x] **Step 1: Write the failing name-matching tests**
 
 Create `internal/process/checker_test.go`:
 
@@ -396,13 +396,13 @@ func TestContainsExecutableUsesExactCaseInsensitiveName(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `go test ./internal/process`
 
 Expected: FAIL because `containsExecutable` does not exist.
 
-- [ ] **Step 3: Implement the interface and pure matcher**
+- [x] **Step 3: Implement the interface and pure matcher**
 
 Create `internal/process/checker.go`:
 
@@ -423,7 +423,7 @@ func containsExecutable(names []string, target string) bool {
 }
 ```
 
-- [ ] **Step 4: Implement Toolhelp enumeration**
+- [x] **Step 4: Implement Toolhelp enumeration**
 
 Create `internal/process/toolhelp_windows.go` using only:
 
@@ -436,7 +436,7 @@ entry.Size = uint32(unsafe.Sizeof(entry))
 
 Iterate with `windows.Process32First` and `windows.Process32Next`, convert `entry.ExeFile[:]` using `windows.UTF16ToString`, and compare with `strings.EqualFold`. Do not call `OpenProcess`, query modules, read memory, enumerate windows, or inspect command lines.
 
-- [ ] **Step 5: Verify and commit process observation**
+- [x] **Step 5: Verify and commit process observation**
 
 Run:
 
@@ -462,7 +462,7 @@ Expected: tests PASS and production code contains no `OpenProcess` call.
 - Consumes: `domain.Profile`, `display.Controller`, `process.Checker`.
 - Produces: `app.Session`, `app.State`, `app.Snapshot`, `Enable`, `Disable`, `Shutdown`, `Refresh`, and `SetOnChange`.
 
-- [ ] **Step 1: Write failing tracker tests**
+- [x] **Step 1: Write failing tracker tests**
 
 Create `internal/app/tracker_test.go` and cover these exact transitions:
 
@@ -474,13 +474,13 @@ func TestTrackerNeverRestoresWhenGameWasNeverSeen(t *testing.T)
 
 Use a fixed `time.Unix(100, 0)`, feed `Observe(false, now)`, `Observe(true, now)`, then absent observations at `now.Add(2*time.Second)` and `now.Add(3*time.Second)`. Assert `ShouldRestore` is true only for the final observation.
 
-- [ ] **Step 2: Run tracker tests to verify they fail**
+- [x] **Step 2: Run tracker tests to verify they fail**
 
 Run: `go test ./internal/app -run Tracker`
 
 Expected: FAIL because `gameTracker` and `Observe` do not exist.
 
-- [ ] **Step 3: Implement the pure tracker**
+- [x] **Step 3: Implement the pure tracker**
 
 Create `internal/app/tracker.go`:
 
@@ -516,7 +516,7 @@ func (t *gameTracker) Observe(running bool, now time.Time) trackerResult {
 }
 ```
 
-- [ ] **Step 4: Write failing session tests**
+- [x] **Step 4: Write failing session tests**
 
 Create fake display and checker implementations in `internal/app/session_test.go`. Test:
 
@@ -531,13 +531,13 @@ func TestDisableUsesFallbackWhenAppStartsInUnmanagedFourByThreeMode(t *testing.T
 
 Assert the fake display call order is exactly `resolve`, `current`, `test`, `apply`; assert restore applies the captured mode rather than the hard-coded fallback.
 
-- [ ] **Step 5: Run session tests to verify they fail**
+- [x] **Step 5: Run session tests to verify they fail**
 
 Run: `go test ./internal/app -run 'Enable|Disable|Shutdown|Manual'`
 
 Expected: FAIL because `Session` does not exist.
 
-- [ ] **Step 6: Implement the serialized session**
+- [x] **Step 6: Implement the serialized session**
 
 Create `internal/app/session.go` with these contracts:
 
