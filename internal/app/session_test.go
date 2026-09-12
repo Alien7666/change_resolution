@@ -225,14 +225,20 @@ func (f *sessionFixture) waitSnapshot(t *testing.T, predicate func(Snapshot) boo
 	}
 }
 
-func (f *sessionFixture) poll(t *testing.T, index int, seconds int, result processResult) Snapshot {
+// tick drives one poll of the watcher at index and answers its process check.
+func (f *sessionFixture) tick(t *testing.T, index int, seconds int, result processResult) {
 	t.Helper()
-	previous := f.s.Snapshot().Revision
 	f.clock.tick(index, time.Unix(100+int64(seconds), 0))
 	if name := waitValue(t, f.checker.called); name != f.profile.ProcessName {
 		t.Fatalf("watched process = %q", name)
 	}
 	f.checker.results <- result
+}
+
+func (f *sessionFixture) poll(t *testing.T, index int, seconds int, result processResult) Snapshot {
+	t.Helper()
+	previous := f.s.Snapshot().Revision
+	f.tick(t, index, seconds, result)
 	return f.waitSnapshot(t, func(snapshot Snapshot) bool {
 		return snapshot.Revision > previous && snapshot.State != StateRestoring
 	})
@@ -373,7 +379,10 @@ func TestManualDisableWinsOverPendingAutomaticRestore(t *testing.T) {
 func TestDisableUsesFallbackWhenAppStartsInUnmanagedFourByThreeMode(t *testing.T) {
 	f := newFixture(t)
 	f.display.current = f.profile.GameMode
-	got := f.s.Refresh()
+	got, err := f.s.Refresh()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !got.FourByThree || got.Managed || f.clock.count() != 0 {
 		t.Fatalf("startup = %+v", got)
 	}
@@ -398,8 +407,8 @@ func TestDisableUsesFallbackWhenAppStartsInUnmanagedFourByThreeMode(t *testing.T
 func TestRefreshAndShutdownLeaveUnmanagedGameModeUntouched(t *testing.T) {
 	f := newFixture(t)
 	f.display.current = f.profile.GameMode
-	if got := f.s.Refresh(); !got.FourByThree || got.Managed {
-		t.Fatalf("snapshot = %+v", got)
+	if got, err := f.s.Refresh(); err != nil || !got.FourByThree || got.Managed {
+		t.Fatalf("snapshot = %+v, err = %v", got, err)
 	}
 	assertOperations(t, f.display.takeCalls(), "resolve", "current")
 	if err := f.s.Shutdown(); err != nil {
@@ -456,7 +465,10 @@ func TestRefreshKeepsTargetNotFoundSentinelInSnapshotErr(t *testing.T) {
 	f := newFixture(t)
 	f.display.setFailure("resolve", fmt.Errorf("%w: %s", display.ErrTargetNotFound, f.profile.MonitorHardwareID))
 
-	got := f.s.Refresh()
+	got, err := f.s.Refresh()
+	if !errors.Is(err, display.ErrTargetNotFound) {
+		t.Fatalf("Refresh error = %v, lost display.ErrTargetNotFound", err)
+	}
 	if got.State != StateError || !errors.Is(got.Err, display.ErrTargetNotFound) {
 		t.Fatalf("snapshot = %+v, Err lost display.ErrTargetNotFound", got)
 	}
@@ -547,5 +559,145 @@ func TestGameNeverAppearingLeavesModeUnchanged(t *testing.T) {
 	}
 	if got := f.s.Snapshot(); !got.Managed || !got.FourByThree {
 		t.Fatalf("snapshot = %+v", got)
+	}
+}
+
+// A restore the user asked for can fail transiently. Ownership survives, so the
+// poll loop has to survive with it: the user dismisses the dialog, keeps playing,
+// and the automatic restore is what finally puts the display back.
+func TestFailedManualRestoreKeepsTheWatcherRunning(t *testing.T) {
+	f := newFixture(t)
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.poll(t, 0, 1, processResult{running: true})
+
+	failure := errors.New("driver refused the mode change")
+	f.display.setFailure("apply", failure)
+	if err := f.s.Disable(); !errors.Is(err, failure) {
+		t.Fatalf("Disable error = %v", err)
+	}
+	got := f.s.Snapshot()
+	if !got.Managed || got.State != StateError {
+		t.Fatalf("failed restore dropped ownership: %+v", got)
+	}
+	if got.AutoRestoreFailures != 0 {
+		t.Fatalf("a restore the user triggered was counted as automatic: %+v", got)
+	}
+	if f.clock.count() != 2 {
+		t.Fatalf("watchers started = %d, want a replacement after the failed restore", f.clock.count())
+	}
+	if !f.clock.tickers[0].isStopped() {
+		t.Fatal("the superseded watcher was left running")
+	}
+
+	// The replacement watcher must still drive the automatic restore end to end.
+	f.display.setFailure("apply", nil)
+	f.display.takeCalls()
+	if got := f.poll(t, 1, 2, processResult{running: true}); got.State != StateGameRunning {
+		t.Fatalf("replacement watcher is not polling: %+v", got)
+	}
+	f.poll(t, 1, 3, processResult{})
+	f.poll(t, 1, 4, processResult{})
+
+	got = f.poll(t, 1, 6, processResult{})
+	calls := f.display.takeCalls()
+	assertOperations(t, calls, "resolve", "test", "apply")
+	if calls[2].mode != f.original {
+		t.Fatalf("automatic restore used the wrong mode: %+v", calls)
+	}
+	if got.Managed || got.FourByThree || got.CurrentMode != f.original || got.State != StateNative {
+		t.Fatalf("restored snapshot = %+v", got)
+	}
+}
+
+// Exit runs the same restore. Refusing to close on a failure is only safe if the
+// session the user keeps using is still watching the game.
+func TestFailedShutdownRestoreKeepsTheWatcherRunning(t *testing.T) {
+	f := newFixture(t)
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.poll(t, 0, 1, processResult{running: true})
+
+	failure := errors.New("driver refused the mode change")
+	f.display.setFailure("apply", failure)
+	if err := f.s.Shutdown(); !errors.Is(err, failure) {
+		t.Fatalf("Shutdown error = %v", err)
+	}
+	if got := f.s.Snapshot(); !got.Managed || got.AutoRestoreFailures != 0 {
+		t.Fatalf("snapshot = %+v", got)
+	}
+	if f.clock.count() != 2 {
+		t.Fatalf("watchers started = %d, want a replacement after the failed restore", f.clock.count())
+	}
+	if !f.clock.tickers[0].isStopped() {
+		t.Fatal("the superseded watcher was left running")
+	}
+	if got := f.poll(t, 1, 2, processResult{running: true}); got.State != StateGameRunning {
+		t.Fatalf("replacement watcher is not polling: %+v", got)
+	}
+
+	f.display.setFailure("apply", nil)
+	f.display.takeCalls()
+	if err := f.s.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	assertOperations(t, f.display.takeCalls(), "resolve", "test", "apply")
+}
+
+// Nothing prompts the user when the delayed restore fails, so the session records
+// the failure for the UI to announce. It must count one failure per restore, not
+// one per poll, and it must keep watching so a later game exit can try again.
+func TestFailedAutomaticRestoreIsCountedOnceAndKeepsTheWatcherRunning(t *testing.T) {
+	f := newFixture(t)
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.poll(t, 0, 1, processResult{running: true})
+	f.poll(t, 0, 2, processResult{})
+
+	failure := errors.New("driver refused the mode change")
+	f.display.setFailure("apply", failure)
+	f.display.takeCalls()
+
+	f.tick(t, 0, 5, processResult{})
+	got := f.waitSnapshot(t, func(snapshot Snapshot) bool { return snapshot.AutoRestoreFailures > 0 })
+	if got.AutoRestoreFailures != 1 {
+		t.Fatalf("failures = %d, want exactly one", got.AutoRestoreFailures)
+	}
+	if got.State != StateError || !errors.Is(got.Err, failure) {
+		t.Fatalf("snapshot = %+v", got)
+	}
+	if !got.Managed {
+		t.Fatalf("failed automatic restore dropped ownership: %+v", got)
+	}
+	assertOperations(t, f.display.takeCalls(), "resolve", "test", "apply")
+	if f.clock.count() != 2 {
+		t.Fatalf("watchers started = %d, want a replacement after the failed restore", f.clock.count())
+	}
+
+	// The game is still gone. Polling it must not retry the restore, or the UI
+	// would raise one notification per second.
+	for _, second := range []int{6, 7, 8} {
+		if got := f.poll(t, 1, second, processResult{}); got.State != StateWaitingForGame {
+			t.Fatalf("at %ds: snapshot = %+v", second, got)
+		}
+	}
+	if calls := f.display.takeCalls(); len(calls) != 0 {
+		t.Fatalf("the replacement watcher retried the restore on every poll: %+v", calls)
+	}
+	if got := f.s.Snapshot(); got.AutoRestoreFailures != 1 {
+		t.Fatalf("failures = %d, want one notification per failed restore", got.AutoRestoreFailures)
+	}
+
+	// A later game exit restores through the replacement watcher.
+	f.display.setFailure("apply", nil)
+	f.poll(t, 1, 9, processResult{running: true})
+	f.poll(t, 1, 10, processResult{})
+	got = f.poll(t, 1, 13, processResult{})
+	assertOperations(t, f.display.takeCalls(), "resolve", "test", "apply")
+	if got.Managed || got.CurrentMode != f.original || got.State != StateNative {
+		t.Fatalf("restored snapshot = %+v", got)
 	}
 }

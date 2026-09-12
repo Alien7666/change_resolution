@@ -35,6 +35,12 @@ type Snapshot struct {
 	Revision    uint64
 	Message     string
 	Err         error
+
+	// AutoRestoreFailures counts the restores this session started by itself and
+	// could not complete. Nothing prompts the user on that path, so the UI tracks
+	// the counter to raise exactly one notification per failed automatic restore
+	// instead of one per poll.
+	AutoRestoreFailures uint64
 }
 
 type sessionTicker interface {
@@ -200,17 +206,22 @@ func (s *Session) readCurrent() (domain.Target, domain.Mode, error) {
 	return target, mode, nil
 }
 
-func (s *Session) Refresh() Snapshot {
+// Refresh re-reads the target monitor and its current mode without changing it.
+// It stays useful when every mutating control is disabled: a monitor that was
+// asleep or on another input at startup is only noticed by reading again. The
+// returned error describes this read alone, while Snapshot.Err may still carry an
+// earlier failure that is still true, such as a restore that did not complete.
+func (s *Session) Refresh() (Snapshot, error) {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	if s.closed {
-		return s.Snapshot()
+		return s.Snapshot(), ErrClosed
 	}
 	_, _, err := s.readCurrent()
 	if err == nil && !s.managed {
 		s.state(StateNative, "已讀取目前顯示模式")
 	}
-	return s.Snapshot()
+	return s.Snapshot(), err
 }
 
 func (s *Session) Enable() error {
@@ -271,6 +282,19 @@ func joinWatcher(watcher *sessionWatcher) {
 	}
 }
 
+// ensureWatcher puts the poll loop back after a restore failed while this session
+// still owns the applied mode: the automatic restore is then the only thing left
+// that can return the display without another click. Callers hold opMu, and the
+// replacement starts from a fresh tracker on purpose — a tracker that already
+// fired its restore would never arm another one. A watcher goroutine may call
+// this: it replaces itself and must not join the watcher it stopped.
+func (s *Session) ensureWatcher() {
+	if s.closed || !s.managed || s.watcher != nil {
+		return
+	}
+	s.startWatcher()
+}
+
 func (s *Session) Disable() error {
 	s.opMu.Lock()
 	if s.closed {
@@ -279,6 +303,7 @@ func (s *Session) Disable() error {
 	}
 	watcher := s.stopWatcher()
 	err := s.restore(true)
+	s.ensureWatcher()
 	s.opMu.Unlock()
 	joinWatcher(watcher)
 	return err
@@ -337,6 +362,7 @@ func (s *Session) Shutdown() error {
 	}
 	watcher := s.stopWatcher()
 	if err := s.restore(false); err != nil {
+		s.ensureWatcher()
 		s.opMu.Unlock()
 		joinWatcher(watcher)
 		return err
@@ -398,7 +424,14 @@ func (s *Session) observeGame(generation uint64, tracker *gameTracker, running b
 	if result.ShouldRestore {
 		s.stopWatcher()
 		// This goroutine must not join itself; it exits immediately after restoration.
-		s.restore(false)
+		// A failure keeps ownership, so a replacement watcher takes over the polling
+		// and the counter tells the UI to announce this one failure.
+		if err := s.restore(false); err != nil {
+			// The replacement watcher is in place before the counter is published, so
+			// an observer that reacts to the failure already sees a watched session.
+			s.ensureWatcher()
+			s.updateSnapshot(func(snapshot *Snapshot) { snapshot.AutoRestoreFailures++ })
+		}
 		return false
 	}
 	switch {

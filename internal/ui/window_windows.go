@@ -25,15 +25,19 @@ const (
 	toggleText  = "使用 4:3（1920×1440 @ 180 Hz）"
 	hideText    = "隱藏至系統匣"
 	restoreText = "恢復 2K"
+	refreshText = "重新整理"
 
 	trayShowText    = "顯示主視窗"
 	trayEnableText  = "使用 4:3"
 	trayRestoreText = "恢復原始解析度"
+	trayRefreshText = "重新整理狀態"
 	trayExitText    = "結束"
 
-	enableOperation   = "啟用 4:3"
-	restoreOperation  = "恢復顯示模式"
-	shutdownOperation = "結束前恢復顯示模式"
+	enableOperation      = "啟用 4:3"
+	restoreOperation     = "恢復顯示模式"
+	refreshOperation     = "重新整理顯示狀態"
+	autoRestoreOperation = "自動恢復顯示模式"
+	shutdownOperation    = "結束前恢復顯示模式"
 
 	windowWidth  = 420
 	windowHeight = 240
@@ -51,17 +55,23 @@ type window struct {
 	modeLabel     *walk.Label
 	toggle        *walk.CheckBox
 	statusLabel   *walk.TextLabel
+	refreshButton *walk.PushButton
 	hideButton    *walk.PushButton
 	restoreButton *walk.PushButton
 
 	showAction    *walk.Action
 	enableAction  *walk.Action
 	restoreAction *walk.Action
+	refreshAction *walk.Action
 	exitAction    *walk.Action
 
 	busy              bool
 	suppressToggle    bool
 	unavailableReason string
+
+	// reportedAutoRestoreFailures is the highest Snapshot.AutoRestoreFailures this
+	// window has already announced.
+	reportedAutoRestoreFailures uint64
 }
 
 // Run builds the main window plus the notification-area icon and blocks on the
@@ -89,7 +99,9 @@ func Run(session *app.Session) error {
 	// Startup is read-only. Refresh talks to Win32, so it runs off the UI thread
 	// and only reports what it found; it never changes a display mode.
 	go func() {
-		snapshot := session.Refresh()
+		// A failed startup probe needs no dialog: it is rendered into the status
+		// label, and the refresh command stays live so the user can read again.
+		snapshot, _ := session.Refresh()
 		w.mw.Synchronize(func() { w.render(snapshot) })
 	}()
 
@@ -130,6 +142,7 @@ func (w *window) buildMainWindow() error {
 				Layout: dec.HBox{MarginsZero: true, Spacing: 8},
 				Children: []dec.Widget{
 					dec.HSpacer{},
+					dec.PushButton{AssignTo: &w.refreshButton, Text: refreshText, OnClicked: w.onRefresh},
 					dec.PushButton{AssignTo: &w.hideButton, Text: hideText, OnClicked: w.onHide},
 					dec.PushButton{AssignTo: &w.restoreButton, Text: restoreText, OnClicked: w.onRestore},
 				},
@@ -187,6 +200,9 @@ func (w *window) buildTray() error {
 	if w.restoreAction, err = newAction(trayRestoreText, w.onRestore); err != nil {
 		return err
 	}
+	if w.refreshAction, err = newAction(trayRefreshText, w.onRefresh); err != nil {
+		return err
+	}
 	if w.exitAction, err = newAction(trayExitText, w.onExit); err != nil {
 		return err
 	}
@@ -196,6 +212,7 @@ func (w *window) buildTray() error {
 		w.showAction,
 		w.enableAction,
 		w.restoreAction,
+		w.refreshAction,
 		walk.NewSeparatorAction(),
 		w.exitAction,
 	}
@@ -239,8 +256,18 @@ func (w *window) onToggled() {
 
 func (w *window) onEnable()  { w.runOperation(enableOperation, w.session.Enable) }
 func (w *window) onRestore() { w.runOperation(restoreOperation, w.session.Disable) }
+func (w *window) onRefresh() { w.runOperation(refreshOperation, w.refresh) }
 func (w *window) onHide()    { w.hideToTray() }
 func (w *window) onShow()    { w.showMainWindow() }
+
+// refresh re-reads the display state through the session. It is the way out of
+// the unavailable latch: a monitor that was asleep or on another input when the
+// tool started leaves every mutating control disabled, and only a fresh read can
+// tell the window that the monitor came back.
+func (w *window) refresh() error {
+	_, err := w.session.Refresh()
+	return err
+}
 
 // onExit restores any mode this run applied before the process ends. A failed
 // restore keeps the application alive so the user can retry instead of silently
@@ -336,6 +363,26 @@ func (w *window) render(snapshot app.Snapshot) {
 		w.setToggleChecked(snapshot.FourByThree)
 	}
 	w.applyEnabled(snapshot)
+
+	if err := w.takeAutoRestoreFailure(snapshot); err != nil {
+		w.reportError(autoRestoreOperation, err)
+	}
+}
+
+// takeAutoRestoreFailure returns the error of an automatic restore this window has
+// not announced yet. runOperation already reports every failure the user asked
+// for; the watcher has no such path, so the session counts its own failures and
+// this window reports each count once. Re-rendering the same failed state, which
+// every later poll does, stays silent.
+func (w *window) takeAutoRestoreFailure(snapshot app.Snapshot) error {
+	if snapshot.AutoRestoreFailures <= w.reportedAutoRestoreFailures {
+		return nil
+	}
+	w.reportedAutoRestoreFailures = snapshot.AutoRestoreFailures
+	if snapshot.Err == nil {
+		return errors.New("恢復原始顯示模式時發生未知錯誤")
+	}
+	return snapshot.Err
 }
 
 // updateAvailability latches the two conditions that must disable the 4:3 toggle:
@@ -351,17 +398,47 @@ func (w *window) updateAvailability(snapshot app.Snapshot) {
 	}
 }
 
-func (w *window) applyEnabled(snapshot app.Snapshot) {
+// controls says which commands accept input. It is one value so the policy can be
+// decided without touching Walk and asserted in a test.
+type controls struct {
+	toggle  bool
+	restore bool
+	enable  bool
+	refresh bool
+	hide    bool
+	show    bool
+	exit    bool
+}
+
+// availableControls keeps the read-only command live while the target monitor is
+// unavailable: re-reading is the only way out of that latch. The 4:3 commands stay
+// disabled with the reason on screen.
+func (w *window) availableControls(snapshot app.Snapshot) controls {
 	interactive := w.unavailableReason == "" && !w.busy
+	return controls{
+		toggle:  interactive,
+		restore: interactive,
+		enable:  interactive && !snapshot.FourByThree,
+		refresh: !w.busy,
+		hide:    true,
+		show:    true,
+		exit:    !w.busy,
+	}
+}
 
-	w.toggle.SetEnabled(interactive)
-	w.restoreButton.SetEnabled(interactive)
-	w.hideButton.SetEnabled(true)
+func (w *window) applyEnabled(snapshot app.Snapshot) {
+	available := w.availableControls(snapshot)
 
-	_ = w.showAction.SetEnabled(true)
-	_ = w.enableAction.SetEnabled(interactive && !snapshot.FourByThree)
-	_ = w.restoreAction.SetEnabled(interactive)
-	_ = w.exitAction.SetEnabled(!w.busy)
+	w.toggle.SetEnabled(available.toggle)
+	w.restoreButton.SetEnabled(available.restore)
+	w.refreshButton.SetEnabled(available.refresh)
+	w.hideButton.SetEnabled(available.hide)
+
+	_ = w.showAction.SetEnabled(available.show)
+	_ = w.enableAction.SetEnabled(available.enable)
+	_ = w.restoreAction.SetEnabled(available.restore)
+	_ = w.refreshAction.SetEnabled(available.refresh)
+	_ = w.exitAction.SetEnabled(available.exit)
 }
 
 func (w *window) setToggleChecked(checked bool) {
