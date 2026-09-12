@@ -607,7 +607,7 @@ Expected: all tests PASS under the race detector and normal test run.
 - Consumes: `app.Session`, `app.Snapshot`.
 - Produces: `ui.Run(session *app.Session) error` and the Windows application entry point.
 
-- [ ] **Step 1: Add Walk and the resource generator**
+- [x] **Step 1: Add Walk and the resource generator**
 
 Run:
 
@@ -619,7 +619,7 @@ go mod tidy
 
 Expected: dependencies are pinned in `go.mod`/`go.sum`.
 
-- [ ] **Step 2: Create the Windows manifest and generation directive**
+- [x] **Step 2: Create the Windows manifest and generation directive**
 
 Create `cmd/resolution-tray/resolution-tray.manifest` with Common Controls 6, `asInvoker`, `PerMonitorV2` DPI awareness, and Windows 10/11 compatibility. Create `cmd/resolution-tray/generate.go`:
 
@@ -635,7 +635,7 @@ Run: `go generate ./cmd/resolution-tray`
 
 Expected: ignored file `cmd/resolution-tray/rsrc.syso` is generated.
 
-- [ ] **Step 3: Implement the Walk UI**
+- [x] **Step 3: Implement the Walk UI**
 
 Create `internal/ui/window_windows.go` with a 420×240 fixed-size main window containing:
 
@@ -650,7 +650,7 @@ Use `walk.IconApplication()` for the window and tray icon. The checkbox handler 
 
 Create one `walk.NotifyIcon` with tooltip `VALORANT 4:3 顯示工具`. Add actions `顯示主視窗`, `使用 4:3`, `恢復原始解析度`, separator, and `結束`. Window close and minimize events hide the window without ending the message loop. Tray left-click restores and foregrounds the main window. `結束` calls `session.Shutdown`; on restore failure it keeps the application alive and reports the error instead of silently abandoning 4:3.
 
-- [ ] **Step 4: Compose the production application**
+- [x] **Step 4: Compose the production application**
 
 Create `cmd/resolution-tray/main_windows.go`:
 
@@ -675,7 +675,7 @@ func main() {
 }
 ```
 
-- [ ] **Step 5: Verify UI compilation and commit**
+- [x] **Step 5: Verify UI compilation and commit**
 
 Run:
 
@@ -702,7 +702,7 @@ Expected: tests and vet PASS, `dist/ResolutionTray.exe` builds, and starting it 
 **Interfaces:**
 - Produces: `./build.ps1` and documented user/build workflows.
 
-- [ ] **Step 1: Create the build script**
+- [x] **Step 1: Create the build script**
 
 Create `build.ps1` with `$ErrorActionPreference = 'Stop'`, resolve `go.exe` from PATH or `C:\Program Files\Go\bin\go.exe`, then run every Go command through this checked helper:
 
@@ -725,7 +725,7 @@ Invoke-Go @('build', '-trimpath', '-ldflags', '-H windowsgui -s -w', '-o', 'dist
 
 This prevents a failed generate, test, vet, or build command from leaving a release artifact that appears successful.
 
-- [ ] **Step 2: Document operation and safety boundaries**
+- [x] **Step 2: Document operation and safety boundaries**
 
 Create `README.md` covering:
 
@@ -741,7 +741,7 @@ Create `README.md` covering:
 
 Replace the Python-specific content in `CLAUDE.md` with the same Go architecture and commands, keeping Traditional Chinese UI-string guidance.
 
-- [ ] **Step 3: Verify and commit build/documentation**
+- [x] **Step 3: Verify and commit build/documentation**
 
 Run:
 
@@ -775,7 +775,7 @@ Expected: build succeeds and produces a non-empty `ResolutionTray.exe`; document
 - Consumes: the tested and built Go replacement.
 - Produces: a Go-only source tree; generated `dist/ResolutionTray.exe` remains ignored and local.
 
-- [ ] **Step 1: Run the complete automated verification before deletion**
+- [x] **Step 1: Run the complete automated verification before deletion**
 
 Run:
 
@@ -803,7 +803,7 @@ With VALORANT closed:
 
 Expected: every behavior matches the design spec without the application launching or attaching to VALORANT.
 
-- [ ] **Step 3: Remove exact legacy targets**
+- [x] **Step 3: Remove exact legacy targets**
 
 Use one PowerShell session and this exact target list. Compute every absolute target before deleting anything, reject paths outside the repository, and preserve `.venv/` plus `dist/ResolutionTray.exe`:
 
@@ -838,7 +838,7 @@ foreach ($absolutePath in $resolvedTargets) {
 }
 ```
 
-- [ ] **Step 4: Re-run verification after deletion**
+- [x] **Step 4: Re-run verification after deletion**
 
 Run:
 
