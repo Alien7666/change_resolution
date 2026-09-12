@@ -1,0 +1,413 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/Alien7666/change_resolution/internal/display"
+	"github.com/Alien7666/change_resolution/internal/domain"
+	"github.com/Alien7666/change_resolution/internal/process"
+)
+
+type State string
+
+const (
+	StateNative         State = "native"
+	StateApplying       State = "applying"
+	StateWaitingForGame State = "waiting-for-game"
+	StateGameRunning    State = "game-running"
+	StateRestorePending State = "restore-pending"
+	StateRestoring      State = "restoring"
+	StateError          State = "error"
+)
+
+var ErrClosed = errors.New("display session is closed")
+
+type Snapshot struct {
+	State       State
+	Target      domain.Target
+	CurrentMode domain.Mode
+	FourByThree bool
+	Managed     bool
+	Revision    uint64
+	Message     string
+	Err         error
+}
+
+type sessionTicker interface {
+	C() <-chan time.Time
+	Stop()
+}
+
+type sessionClock interface {
+	Now() time.Time
+	NewTicker(time.Duration) sessionTicker
+}
+
+type realClock struct{}
+type realTicker struct{ *time.Ticker }
+
+func (realClock) Now() time.Time { return time.Now() }
+func (realClock) NewTicker(interval time.Duration) sessionTicker {
+	return realTicker{time.NewTicker(interval)}
+}
+func (t realTicker) C() <-chan time.Time { return t.Ticker.C }
+
+type sessionWatcher struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// Session owns a saved mode only after this instance successfully applies GameMode.
+// opMu serializes complete workflows. mu protects snapshots and notifications only;
+// no external display, process, or callback code runs while mu is held.
+type Session struct {
+	opMu sync.Mutex
+	mu   sync.Mutex
+
+	displays     display.Controller
+	processes    process.Checker
+	profile      domain.Profile
+	clock        sessionClock
+	original     domain.Mode
+	managed      bool
+	closed       bool
+	generation   uint64
+	watcher      *sessionWatcher
+	watchers     sync.WaitGroup
+	shutdownDone chan struct{}
+
+	snapshot            Snapshot
+	onChange            func(Snapshot)
+	handlerVersion      uint64
+	notify              chan struct{}
+	notifyStop          chan struct{}
+	notifyDone          chan struct{}
+	notificationsClosed bool
+}
+
+// NewSession creates an idle session. Refresh is the explicit read-only startup probe.
+func NewSession(displays display.Controller, processes process.Checker, profile domain.Profile) *Session {
+	return newSession(displays, processes, profile, realClock{})
+}
+
+func newSession(displays display.Controller, processes process.Checker, profile domain.Profile, clock sessionClock) *Session {
+	s := &Session{
+		displays: displays, processes: processes, profile: profile, clock: clock,
+		snapshot: Snapshot{State: StateNative, Revision: 1, Message: "尚未啟用 4:3"},
+		notify:   make(chan struct{}, 1), notifyStop: make(chan struct{}), notifyDone: make(chan struct{}),
+		shutdownDone: make(chan struct{}),
+	}
+	go s.dispatchChanges()
+	return s
+}
+
+// SetOnChange replaces the single observer; nil disables future notifications.
+// Notifications are ordered and may coalesce intermediate snapshots. Callbacks can
+// call Snapshot and must return for Shutdown to finish; UI callers should therefore
+// run Shutdown off the UI thread when their callback synchronizes with that thread.
+func (s *Session) SetOnChange(fn func(Snapshot)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.notificationsClosed {
+		return
+	}
+	s.onChange = fn
+	s.handlerVersion++
+	s.signalChangeLocked()
+}
+
+func (s *Session) Snapshot() Snapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.snapshot
+}
+
+func (s *Session) updateSnapshot(change func(*Snapshot)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	change(&s.snapshot)
+	s.snapshot.Revision++
+	s.signalChangeLocked()
+}
+
+func (s *Session) signalChangeLocked() {
+	if s.notificationsClosed {
+		return
+	}
+	select {
+	case s.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Session) dispatchChanges() {
+	defer close(s.notifyDone)
+	var lastRevision, lastHandler uint64
+	for {
+		select {
+		case <-s.notifyStop:
+			return
+		case <-s.notify:
+			s.mu.Lock()
+			fn, snapshot, version, stopped := s.onChange, s.snapshot, s.handlerVersion, s.notificationsClosed
+			s.mu.Unlock()
+			if stopped {
+				return
+			}
+			if fn != nil && (snapshot.Revision > lastRevision || version != lastHandler) {
+				fn(snapshot)
+				lastRevision, lastHandler = snapshot.Revision, version
+			}
+		}
+	}
+}
+
+func (s *Session) state(state State, message string) {
+	s.updateSnapshot(func(snapshot *Snapshot) {
+		snapshot.State, snapshot.Message, snapshot.Err = state, message, nil
+	})
+}
+
+func (s *Session) fail(operation string, err error) error {
+	err = fmt.Errorf("%s: %w", operation, err)
+	s.updateSnapshot(func(snapshot *Snapshot) {
+		snapshot.State, snapshot.Message, snapshot.Err = StateError, err.Error(), err
+	})
+	return err
+}
+
+func (s *Session) observed(target domain.Target, mode domain.Mode) {
+	s.updateSnapshot(func(snapshot *Snapshot) {
+		snapshot.Target, snapshot.CurrentMode = target, mode
+		snapshot.FourByThree = mode == s.profile.GameMode
+	})
+}
+
+func (s *Session) readCurrent() (domain.Target, domain.Mode, error) {
+	target, err := s.displays.ResolveTarget(s.profile.MonitorHardwareID)
+	if err != nil {
+		return domain.Target{}, domain.Mode{}, s.fail("resolve target", err)
+	}
+	mode, err := s.displays.CurrentMode(target)
+	if err != nil {
+		return target, domain.Mode{}, s.fail("read current mode", err)
+	}
+	s.observed(target, mode)
+	return target, mode, nil
+}
+
+func (s *Session) Refresh() Snapshot {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if s.closed {
+		return s.Snapshot()
+	}
+	_, _, err := s.readCurrent()
+	if err == nil && !s.managed {
+		s.state(StateNative, "已讀取目前顯示模式")
+	}
+	return s.Snapshot()
+}
+
+func (s *Session) Enable() error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	if s.managed {
+		return nil
+	}
+	s.state(StateApplying, "正在驗證並套用 4:3")
+	target, original, err := s.readCurrent()
+	if err != nil {
+		return err
+	}
+	if original == s.profile.GameMode {
+		s.state(StateNative, "目前已是 4:3；可手動恢復 2K")
+		return nil
+	}
+	if err := s.apply(target, s.profile.GameMode); err != nil {
+		return err
+	}
+	s.original, s.managed = original, true
+	s.updateSnapshot(func(snapshot *Snapshot) {
+		snapshot.CurrentMode, snapshot.FourByThree, snapshot.Managed = s.profile.GameMode, true, true
+		snapshot.State, snapshot.Message, snapshot.Err = StateWaitingForGame, "4:3 已啟用，等待遊戲", nil
+	})
+	s.startWatcher()
+	return nil
+}
+
+func (s *Session) apply(target domain.Target, mode domain.Mode) error {
+	if err := s.displays.TestMode(target, mode); err != nil {
+		return s.fail("test display mode", err)
+	}
+	if err := s.displays.ApplyMode(target, mode); err != nil {
+		return s.fail("apply display mode", err)
+	}
+	return nil
+}
+
+// stopWatcher invalidates ownership before cancellation. Callers must release opMu
+// before joining: a poll may already be waiting to acquire the operation gate.
+func (s *Session) stopWatcher() *sessionWatcher {
+	s.generation++
+	watcher := s.watcher
+	s.watcher = nil
+	if watcher != nil {
+		watcher.cancel()
+	}
+	return watcher
+}
+
+func joinWatcher(watcher *sessionWatcher) {
+	if watcher != nil {
+		<-watcher.done
+	}
+}
+
+func (s *Session) Disable() error {
+	s.opMu.Lock()
+	if s.closed {
+		s.opMu.Unlock()
+		return ErrClosed
+	}
+	watcher := s.stopWatcher()
+	err := s.restore(true)
+	s.opMu.Unlock()
+	joinWatcher(watcher)
+	return err
+}
+
+// restore runs only under opMu. Unmanaged fallback is reserved for explicit Disable.
+// Saved ownership survives every resolve/test/apply failure so restoration is retryable.
+func (s *Session) restore(allowFallback bool) error {
+	var target domain.Target
+	var mode domain.Mode
+	var err error
+	if s.managed {
+		s.state(StateRestoring, "正在恢復原始顯示模式")
+		target, err = s.displays.ResolveTarget(s.profile.MonitorHardwareID)
+		if err != nil {
+			return s.fail("resolve target for restore", err)
+		}
+		mode = s.original
+	} else {
+		if !allowFallback {
+			return nil
+		}
+		target, mode, err = s.readCurrent()
+		if err != nil {
+			return err
+		}
+		if mode != s.profile.GameMode {
+			s.state(StateNative, "目前未使用 4:3")
+			return nil
+		}
+		mode = s.profile.FallbackNativeMode
+		s.state(StateRestoring, "正在恢復 2K 顯示模式")
+	}
+	if err := s.apply(target, mode); err != nil {
+		return err
+	}
+	s.managed = false
+	s.original = domain.Mode{}
+	s.updateSnapshot(func(snapshot *Snapshot) {
+		snapshot.Target, snapshot.CurrentMode = target, mode
+		snapshot.FourByThree, snapshot.Managed = mode == s.profile.GameMode, false
+		snapshot.State, snapshot.Message, snapshot.Err = StateNative, "已恢復顯示模式", nil
+	})
+	return nil
+}
+
+// Shutdown restores owned state and joins all watchers and in-flight callbacks.
+// A restore failure leaves the session open and retryable. Successful repeated
+// calls wait for the same shutdown barrier before returning.
+func (s *Session) Shutdown() error {
+	s.opMu.Lock()
+	if s.closed {
+		s.opMu.Unlock()
+		<-s.shutdownDone
+		return nil
+	}
+	watcher := s.stopWatcher()
+	if err := s.restore(false); err != nil {
+		s.opMu.Unlock()
+		joinWatcher(watcher)
+		return err
+	}
+	s.closed = true
+	s.mu.Lock()
+	s.notificationsClosed = true
+	s.onChange = nil
+	close(s.notifyStop)
+	s.mu.Unlock()
+	s.opMu.Unlock()
+	s.watchers.Wait()
+	<-s.notifyDone
+	close(s.shutdownDone)
+	return nil
+}
+
+func (s *Session) startWatcher() {
+	s.generation++
+	generation := s.generation
+	ctx, cancel := context.WithCancel(context.Background())
+	watcher := &sessionWatcher{cancel: cancel, done: make(chan struct{})}
+	s.watcher = watcher
+	ticker := s.clock.NewTicker(time.Second)
+	s.watchers.Add(1)
+	go func() {
+		defer s.watchers.Done()
+		defer close(watcher.done)
+		defer ticker.Stop()
+		tracker := newGameTracker(s.profile.RestoreDelay)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C():
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			running, err := s.processes.Running(s.profile.ProcessName)
+			if !s.observeGame(generation, tracker, running, err) {
+				return
+			}
+		}
+	}()
+}
+
+func (s *Session) observeGame(generation uint64, tracker *gameTracker, running bool, err error) bool {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if s.closed || !s.managed || generation != s.generation {
+		return false
+	}
+	if err != nil {
+		s.fail("check game process", err)
+		return true
+	}
+	result := tracker.Observe(running, s.clock.Now())
+	if result.ShouldRestore {
+		s.stopWatcher()
+		// This goroutine must not join itself; it exits immediately after restoration.
+		s.restore(false)
+		return false
+	}
+	switch {
+	case running:
+		s.state(StateGameRunning, "遊戲執行中")
+	case result.SeenGame:
+		s.state(StateRestorePending, "遊戲已關閉，等待恢復顯示模式")
+	default:
+		s.state(StateWaitingForGame, "4:3 已啟用，等待遊戲")
+	}
+	return true
+}
