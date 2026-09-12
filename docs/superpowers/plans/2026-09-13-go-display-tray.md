@@ -578,7 +578,7 @@ Protect mutable state with `sync.Mutex`, serialize display mutations with a sepa
 
 Watcher errors update the message but do not restore or alter display state. The watcher calls `gameTracker.Observe(running, time.Now())`; when `ShouldRestore` becomes true it calls `Disable` exactly once and exits.
 
-- [ ] **Step 7: Verify and commit the application core**
+- [x] **Step 7: Verify and commit the application core**
 
 Run:
 
@@ -852,7 +852,7 @@ git status --short
 
 Expected: verification still passes; no Python source/spec or legacy executable remains; `dist/` stays ignored.
 
-- [ ] **Step 5: Commit the migration cleanup**
+- [x] **Step 5: Commit the migration cleanup**
 
 Run:
 
@@ -875,7 +875,7 @@ Expected: the staged diff deletes only the enumerated legacy files and includes 
 **Interfaces:**
 - Validates every interface and behavior produced by Tasks 1–7.
 
-- [ ] **Step 1: Inspect the complete branch diff**
+- [x] **Step 1: Inspect the complete branch diff**
 
 Run:
 
@@ -886,7 +886,7 @@ git diff main...HEAD -- . ':(exclude)docs/superpowers/plans/2026-09-13-go-displa
 
 Check for accidental display-wide changes, fixed `DISPLAY1` assumptions, `CDS_UPDATEREGISTRY`, VALORANT launch code, `OpenProcess`, unbounded goroutines, UI updates outside `Synchronize`, and generated artifacts.
 
-- [ ] **Step 2: Run final verification**
+- [x] **Step 2: Run final verification**
 
 Run:
 
@@ -902,6 +902,6 @@ git status --short
 
 Expected: formatting, tests, race detector, vet, and build PASS; only intended source/documentation changes are present.
 
-- [ ] **Step 3: Commit review fixes only when needed**
+- [x] **Step 3: Commit review fixes only when needed**
 
 If Step 1 finds a concrete issue, add a focused regression test, apply the smallest fix, rerun Step 2, and commit with `fix: <specific user-visible behavior>`. If no issue is found, do not create an empty commit.

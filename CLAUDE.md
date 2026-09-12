@@ -40,7 +40,7 @@ go test ./internal/display -run TestWindowsControllerCanTestMiMonitorMode -v
 Remove-Item Env:RUN_DISPLAY_INTEGRATION
 ```
 
-`go build` always targets `windows/amd64` with `CGO_ENABLED=0` and `-ldflags "-H windowsgui"`, producing `dist/ResolutionTray.exe` (gitignored, local artifact only).
+`go build` always targets `windows/amd64` with `CGO_ENABLED=0` and `-ldflags '-H windowsgui -s -w'`, producing `dist/ResolutionTray.exe` (gitignored, local artifact only).
 
 ## Testing
 
