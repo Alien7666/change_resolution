@@ -9,19 +9,27 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// win32Call is one ChangeDisplaySettingsExW crossing. A nil mode records the
+// committing call, which passes neither a device nor a DEVMODEW.
+type win32Call struct {
+	device string
+	mode   *devMode
+	flags  uint32
+}
+
 type fakeWin32 struct {
 	adapters           []displayDevice
 	monitors           map[string][]displayDevice
 	current            devMode
+	modes              map[string]devMode
 	displayDeviceSizes []uint32
 	enumSettingsCalls  int
 	enumSettingsDevice string
 	enumSettingsMode   uint32
 	enumSettingsSizes  []uint16
-	changeDevice       string
-	changedMode        devMode
-	changeFlags        uint32
+	calls              []win32Call
 	changeResult       int32
+	changeResults      map[string]int32
 }
 
 func (f *fakeWin32) enumDisplayDevices(
@@ -45,19 +53,39 @@ func (f *fakeWin32) enumDisplayDevices(
 }
 
 func (f *fakeWin32) enumDisplaySettings(deviceName *uint16, modeNumber uint32, mode *devMode) (bool, error) {
+	name := windows.UTF16PtrToString(deviceName)
 	f.enumSettingsCalls++
-	f.enumSettingsDevice = windows.UTF16PtrToString(deviceName)
+	f.enumSettingsDevice = name
 	f.enumSettingsMode = modeNumber
 	f.enumSettingsSizes = append(f.enumSettingsSizes, mode.DmSize)
+	if known, ok := f.modes[name]; ok {
+		*mode = known
+		return true, nil
+	}
 	*mode = f.current
 	return true, nil
 }
 
 func (f *fakeWin32) changeDisplaySettingsEx(deviceName *uint16, mode *devMode, flags uint32) int32 {
-	f.changeDevice = windows.UTF16PtrToString(deviceName)
-	f.changedMode = *mode
-	f.changeFlags = flags
+	name := windows.UTF16PtrToString(deviceName)
+	call := win32Call{device: name, flags: flags}
+	if mode != nil {
+		staged := *mode
+		call.mode = &staged
+	}
+	f.calls = append(f.calls, call)
+	if result, ok := f.changeResults[name]; ok {
+		return result
+	}
 	return f.changeResult
+}
+
+func (f *fakeWin32) lastMode(t *testing.T) devMode {
+	t.Helper()
+	if len(f.calls) == 0 || f.calls[len(f.calls)-1].mode == nil {
+		t.Fatalf("no DEVMODEW reached ChangeDisplaySettingsExW: %+v", f.calls)
+	}
+	return *f.calls[len(f.calls)-1].mode
 }
 
 func TestWindowsStructsMatchWin32ABI(t *testing.T) {
@@ -69,17 +97,58 @@ func TestWindowsStructsMatchWin32ABI(t *testing.T) {
 	}
 }
 
+// The flag values are the contract with wingdi.h. CDS_UPDATEREGISTRY is 0x00000001
+// and would make the game mode the user permanent setting, so it must not be the
+// value of any constant this package sends, CDS_NORESET included.
+func TestWindowsFlagsMatchWin32AndExcludeUpdateRegistry(t *testing.T) {
+	const cdsUpdateRegistry uint32 = 0x00000001
+	for name, got := range map[string]uint32{
+		"DM_POSITION":           dmPosition,
+		"DM_BITSPERPEL":         dmBitsPerPel,
+		"DM_PELSWIDTH":          dmPelsWidth,
+		"DM_PELSHEIGHT":         dmPelsHeight,
+		"DM_DISPLAYFREQUENCY":   dmDisplayFrequency,
+		"CDS_TEST":              cdsTest,
+		"CDS_FULLSCREEN":        cdsFullscreen,
+		"CDS_NORESET":           cdsNoReset,
+		"DISPLAY_DEVICE_ATTACH": displayDeviceAttachedToDesktop,
+	} {
+		want := map[string]uint32{
+			"DM_POSITION": 0x00000020, "DM_BITSPERPEL": 0x00040000,
+			"DM_PELSWIDTH": 0x00080000, "DM_PELSHEIGHT": 0x00100000,
+			"DM_DISPLAYFREQUENCY": 0x00400000, "CDS_TEST": 0x00000002,
+			"CDS_FULLSCREEN": 0x00000004, "CDS_NORESET": 0x10000000,
+			"DISPLAY_DEVICE_ATTACH": 0x00000001,
+		}[name]
+		if got != want {
+			t.Errorf("%s=%#x, want %#x", name, got, want)
+		}
+	}
+	if displayDevicePrimaryDevice != 0x00000004 {
+		t.Errorf("DISPLAY_DEVICE_PRIMARY_DEVICE=%#x", displayDevicePrimaryDevice)
+	}
+	for name, flags := range map[string]uint32{
+		"pre-flight": cdsTest,
+		"staging":    cdsFullscreen | cdsNoReset,
+		"commit":     commitFlags,
+	} {
+		if flags&cdsUpdateRegistry != 0 {
+			t.Errorf("the %s call carries CDS_UPDATEREGISTRY: %#x", name, flags)
+		}
+	}
+}
+
 func TestWindowsNativeMapsMonitorHardwareIDToAttachedAdapter(t *testing.T) {
 	api := &fakeWin32{
 		adapters: []displayDevice{
-			newDisplayDevice(t, `\\.\DETACHED`, "", 0),
-			newDisplayDevice(t, `\\.\DISPLAY1`, "", displayDeviceAttachedToDesktop),
+			newDisplayDevice(t, `\.\DETACHED`, "", 0),
+			newDisplayDevice(t, `\.\DISPLAY1`, "", displayDeviceAttachedToDesktop),
 		},
 		monitors: map[string][]displayDevice{
-			`\\.\DETACHED`: {
+			`\.\DETACHED`: {
 				newDisplayDevice(t, "", `MONITOR\IGNORED\0001`, 0),
 			},
-			`\\.\DISPLAY1`: {
+			`\.\DISPLAY1`: {
 				newDisplayDevice(t, "", `MONITOR\XMI27B2\0009`, 0),
 			},
 		},
@@ -90,7 +159,7 @@ func TestWindowsNativeMapsMonitorHardwareIDToAttachedAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := domain.Target{DeviceName: `\\.\DISPLAY1`, HardwareID: `MONITOR\XMI27B2\0009`}
+	want := domain.Target{DeviceName: `\.\DISPLAY1`, HardwareID: `MONITOR\XMI27B2\0009`}
 	if len(targets) != 1 || targets[0] != want {
 		t.Fatalf("targets=%#v", targets)
 	}
@@ -110,7 +179,7 @@ func TestWindowsNativeCurrentModeUsesTargetDevice(t *testing.T) {
 	}}
 	native := &windowsNative{api: api}
 
-	got, err := native.currentMode(`\\.\DISPLAY1`)
+	got, err := native.currentMode(`\.\DISPLAY1`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,57 +189,225 @@ func TestWindowsNativeCurrentModeUsesTargetDevice(t *testing.T) {
 	}
 }
 
-func TestWindowsNativeChangeModePreservesDriverStateAndUsesExactFlags(t *testing.T) {
-	wantMode := domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
-	tests := []struct {
-		name      string
-		testOnly  bool
-		wantFlags uint32
-	}{
-		{name: "test", testOnly: true, wantFlags: cdsTest},
-		{name: "apply", testOnly: false, wantFlags: cdsFullscreen},
+// The layout read has to carry each attached display position and which one is
+// primary: without both, nothing downstream can keep the desktop contiguous or
+// anchored. A detached adapter is not part of the desktop and is skipped.
+func TestWindowsNativeCurrentLayoutReadsPositionsAndPrimaryFlag(t *testing.T) {
+	api := &fakeWin32{
+		adapters: []displayDevice{
+			newDisplayDevice(t, `\.\DISPLAY1`, "",
+				displayDeviceAttachedToDesktop|displayDevicePrimaryDevice),
+			newDisplayDevice(t, `\.\DETACHED`, "", 0),
+			newDisplayDevice(t, `\.\DISPLAY2`, "", displayDeviceAttachedToDesktop),
+		},
+		modes: map[string]devMode{
+			`\.\DISPLAY1`: {
+				DmPosition: pointL{X: 0, Y: 0}, DmPelsWidth: 2560, DmPelsHeight: 1440,
+				DmDisplayFrequency: 180, DmBitsPerPel: 32,
+			},
+			`\.\DISPLAY2`: {
+				DmPosition: pointL{X: 2560, Y: -120}, DmPelsWidth: 1920, DmPelsHeight: 1080,
+				DmDisplayFrequency: 60, DmBitsPerPel: 32,
+			},
+		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			api := &fakeWin32{current: devMode{
-				DmFields:       0xffffffff,
-				DmPosition:     pointL{X: 123, Y: 456},
-				DmDisplayFlags: 77,
-			}}
-			native := &windowsNative{api: api}
+	native := &windowsNative{api: api}
 
-			if err := native.changeMode(`\\.\DISPLAY1`, wantMode, tt.testOnly); err != nil {
-				t.Fatal(err)
+	got, err := native.currentLayout()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := domain.Layout{Displays: []domain.DisplayState{
+		{
+			DeviceName: `\.\DISPLAY1`,
+			Mode:       domain.Mode{Width: 2560, Height: 1440, RefreshHz: 180, BitsPerPixel: 32},
+			Position:   domain.Point{X: 0, Y: 0}, Primary: true,
+		},
+		{
+			DeviceName: `\.\DISPLAY2`,
+			Mode:       domain.Mode{Width: 1920, Height: 1080, RefreshHz: 60, BitsPerPixel: 32},
+			Position:   domain.Point{X: 2560, Y: -120},
+		},
+	}}
+	if len(got.Displays) != len(want.Displays) {
+		t.Fatalf("layout=%#v", got)
+	}
+	for i, display := range got.Displays {
+		if display != want.Displays[i] {
+			t.Fatalf("display %d = %#v, want %#v", i, display, want.Displays[i])
+		}
+	}
+}
+
+// The pre-flight still names the target alone, declares only the four mode members
+// and leaves every other DEVMODEW member the driver reported untouched.
+func TestWindowsNativeTestModePreservesDriverStateAndUsesExactFlags(t *testing.T) {
+	wantMode := domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
+	api := &fakeWin32{current: devMode{
+		DmFields:       0xffffffff,
+		DmPosition:     pointL{X: 123, Y: 456},
+		DmDisplayFlags: 77,
+	}}
+	native := &windowsNative{api: api}
+
+	if err := native.testMode(`\.\DISPLAY1`, wantMode); err != nil {
+		t.Fatal(err)
+	}
+	if api.enumSettingsCalls != 1 {
+		t.Fatalf("EnumDisplaySettingsW calls=%d", api.enumSettingsCalls)
+	}
+	if len(api.calls) != 1 || api.calls[0].device != `\.\DISPLAY1` {
+		t.Fatalf("calls=%+v", api.calls)
+	}
+	if api.calls[0].flags != cdsTest {
+		t.Fatalf("flags=%#x", api.calls[0].flags)
+	}
+	staged := api.lastMode(t)
+	if want := dmPelsWidth | dmPelsHeight | dmDisplayFrequency | dmBitsPerPel; staged.DmFields != want {
+		t.Fatalf("DmFields=%#x, want %#x", staged.DmFields, want)
+	}
+	if modeOf(staged) != wantMode {
+		t.Fatalf("mode=%#v", modeOf(staged))
+	}
+	if staged.DmPosition != (pointL{X: 123, Y: 456}) || staged.DmDisplayFlags != 77 {
+		t.Fatalf("driver state was not preserved: %#v", staged)
+	}
+	if want := uint16(unsafe.Sizeof(devMode{})); staged.DmSize != want {
+		t.Fatalf("DEVMODEW.dmSize=%d, want %d", staged.DmSize, want)
+	}
+}
+
+// stagedLayout is the measured desktop as the driver would report it, so applyLayout
+// reads a real DEVMODEW per display instead of one shared fixture.
+func stagedLayout(t *testing.T) *fakeWin32 {
+	t.Helper()
+	modes := make(map[string]devMode, len(measuredLayout().Displays))
+	for _, display := range measuredLayout().Displays {
+		modes[display.DeviceName] = devMode{
+			DmFields:           0xffffffff,
+			DmPosition:         pointL{X: display.Position.X, Y: display.Position.Y},
+			DmPelsWidth:        display.Mode.Width,
+			DmPelsHeight:       display.Mode.Height,
+			DmDisplayFrequency: display.Mode.RefreshHz,
+			DmBitsPerPel:       display.Mode.BitsPerPixel,
+			DmDisplayFlags:     77,
+		}
+	}
+	return &fakeWin32{modes: modes}
+}
+
+// The transaction is what reaches Win32: one CDS_NORESET call per display, then one
+// committing call with no device and no DEVMODEW. Nothing is applied display by
+// display, so the desktop never exists in a half rearranged state.
+func TestWindowsNativeApplyLayoutStagesEveryDisplayThenCommitsOnce(t *testing.T) {
+	api := stagedLayout(t)
+	native := &windowsNative{api: api}
+	plan, err := PlanModeChange(measuredLayout(), `\.\DISPLAY1`, miMonitorGame)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := native.applyLayout(plan); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.calls) != len(plan.Changes)+1 {
+		t.Fatalf("calls=%d, want one per display plus one commit: %+v", len(api.calls), api.calls)
+	}
+	for i, change := range plan.Changes {
+		call := api.calls[i]
+		if call.device != change.DeviceName {
+			t.Fatalf("call %d device=%q, want %q", i, call.device, change.DeviceName)
+		}
+		if call.flags != cdsFullscreen|cdsNoReset {
+			t.Fatalf("call %d flags=%#x, want CDS_FULLSCREEN|CDS_NORESET", i, call.flags)
+		}
+		if call.mode == nil {
+			t.Fatalf("call %d carried no DEVMODEW", i)
+		}
+		if call.mode.DmPosition != (pointL{X: change.Position.X, Y: change.Position.Y}) {
+			t.Fatalf("call %d dmPosition=%+v, want %+v", i, call.mode.DmPosition, change.Position)
+		}
+		if want := uint16(unsafe.Sizeof(devMode{})); call.mode.DmSize != want {
+			t.Fatalf("call %d dmSize=%d, want %d", i, call.mode.DmSize, want)
+		}
+	}
+	commit := api.calls[len(api.calls)-1]
+	if commit.device != "" || commit.mode != nil || commit.flags != commitFlags {
+		t.Fatalf("commit call = %+v, want a NULL device and NULL DEVMODEW", commit)
+	}
+}
+
+// A display that is not the target may only be moved. Declaring DM_POSITION alone
+// is what keeps its resolution, refresh rate and colour depth out of the write set,
+// whatever the plan happens to carry.
+func TestWindowsNativeApplyLayoutMovesOtherDisplaysWithoutTouchingTheirMode(t *testing.T) {
+	api := stagedLayout(t)
+	native := &windowsNative{api: api}
+	plan, err := PlanModeChange(measuredLayout(), `\.\DISPLAY1`, miMonitorGame)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := native.applyLayout(plan); err != nil {
+		t.Fatal(err)
+	}
+	before := measuredLayout()
+	for i, change := range plan.Changes {
+		staged := api.calls[i].mode
+		reported, _ := before.Find(change.DeviceName)
+		if change.DeviceName == `\.\DISPLAY1` {
+			want := dmPosition | dmPelsWidth | dmPelsHeight | dmDisplayFrequency | dmBitsPerPel
+			if staged.DmFields != want {
+				t.Fatalf("target DmFields=%#x, want %#x", staged.DmFields, want)
 			}
-			if api.enumSettingsCalls != 1 {
-				t.Fatalf("EnumDisplaySettingsW calls=%d", api.enumSettingsCalls)
+			if modeOf(*staged) != miMonitorGame {
+				t.Fatalf("target mode=%#v", modeOf(*staged))
 			}
-			if api.changeDevice != `\\.\DISPLAY1` {
-				t.Fatalf("device=%q", api.changeDevice)
-			}
-			if api.changeFlags != tt.wantFlags {
-				t.Fatalf("flags=%#x", api.changeFlags)
-			}
-			wantFields := dmPelsWidth | dmPelsHeight | dmDisplayFrequency | dmBitsPerPel
-			if api.changedMode.DmFields != wantFields {
-				t.Fatalf("DmFields=%#x", api.changedMode.DmFields)
-			}
-			gotMode := domain.Mode{
-				Width:        api.changedMode.DmPelsWidth,
-				Height:       api.changedMode.DmPelsHeight,
-				RefreshHz:    api.changedMode.DmDisplayFrequency,
-				BitsPerPixel: api.changedMode.DmBitsPerPel,
-			}
-			if gotMode != wantMode {
-				t.Fatalf("mode=%#v", gotMode)
-			}
-			if api.changedMode.DmPosition != (pointL{X: 123, Y: 456}) || api.changedMode.DmDisplayFlags != 77 {
-				t.Fatalf("driver state was not preserved: %#v", api.changedMode)
-			}
-			if want := uint16(unsafe.Sizeof(devMode{})); api.changedMode.DmSize != want {
-				t.Fatalf("ChangeDisplaySettingsExW DEVMODEW.dmSize=%d, want %d", api.changedMode.DmSize, want)
-			}
-		})
+			continue
+		}
+		if staged.DmFields != dmPosition {
+			t.Fatalf("%s DmFields=%#x, want DM_POSITION alone", change.DeviceName, staged.DmFields)
+		}
+		if modeOf(*staged) != reported.Mode {
+			t.Fatalf("%s mode=%#v, want the driver reported %#v",
+				change.DeviceName, modeOf(*staged), reported.Mode)
+		}
+	}
+}
+
+// A staging failure must abort before the commit: with nothing committed the
+// desktop is exactly as it was, which is why the commit is the last call.
+func TestWindowsNativeApplyLayoutAbortsBeforeCommittingAPartialLayout(t *testing.T) {
+	api := stagedLayout(t)
+	api.changeResults = map[string]int32{`\.\DISPLAY5`: dispChangeBadParam}
+	native := &windowsNative{api: api}
+	plan, err := PlanModeChange(measuredLayout(), `\.\DISPLAY1`, miMonitorGame)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := native.applyLayout(plan); err == nil {
+		t.Fatal("a rejected display was reported as success")
+	}
+	for _, call := range api.calls {
+		if call.device == "" {
+			t.Fatalf("the layout was committed after a staging failure: %+v", api.calls)
+		}
+	}
+	if len(api.calls) != 3 {
+		t.Fatalf("calls=%+v, want staging to stop at the rejected display", api.calls)
+	}
+}
+
+func TestWindowsNativeApplyLayoutRefusesAnEmptyPlan(t *testing.T) {
+	api := stagedLayout(t)
+	native := &windowsNative{api: api}
+
+	if err := native.applyLayout(domain.LayoutPlan{}); err == nil {
+		t.Fatal("an empty plan was applied")
+	}
+	if len(api.calls) != 0 {
+		t.Fatalf("calls=%+v", api.calls)
 	}
 }
 
@@ -186,8 +423,13 @@ func TestWindowsNativeEnumUsesResolvedDeviceCurrentSettingsAndBufferSize(t *test
 			_, err := n.currentMode(device)
 			return err
 		},
-		"changeMode": func(n *windowsNative) error {
-			return n.changeMode(device, gameMode, true)
+		"testMode": func(n *windowsNative) error {
+			return n.testMode(device, gameMode)
+		},
+		"applyLayout": func(n *windowsNative) error {
+			return n.applyLayout(domain.LayoutPlan{Changes: []domain.LayoutChange{{
+				DeviceName: device, Position: domain.Point{}, Mode: gameMode, SetMode: true,
+			}}})
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -232,6 +474,12 @@ func TestDescribeResultCoversDocumentedValues(t *testing.T) {
 		if got := describeResult(tt.result); got != tt.want {
 			t.Errorf("describeResult(%d)=%q want %q", tt.result, got, tt.want)
 		}
+	}
+	if got := describeDevice(""); got != "commit" {
+		t.Errorf("describeDevice(nil device)=%q", got)
+	}
+	if got := describeDevice(`\.\DISPLAY1`); got != `\.\DISPLAY1` {
+		t.Errorf("describeDevice=%q", got)
 	}
 }
 

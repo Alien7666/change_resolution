@@ -121,8 +121,16 @@ func (d *stubDisplays) CurrentMode(domain.Target) (domain.Mode, error) {
 	return domain.Mode{Width: 2560, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}, nil
 }
 
-func (d *stubDisplays) TestMode(domain.Target, domain.Mode) error  { return errUnexpectedModeChange }
-func (d *stubDisplays) ApplyMode(domain.Target, domain.Mode) error { return errUnexpectedModeChange }
+func (d *stubDisplays) CurrentLayout() (domain.Layout, error) {
+	return domain.Layout{Displays: []domain.DisplayState{{
+		DeviceName: `\.\DISPLAY4`,
+		Mode:       domain.Mode{Width: 2560, Height: 1440, RefreshHz: 180, BitsPerPixel: 32},
+		Primary:    true,
+	}}}, nil
+}
+
+func (d *stubDisplays) TestMode(domain.Target, domain.Mode) error { return errUnexpectedModeChange }
+func (d *stubDisplays) ApplyLayout(domain.LayoutPlan) error       { return errUnexpectedModeChange }
 
 func (d *stubDisplays) setResolveErr(err error) {
 	d.mu.Lock()

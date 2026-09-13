@@ -67,7 +67,8 @@ type sessionWatcher struct {
 	done   chan struct{}
 }
 
-// Session owns a saved mode only after this instance successfully applies GameMode.
+// Session owns the saved desktop layout only after this instance successfully applies
+// GameMode.
 // opMu serializes complete workflows. mu protects snapshots and notifications only;
 // no external display, process, or callback code runs while mu is held.
 type Session struct {
@@ -78,7 +79,7 @@ type Session struct {
 	processes    process.Checker
 	profile      domain.Profile
 	clock        sessionClock
-	original     domain.Mode
+	saved        domain.Layout
 	managed      bool
 	closed       bool
 	generation   uint64
@@ -206,6 +207,28 @@ func (s *Session) readCurrent() (domain.Target, domain.Mode, error) {
 	return target, mode, nil
 }
 
+// readLayout resolves the target and reads the whole desktop arrangement. Any mode
+// change moves the displays beside the target, so the arrangement, not the target's
+// mode on its own, is what an apply and a fallback restore have to be planned from.
+func (s *Session) readLayout() (domain.Target, domain.Layout, domain.DisplayState, error) {
+	target, err := s.displays.ResolveTarget(s.profile.MonitorHardwareID)
+	if err != nil {
+		return domain.Target{}, domain.Layout{}, domain.DisplayState{}, s.fail("resolve target", err)
+	}
+	layout, err := s.displays.CurrentLayout()
+	if err != nil {
+		return target, domain.Layout{}, domain.DisplayState{}, s.fail("read display layout", err)
+	}
+	current, ok := layout.Find(target.DeviceName)
+	if !ok {
+		return target, domain.Layout{}, domain.DisplayState{}, s.fail("read display layout",
+			fmt.Errorf("%w: %s is not among the attached displays",
+				display.ErrLayoutUnsafe, target.DeviceName))
+	}
+	s.observed(target, current.Mode)
+	return target, layout, current, nil
+}
+
 // Refresh re-reads the target monitor and its current mode without changing it.
 // It stays useful when every mutating control is disabled: a monitor that was
 // asleep or on another input at startup is only noticed by reading again. The
@@ -234,18 +257,22 @@ func (s *Session) Enable() error {
 		return nil
 	}
 	s.state(StateApplying, "正在驗證並套用 4:3")
-	target, original, err := s.readCurrent()
+	target, layout, current, err := s.readLayout()
 	if err != nil {
 		return err
 	}
-	if original == s.profile.GameMode {
+	if current.Mode == s.profile.GameMode {
 		s.state(StateNative, "目前已是 4:3；可手動恢復 2K")
 		return nil
 	}
-	if err := s.apply(target, s.profile.GameMode); err != nil {
+	plan, err := display.PlanModeChange(layout, target.DeviceName, s.profile.GameMode)
+	if err != nil {
+		return s.fail("plan display layout", err)
+	}
+	if err := s.apply(target, s.profile.GameMode, plan); err != nil {
 		return err
 	}
-	s.original, s.managed = original, true
+	s.saved, s.managed = layout, true
 	s.updateSnapshot(func(snapshot *Snapshot) {
 		snapshot.CurrentMode, snapshot.FourByThree, snapshot.Managed = s.profile.GameMode, true, true
 		snapshot.State, snapshot.Message, snapshot.Err = StateWaitingForGame, "4:3 已啟用，等待遊戲", nil
@@ -254,12 +281,15 @@ func (s *Session) Enable() error {
 	return nil
 }
 
-func (s *Session) apply(target domain.Target, mode domain.Mode) error {
+// apply pre-flights the target's mode and then applies the whole arrangement in one
+// transaction. The plan reaching this point has already been proved safe, so the
+// only thing left between it and the desktop is the driver.
+func (s *Session) apply(target domain.Target, mode domain.Mode, plan domain.LayoutPlan) error {
 	if err := s.displays.TestMode(target, mode); err != nil {
 		return s.fail("test display mode", err)
 	}
-	if err := s.displays.ApplyMode(target, mode); err != nil {
-		return s.fail("apply display mode", err)
+	if err := s.displays.ApplyLayout(plan); err != nil {
+		return s.fail("apply display layout", err)
 	}
 	return nil
 }
@@ -310,38 +340,68 @@ func (s *Session) Disable() error {
 }
 
 // restore runs only under opMu. Unmanaged fallback is reserved for explicit Disable.
-// Saved ownership survives every resolve/test/apply failure so restoration is retryable.
+// Saved ownership survives every resolve/plan/test/apply failure so restoration is
+// retryable.
 func (s *Session) restore(allowFallback bool) error {
-	var target domain.Target
-	var mode domain.Mode
-	var err error
 	if s.managed {
-		s.state(StateRestoring, "正在恢復原始顯示模式")
-		target, err = s.displays.ResolveTarget(s.profile.MonitorHardwareID)
-		if err != nil {
-			return s.fail("resolve target for restore", err)
-		}
-		mode = s.original
-	} else {
-		if !allowFallback {
-			return nil
-		}
-		target, mode, err = s.readCurrent()
-		if err != nil {
-			return err
-		}
-		if mode != s.profile.GameMode {
-			s.state(StateNative, "目前未使用 4:3")
-			return nil
-		}
-		mode = s.profile.FallbackNativeMode
-		s.state(StateRestoring, "正在恢復 2K 顯示模式")
+		return s.restoreSaved()
 	}
-	if err := s.apply(target, mode); err != nil {
+	if !allowFallback {
+		return nil
+	}
+	return s.restoreFallback()
+}
+
+// restoreSaved puts the desktop back exactly as this session found it: the target's
+// saved mode and every display's saved coordinate, applied together. The target is
+// resolved again rather than taken from the saved layout, and a target that is no
+// longer part of that layout aborts the restore: the displays have been renumbered
+// under the tool, so the saved coordinates belong to an arrangement that is gone.
+func (s *Session) restoreSaved() error {
+	s.state(StateRestoring, "正在恢復原始顯示模式")
+	target, err := s.displays.ResolveTarget(s.profile.MonitorHardwareID)
+	if err != nil {
+		return s.fail("resolve target for restore", err)
+	}
+	saved, ok := s.saved.Find(target.DeviceName)
+	if !ok {
+		return s.fail("plan display layout", fmt.Errorf("%w: the saved layout does not contain %s",
+			display.ErrLayoutUnsafe, target.DeviceName))
+	}
+	plan, err := display.PlanRestore(s.saved, target.DeviceName)
+	if err != nil {
+		return s.fail("plan display layout", err)
+	}
+	return s.finishRestore(target, saved.Mode, plan)
+}
+
+// restoreFallback is the escape hatch for a 4:3 desktop this session never applied.
+// There is no saved arrangement to return to, so the native mode from the profile is
+// planned against the desktop as it looks right now, which is also what keeps the
+// wider mode from landing on top of the display beside it.
+func (s *Session) restoreFallback() error {
+	target, layout, current, err := s.readLayout()
+	if err != nil {
+		return err
+	}
+	if current.Mode != s.profile.GameMode {
+		s.state(StateNative, "目前未使用 4:3")
+		return nil
+	}
+	plan, err := display.PlanModeChange(layout, target.DeviceName, s.profile.FallbackNativeMode)
+	if err != nil {
+		return s.fail("plan display layout", err)
+	}
+	s.state(StateRestoring, "正在恢復 2K 顯示模式")
+	return s.finishRestore(target, s.profile.FallbackNativeMode, plan)
+}
+
+func (s *Session) finishRestore(target domain.Target, mode domain.Mode, plan domain.LayoutPlan) error {
+	if err := s.apply(target, mode, plan); err != nil {
 		return err
 	}
 	s.managed = false
-	s.original = domain.Mode{}
+	s.saved = domain.Layout{}
 	s.updateSnapshot(func(snapshot *Snapshot) {
 		snapshot.Target, snapshot.CurrentMode = target, mode
 		snapshot.FourByThree, snapshot.Managed = mode == s.profile.GameMode, false
