@@ -789,7 +789,7 @@ $env:RUN_DISPLAY_INTEGRATION='1'; go test ./internal/display -run TestWindowsCon
 
 Expected: all tests, vet, safe mode validation, and build PASS.
 
-- [ ] **Step 2: Perform the manual Windows smoke test**
+- [x] **Step 2: Perform the manual Windows smoke test**
 
 With VALORANT closed:
 
