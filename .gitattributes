@@ -1,0 +1,14 @@
+# Check every text file out with LF, on every platform.
+#
+# Without this, Windows runners (and Windows clones with core.autocrlf=true)
+# get a CRLF working tree, and `gofmt -l` then reports every Go file as
+# unformatted because Go source is defined to use LF. That is what broke CI
+# on the first push: 26 files listed, none of them actually misformatted.
+* text=auto eol=lf
+
+# Binaries git should never touch.
+*.exe binary
+*.syso binary
+*.pyz binary
+*.pyc binary
+*.zip binary
