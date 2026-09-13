@@ -20,7 +20,7 @@ const (
 	maxCoordinate = 1 << 24
 )
 
-// PlanModeChange derives the transaction that puts targetDevice into mode while
+// PlanModeChange derives the arrangement that puts targetDevice into mode while
 // keeping the desktop contiguous.
 //
 // Changing the target's width by delta would otherwise leave a delta-wide dead zone
@@ -68,11 +68,11 @@ func PlanModeChange(layout domain.Layout, targetDevice string, mode domain.Mode)
 	return planFor(arranged, targetDevice), nil
 }
 
-// PlanRestore derives the transaction that puts the desktop back to the saved
-// arrangement. Only the target's mode is restored: every other display is moved
-// back to its saved coordinate and keeps whatever mode it is running now, because
-// the tool never owned those modes and must not revert a change the user made
-// while the game mode was active.
+// PlanRestore derives the arrangement that puts the desktop back to the saved one.
+// Only the target's mode is restored: every other display is moved back to its
+// saved coordinate and keeps whatever mode it is running now, because the tool
+// never owned those modes and must not revert a change the user made while the game
+// mode was active.
 func PlanRestore(saved domain.Layout, targetDevice string) (domain.LayoutPlan, error) {
 	if err := validateLayout(saved); err != nil {
 		return domain.LayoutPlan{}, err

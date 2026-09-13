@@ -21,18 +21,12 @@ const (
 	dmPelsHeight       uint32 = 0x00100000
 	dmDisplayFrequency uint32 = 0x00400000
 
-	// CDS_UPDATEREGISTRY (0x00000001) is deliberately absent from this file: the
-	// mode change must stay a run-time one that dies with the process. cdsNoReset
-	// stages a display's change without applying it, so the whole arrangement can be
-	// committed by one later call instead of the desktop rearranging itself display
-	// by display.
+	// CDS_UPDATEREGISTRY (0x00000001) is deliberately absent from this file: the mode
+	// change must stay a run-time one that dies with the process. CDS_NORESET
+	// (0x10000000) is absent too; applyLayout records the measurement that rules it
+	// out.
 	cdsTest       uint32 = 0x00000002
 	cdsFullscreen uint32 = 0x00000004
-	cdsNoReset    uint32 = 0x10000000
-
-	// commitFlags applies everything staged with cdsNoReset. The committing call
-	// passes no device and no DEVMODEW, so it carries no flags of its own.
-	commitFlags uint32 = 0
 
 	dispChangeSuccessful  int32 = 0
 	dispChangeRestart     int32 = 1
@@ -193,10 +187,39 @@ func (n *windowsNative) testMode(deviceName string, mode domain.Mode) error {
 	return n.change(deviceNamePtr, deviceName, &dm, cdsTest)
 }
 
-// applyLayout stages every display's change with CDS_NORESET and then commits the
-// whole arrangement with a single NULL device / NULL DEVMODEW call. Nothing takes
-// effect until that commit, so a staging failure aborts with the desktop untouched
-// instead of leaving it half rearranged.
+// stagedChange is one display's part of an apply: the DEVMODEW that carries the
+// change, and the same DEVMODEW carrying the values the driver reported before it,
+// which is what putting that display back means.
+type stagedChange struct {
+	deviceName string
+	devicePtr  *uint16
+	next       devMode
+	previous   devMode
+	setsMode   bool
+	growsMode  bool
+}
+
+// applyLayout applies the planned arrangement one display at a time, each with its
+// own ChangeDisplaySettingsExW(device, &dm, CDS_FULLSCREEN) call.
+//
+// CDS_NORESET is not used, and this is not an oversight waiting to be "fixed" back
+// into a staged transaction. MSDN documents CDS_NORESET as meaningful only
+// alongside CDS_UPDATEREGISTRY, which this tool must never send because it would
+// make a temporary game mode the user's permanent setting; and the staging call is
+// in fact rejected outright by the driver this tool runs against. Measured on the
+// target machine (RTX 3070, four displays, DISPLAY1 the primary at 2560x1440@180),
+// each call re-reading that display's current settings and writing the identical
+// values back, varying only the flag word:
+//
+//	CDS_FULLSCREEN|CDS_NORESET  ->  DISP_CHANGE_BADFLAGS
+//	CDS_NORESET                 ->  DISP_CHANGE_BADFLAGS
+//	CDS_FULLSCREEN              ->  DISP_CHANGE_SUCCESSFUL
+//	flags = 0                   ->  DISP_CHANGE_SUCCESSFUL
+//
+// A sequential apply has no atomicity of its own, so the three things the staged
+// transaction was meant to buy are bought here instead: orderForApply keeps every
+// intermediate desktop free of overlaps, rollBack puts back whatever was already
+// changed when a later call fails, and verifyApplied holds the result to the plan.
 //
 // Only the target carries mode fields. Every other display declares DM_POSITION and
 // nothing else, which is what keeps its resolution, refresh rate and colour depth
@@ -205,25 +228,157 @@ func (n *windowsNative) applyLayout(plan domain.LayoutPlan) error {
 	if len(plan.Changes) == 0 {
 		return errors.New("ChangeDisplaySettingsExW: refusing to apply an empty layout plan")
 	}
+	staged, err := n.stageChanges(plan)
+	if err != nil {
+		return err
+	}
+	var applied []stagedChange
+	for _, step := range orderForApply(staged) {
+		if err := n.change(step.devicePtr, step.deviceName, &step.next, cdsFullscreen); err != nil {
+			return n.rollBack(applied, err)
+		}
+		applied = append(applied, step)
+	}
+	return n.verifyApplied(plan)
+}
+
+// stageChanges reads every display's DEVMODEW once, before anything is written, and
+// derives both the write and its undo from it. Reading up front is what makes the
+// undo the state the desktop had when this apply started, even for a display an
+// earlier call in the same apply has already nudged.
+func (n *windowsNative) stageChanges(plan domain.LayoutPlan) ([]stagedChange, error) {
+	staged := make([]stagedChange, 0, len(plan.Changes))
 	for _, change := range plan.Changes {
-		deviceNamePtr, err := windows.UTF16PtrFromString(change.DeviceName)
+		devicePtr, err := windows.UTF16PtrFromString(change.DeviceName)
 		if err != nil {
-			return fmt.Errorf("device name: %w", err)
+			return nil, fmt.Errorf("device name: %w", err)
 		}
-		dm, err := n.loadCurrentMode(deviceNamePtr, change.DeviceName)
+		current, err := n.loadCurrentMode(devicePtr, change.DeviceName)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		dm.DmPosition = pointL{X: change.Position.X, Y: change.Position.Y}
-		dm.DmFields = dmPosition
+		next := current
+		next.DmPosition = pointL{X: change.Position.X, Y: change.Position.Y}
+		next.DmFields = dmPosition
 		if change.SetMode {
-			dm = withMode(dm, change.Mode)
+			next = withMode(next, change.Mode)
 		}
-		if err := n.change(deviceNamePtr, change.DeviceName, &dm, cdsFullscreen|cdsNoReset); err != nil {
-			return err
+		// previous declares exactly the members next declares, so undoing a change
+		// writes the same field set back and never widens it.
+		previous := current
+		previous.DmFields = next.DmFields
+		staged = append(staged, stagedChange{
+			deviceName: change.DeviceName,
+			devicePtr:  devicePtr,
+			next:       next,
+			previous:   previous,
+			setsMode:   change.SetMode,
+			growsMode: change.SetMode &&
+				(change.Mode.Width > current.DmPelsWidth || change.Mode.Height > current.DmPelsHeight),
+		})
+	}
+	return staged, nil
+}
+
+// orderForApply decides which display crosses into Win32 first. A transient gap
+// between displays is harmless; a transient overlap is not, because Windows repacks
+// a desktop it considers invalid and the tool then no longer knows where anything
+// sits.
+//
+// A target that does not grow in either axis gives up its space the moment its mode
+// lands, so it goes first and its neighbours close the gap behind it. A target that
+// grows in either axis needs that space before it can occupy it, so the neighbours
+// move away first and the target's mode goes last. The decision is read off the
+// staged sizes -- the planned mode against the one the driver reported -- never off
+// a particular resolution.
+func orderForApply(staged []stagedChange) []stagedChange {
+	target := -1
+	for i, step := range staged {
+		if step.setsMode {
+			target = i
+			break
 		}
 	}
-	return n.change(nil, "", nil, commitFlags)
+	if target < 0 {
+		return staged
+	}
+	ordered := make([]stagedChange, 0, len(staged))
+	if !staged[target].growsMode {
+		ordered = append(ordered, staged[target])
+	}
+	for i, step := range staged {
+		if i != target {
+			ordered = append(ordered, step)
+		}
+	}
+	if staged[target].growsMode {
+		ordered = append(ordered, staged[target])
+	}
+	return ordered
+}
+
+// rollBack puts every display this apply already changed back to what the driver
+// reported before it started, most recent first, and returns the failure that caused
+// it.
+//
+// A rollback call that fails itself is reported as exactly that: saying only that
+// the apply failed would tell the user their desktop is untouched when it is not.
+// The remaining displays are still attempted after such a failure, so as few as
+// possible are left somewhere the user did not put them.
+func (n *windowsNative) rollBack(applied []stagedChange, cause error) error {
+	var failure error
+	for i := len(applied) - 1; i >= 0; i-- {
+		previous := applied[i].previous
+		if err := n.change(applied[i].devicePtr, applied[i].deviceName, &previous, cdsFullscreen); err != nil {
+			if failure == nil {
+				failure = err
+			}
+		}
+	}
+	if failure != nil {
+		return fmt.Errorf("%w: %w; rolling the desktop back also failed: %w",
+			ErrLayoutPartlyApplied, cause, failure)
+	}
+	return cause
+}
+
+// verifyApplied re-reads the desktop and holds it to the plan. Every call having
+// returned DISP_CHANGE_SUCCESSFUL is not proof that the desktop is the arrangement
+// that was planned: Windows may repack displays on its own during a mode change.
+//
+// The rule chosen here is that any difference from the plan is an error. The
+// tempting alternative -- accept a desktop that is merely still contiguous -- is not
+// something this code can honestly check: the planner proves that displays do not
+// overlap, which is not the same as proving the mouse can reach all of them, and a
+// monitor parked out of reach is the exact failure this check exists for. Reporting
+// a harmless repack costs the user one message; calling an unreachable monitor a
+// success costs them the monitor.
+//
+// Nothing is rolled back here. Every call succeeded, so there is no failed call to
+// undo, and a second unvalidated mode change on a desktop that already moved under
+// the tool would be guesswork; the recovery that fits is a restore, which re-plans
+// against the desktop as it actually is.
+func (n *windowsNative) verifyApplied(plan domain.LayoutPlan) error {
+	observed, err := n.currentLayout()
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrLayoutNotVerified, err)
+	}
+	for _, change := range plan.Changes {
+		state, ok := observed.Find(change.DeviceName)
+		if !ok {
+			return fmt.Errorf("%w: %s is no longer attached", ErrLayoutNotVerified, change.DeviceName)
+		}
+		if state.Position != change.Position {
+			return fmt.Errorf("%w: %s sits at (%d,%d), the plan put it at (%d,%d)",
+				ErrLayoutNotVerified, change.DeviceName,
+				state.Position.X, state.Position.Y, change.Position.X, change.Position.Y)
+		}
+		if change.SetMode && state.Mode != change.Mode {
+			return fmt.Errorf("%w: %s runs %s, the plan asked for %s",
+				ErrLayoutNotVerified, change.DeviceName, describeMode(state.Mode), describeMode(change.Mode))
+		}
+	}
+	return nil
 }
 
 func (n *windowsNative) change(deviceNamePtr *uint16, deviceName string, dm *devMode, flags uint32) error {
@@ -233,7 +388,7 @@ func (n *windowsNative) change(deviceNamePtr *uint16, deviceName string, dm *dev
 		dm.DmSize = uint16(unsafe.Sizeof(*dm))
 	}
 	if result := n.api.changeDisplaySettingsEx(deviceNamePtr, dm, flags); result != dispChangeSuccessful {
-		return fmt.Errorf("ChangeDisplaySettingsExW(%s): %s", describeDevice(deviceName), describeResult(result))
+		return fmt.Errorf("ChangeDisplaySettingsExW(%s): %s", deviceName, describeResult(result))
 	}
 	return nil
 }
@@ -314,11 +469,8 @@ func win32CallError(operation string, callErr error) error {
 	return fmt.Errorf("%s: %w", operation, callErr)
 }
 
-func describeDevice(deviceName string) string {
-	if deviceName == "" {
-		return "commit"
-	}
-	return deviceName
+func describeMode(mode domain.Mode) string {
+	return fmt.Sprintf("%dx%d @ %d Hz %d bpp", mode.Width, mode.Height, mode.RefreshHz, mode.BitsPerPixel)
 }
 
 func describeResult(result int32) string {

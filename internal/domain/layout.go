@@ -34,9 +34,9 @@ func (l Layout) Find(deviceName string) (DisplayState, bool) {
 	return DisplayState{}, false
 }
 
-// LayoutChange is one display's part of a layout transaction. Mode is written only
-// when SetMode is true, so a display the tool does not target can only ever be
-// moved: its resolution, refresh rate and colour depth are never in the write set.
+// LayoutChange is one display's part of a layout change. Mode is written only when
+// SetMode is true, so a display the tool does not target can only ever be moved: its
+// resolution, refresh rate and colour depth are never in the write set.
 type LayoutChange struct {
 	DeviceName string
 	Position   Point
@@ -44,8 +44,10 @@ type LayoutChange struct {
 	SetMode    bool
 }
 
-// LayoutPlan is an atomic transaction. Every change is staged first and the whole
-// arrangement is committed once, so the desktop is never left half applied.
+// LayoutPlan is the whole arrangement to be applied, not a list of independent
+// edits. It is planned and validated as a unit, and the layer that applies it is
+// responsible for ordering the displays so no intermediate desktop overlaps and for
+// putting back what it already changed if one of them fails.
 type LayoutPlan struct {
 	Changes []LayoutChange
 }

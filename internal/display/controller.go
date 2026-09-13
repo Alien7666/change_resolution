@@ -17,6 +17,18 @@ var (
 	// the target cannot be driven at it. Callers use errors.Is to separate an
 	// unsupported mode from an apply that merely failed once.
 	ErrModeNotSupported = errors.New("display mode not supported")
+
+	// ErrLayoutNotVerified reports that the desktop read back after an apply is not
+	// the arrangement that was planned. Every call returned DISP_CHANGE_SUCCESSFUL,
+	// so the mode change did happen; what could not be confirmed is that the desktop
+	// it produced is the one that was proved safe.
+	ErrLayoutNotVerified = errors.New("display layout was not applied as planned")
+
+	// ErrLayoutPartlyApplied reports that an apply failed and putting the displays it
+	// had already changed back failed too. The desktop is left in an arrangement
+	// neither the tool nor the user chose, which the user has to be told rather than
+	// be told the operation simply failed and changed nothing.
+	ErrLayoutPartlyApplied = errors.New("display layout was left partly applied")
 )
 
 type Controller interface {
@@ -77,9 +89,12 @@ func (c *controller) TestMode(target domain.Target, mode domain.Mode) error {
 	return nil
 }
 
-// ApplyLayout applies a whole arrangement as one transaction. Callers build the
-// plan with PlanModeChange or PlanRestore, which refuse to produce a plan they
-// cannot prove safe, so nothing partial ever reaches the driver.
+// ApplyLayout applies a whole arrangement. Callers build the plan with
+// PlanModeChange or PlanRestore, which refuse to produce a plan they cannot prove
+// safe, so a half-considered arrangement never reaches the driver. The plan is
+// handed to the native layer whole because that layer owns the apply order, the
+// rollback of a partial apply, and the check that the desktop ended up where the
+// plan said it would.
 func (c *controller) ApplyLayout(plan domain.LayoutPlan) error {
 	return c.native.applyLayout(plan)
 }

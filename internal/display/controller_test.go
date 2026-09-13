@@ -122,8 +122,10 @@ func TestTestModeUsesOnlyResolvedDevice(t *testing.T) {
 	}
 }
 
-// The whole arrangement reaches the native layer as one plan. Splitting it per
-// display here would be exactly the half applied desktop the transaction avoids.
+// The whole arrangement reaches the native layer as one plan. The native layer is
+// what chooses the order the displays are applied in, puts back what it already
+// changed when one of them fails, and checks the desktop it produced; splitting the
+// plan up here would take all three away from it.
 func TestApplyLayoutHandsTheWholePlanToTheNativeLayer(t *testing.T) {
 	api := &fakeNative{}
 	c := newController(api)

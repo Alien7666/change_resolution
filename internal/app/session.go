@@ -281,9 +281,11 @@ func (s *Session) Enable() error {
 	return nil
 }
 
-// apply pre-flights the target's mode and then applies the whole arrangement in one
-// transaction. The plan reaching this point has already been proved safe, so the
-// only thing left between it and the desktop is the driver.
+// apply pre-flights the target's mode and only then applies the whole arrangement.
+// The plan reaching this point has already been proved safe, so the only thing left
+// between it and the desktop is the driver; the display layer applies the displays
+// in an order that never overlaps them, rolls back what it already changed if a
+// call fails, and reports a desktop that did not end up matching the plan.
 func (s *Session) apply(target domain.Target, mode domain.Mode, plan domain.LayoutPlan) error {
 	if err := s.displays.TestMode(target, mode); err != nil {
 		return s.fail("test display mode", err)
