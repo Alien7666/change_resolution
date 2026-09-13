@@ -42,6 +42,14 @@ Remove-Item Env:RUN_DISPLAY_INTEGRATION
 
 `go build` always targets `windows/amd64` with `CGO_ENABLED=0` and `-ldflags '-H windowsgui -s -w'`, producing `dist/ResolutionTray.exe` (gitignored, local artifact only).
 
+### GitHub Actions
+
+`build.ps1` stays the single source of truth for `go generate` and the link flags — both workflows call it instead of restating them.
+
+- `.github/workflows/ci.yml` — push to any branch, pull requests, `workflow_dispatch`. On `windows-latest`: `gofmt -l ./internal ./cmd` (fails if anything is listed), `go mod tidy -diff`, `go build ./...`, `go vet ./...`, `go test ./...`, `go test -race ./...`, then `./build.ps1` to prove the GUI binary still links. `-race` needs a C toolchain, so CI is the only place the race detector runs.
+- `.github/workflows/release.yml` — `v*` tag push, plus `workflow_dispatch` for a dry run that builds and checksums but publishes nothing. On `windows-latest`: `./build.ps1` (generate + full test suite + vet + build), SHA256 checksum, then `softprops/action-gh-release` attaches `dist/ResolutionTray.exe` and `dist/ResolutionTray.exe.sha256` to the release. Job permissions are `contents: write` and nothing else.
+- Neither workflow sets `RUN_DISPLAY_INTEGRATION`. CI must never run the opt-in integration tests, which drive the real Win32 display APIs.
+
 ## Testing
 
 - `internal/domain`, `internal/display`, `internal/process`: pure/table-driven unit tests plus Win32-struct-layout and fake-adapter tests — no real display or process API calls.

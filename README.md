@@ -1,5 +1,7 @@
 # VALORANT 4:3 顯示工具
 
+[![CI](https://github.com/Alien7666/change_resolution/actions/workflows/ci.yml/badge.svg)](https://github.com/Alien7666/change_resolution/actions/workflows/ci.yml)
+
 Windows 系統匣工具，用來手動切換 Mi Monitor（`MONITOR\XMI27B2`）的顯示模式，並在 VALORANT 關閉後自動恢復原始解析度。取代原本的 Python/PyInstaller 解析度切換腳本。
 
 ## 這個工具做什麼
@@ -16,6 +18,20 @@ Mi Monitor 只有原生 `2560×1440`，切到 `1920×1440` 屬於非原生比例
 1. 開啟 NVIDIA 控制台 → **調整桌面尺寸與位置**。
 2. 縮放模式選擇「全螢幕」，並將「執行縮放的裝置」設為 **GPU**（而非顯示器或顯示器內建縮放）。
 3. 套用後即可。此設定只需做一次，之後每次工具切換解析度都會沿用。
+
+## 安裝（從 GitHub Release 下載）
+
+1. 到 [Releases](https://github.com/Alien7666/change_resolution/releases) 下載最新版的 `ResolutionTray.exe` 與 `ResolutionTray.exe.sha256`。免安裝，單一執行檔。
+2. 校驗下載的檔案（PowerShell，在兩個檔案所在的目錄執行）：
+
+   ```powershell
+   $expected = (Get-Content .\ResolutionTray.exe.sha256).Split(' ')[0]
+   (Get-FileHash -Algorithm SHA256 .\ResolutionTray.exe).Hash -eq $expected   # 必須印出 True
+   ```
+
+3. 校驗通過後直接執行 `ResolutionTray.exe`。
+
+> **執行檔沒有程式碼簽章。** 第一次執行時 Windows SmartScreen 會跳出「已保護您的電腦」，防毒軟體也可能一併攔截或隔離——這對自行建置、沒有購買程式碼簽章憑證的工具是正常現象，不代表檔案有問題。請先完成上面的 SHA256 校驗，再點「其他資訊」→「仍要執行」。若不放心，也可以依「[建置](#建置)」一節自行從原始碼建置。
 
 ## 使用者流程
 
@@ -78,3 +94,18 @@ Remove-Item Env:RUN_DISPLAY_INTEGRATION
 ```powershell
 $env:PATH = "C:\Program Files\Go\bin;$env:PATH"
 ```
+
+## 持續整合與發布
+
+建置流程的唯一真相來源是 [`build.ps1`](build.ps1)；兩個 workflow 都直接呼叫它，不另外複製一份建置參數。
+
+- **CI** — [`.github/workflows/ci.yml`](.github/workflows/ci.yml)：每次 push、每個 pull request 以及手動觸發時，在 `windows-latest` 上依序執行 `gofmt` 檢查、`go mod tidy -diff`、`go build ./...`、`go vet ./...`、`go test ./...`、`go test -race ./...`，最後跑一次 `build.ps1` 確認執行檔仍然建得起來。競態偵測器（`-race`）需要 C 工具鏈，開發機沒有，只有 CI 跑得到。CI 永遠不會設定 `RUN_DISPLAY_INTEGRATION`，所以不會真的變更任何顯示模式。
+- **發布** — [`.github/workflows/release.yml`](.github/workflows/release.yml)：推一個 `v*` tag 即可發布。它會跑 `build.ps1`（含完整測試）、計算 SHA256，並建立該 tag 的 GitHub Release，附上 `ResolutionTray.exe` 與 `ResolutionTray.exe.sha256`。
+
+```powershell
+# 發布新版本
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+也可以在 GitHub 的 Actions 頁面手動觸發 Release workflow 做一次 dry run：會完整測試、建置並算出校驗碼，但不會發布任何 Release。

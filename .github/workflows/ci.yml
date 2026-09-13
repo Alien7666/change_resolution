@@ -1,0 +1,84 @@
+name: CI
+
+# Every push on any branch, every pull request, and on demand. Tag pushes are
+# deliberately not matched here: release.yml runs the same checks for a tag.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+# Read-only: CI only needs to check the repository out.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify (windows/amd64)
+    # The project is Windows-only (Win32 display APIs, Toolhelp, Walk), and a
+    # windows-latest runner also ships the C toolchain the race detector needs.
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Go
+        # go-version-file reads the `go` directive from go.mod, so CI can never
+        # drift away from the toolchain the module declares. cache: true keeps
+        # the module cache and build cache warm between runs.
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check gofmt
+        # `gofmt -l` exits 0 even when it lists files, so the listing is the gate.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $unformatted = gofmt -l ./internal ./cmd
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($unformatted) {
+            Write-Host 'These files are not gofmt-clean:'
+            $unformatted | ForEach-Object { Write-Host "  $_" }
+            throw 'gofmt found unformatted files. Run "gofmt -w ./internal ./cmd" and commit the result.'
+          }
+          Write-Host 'gofmt: clean.'
+
+      - name: Check go.mod and go.sum are tidy
+        # `-diff` prints the changes tidying would make and exits non-zero
+        # instead of rewriting the files, so CI fails rather than self-heals.
+        run: go mod tidy -diff
+
+      - name: Build every package
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        # RUN_DISPLAY_INTEGRATION is deliberately never set here. The opt-in
+        # tests in internal/display/integration_windows_test.go drive the real
+        # Win32 display APIs; CI must not change a runner's display mode.
+        run: go test ./...
+
+      - name: Test with the race detector
+        # The race detector needs a C toolchain. The developer's machine has
+        # none, but windows-latest does, so this code's concurrency (the
+        # Session serializer and the background game-presence watcher) gets
+        # checked here and nowhere else.
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race ./...
+
+      - name: Build the shipping binary
+        # build.ps1 is the single source of truth for `go generate` (which
+        # regenerates the gitignored rsrc.syso from the manifest) and for the
+        # GUI-subsystem link flags. Running it here proves the documented build
+        # entry point still works from a clean checkout and that the binary
+        # links. It re-runs test and vet, which is the deliberate cost of not
+        # copying the link flags into a second file.
+        run: ./build.ps1

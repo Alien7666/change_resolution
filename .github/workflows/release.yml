@@ -1,0 +1,102 @@
+name: Release
+
+# A `v*` tag publishes a release. workflow_dispatch runs everything except the
+# publish step, so the pipeline can be rehearsed without creating a release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: windows-latest
+    # The only write this job performs is creating the release and uploading its
+    # assets. Every other scope is dropped to none by naming permissions here.
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test, vet and build the release binary
+        # build.ps1 is the single source of truth: go generate (rebuilds the
+        # gitignored rsrc.syso from resolution-tray.manifest, so the Common
+        # Controls 6 / PerMonitorV2 manifest is never lost) -> go test ./... ->
+        # go vet ./... -> the GUI-subsystem exe. It stops at the first failure,
+        # so nothing is produced unless the full test suite passed first.
+        #
+        # RUN_DISPLAY_INTEGRATION is deliberately never set: the opt-in tests in
+        # internal/display drive the real Win32 display APIs.
+        run: ./build.ps1
+
+      - name: Compute the SHA256 checksum
+        id: checksum
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'dist/ResolutionTray.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "build.ps1 did not produce $exe"
+          }
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
+          # sha256sum-compatible: two spaces, and an LF terminator so that
+          # `sha256sum -c` accepts the file on Linux and macOS too.
+          [System.IO.File]::WriteAllText(
+            (Join-Path $PWD 'dist/ResolutionTray.exe.sha256'),
+            "$sha  ResolutionTray.exe`n")
+          "sha256=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**ResolutionTray.exe SHA256:** $sha"
+
+      - name: Report that a manual run does not publish
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value 'Dry run: the binary was built and checksummed, but no release was published. Push a `v*` tag to publish one.'
+
+      - name: Publish the GitHub Release
+        # Only a tag push publishes; a manual dry run stops at the step above.
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          files: |
+            dist/ResolutionTray.exe
+            dist/ResolutionTray.exe.sha256
+          # Fail loudly rather than publishing a release with no assets.
+          fail_on_unmatched_files: true
+          body: |
+            **VALORANT 4:3 顯示工具** — Windows 系統匣工具，手動把 Mi Monitor（`MONITOR\XMI27B2`）切到 `1920×1440 @ 180 Hz`，並在 `VALORANT-Win64-Shipping.exe` 從程序清單消失 3 秒後自動恢復原始解析度。
+
+            ## 下載
+
+            | 檔案 | 說明 |
+            | --- | --- |
+            | `ResolutionTray.exe` | Windows x64 執行檔，免安裝 |
+            | `ResolutionTray.exe.sha256` | SHA256 校驗碼 |
+
+            ### 校驗
+
+            ```
+            ${{ steps.checksum.outputs.sha256 }}  ResolutionTray.exe
+            ```
+
+            ```powershell
+            (Get-FileHash -Algorithm SHA256 .\ResolutionTray.exe).Hash -eq '${{ steps.checksum.outputs.sha256 }}'
+            ```
+
+            執行檔**沒有程式碼簽章**，第一次執行時 SmartScreen 與防毒軟體很可能會攔截——這對自行建置的未簽章工具是正常現象。請先比對上面的 SHA256，再選擇「其他資訊」→「仍要執行」。
+
+            ## 使用前必讀
+
+            - **事前準備：NVIDIA 全螢幕縮放** — Mi Monitor 原生為 `2560×1440`，切到非原生的 `1920×1440` 前，必須先在 NVIDIA 控制台把縮放模式設為「全螢幕」並由 **GPU** 執行，否則畫面會變形或出現黑邊。這是一次性設定。
+            - **安全邊界** — 本工具只讀取顯示設定並呼叫 Win32 顯示 API。絕不啟動、注入或掛勾 VALORANT，不開啟其行程控制代碼或讀取記憶體，不觸碰 Riot / Vanguard 或任何遊戲檔案，也絕不使用 `CDS_UPDATEREGISTRY`（解析度變更純屬執行期，不會寫回登錄檔）。
+
+            兩節的完整說明請見 [README](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md)。
