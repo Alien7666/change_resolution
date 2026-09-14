@@ -195,7 +195,7 @@ func (s *Session) observed(target domain.Target, mode domain.Mode) {
 }
 
 func (s *Session) readCurrent() (domain.Target, domain.Mode, error) {
-	target, err := s.displays.ResolveTarget(s.profile.Monitor.HardwareID)
+	target, err := s.displays.ResolveTarget(s.profile.Monitor)
 	if err != nil {
 		return domain.Target{}, domain.Mode{}, s.fail("resolve target", err)
 	}
@@ -211,7 +211,7 @@ func (s *Session) readCurrent() (domain.Target, domain.Mode, error) {
 // change moves the displays beside the target, so the arrangement, not the target's
 // mode on its own, is what an apply and a fallback restore have to be planned from.
 func (s *Session) readLayout() (domain.Target, domain.Layout, domain.DisplayState, error) {
-	target, err := s.displays.ResolveTarget(s.profile.Monitor.HardwareID)
+	target, err := s.displays.ResolveTarget(s.profile.Monitor)
 	if err != nil {
 		return domain.Target{}, domain.Layout{}, domain.DisplayState{}, s.fail("resolve target", err)
 	}
@@ -361,7 +361,7 @@ func (s *Session) restore(allowFallback bool) error {
 // under the tool, so the saved coordinates belong to an arrangement that is gone.
 func (s *Session) restoreSaved() error {
 	s.state(StateRestoring, "正在恢復原始顯示模式")
-	target, err := s.displays.ResolveTarget(s.profile.Monitor.HardwareID)
+	target, err := s.displays.ResolveTarget(s.profile.Monitor)
 	if err != nil {
 		return s.fail("resolve target for restore", err)
 	}

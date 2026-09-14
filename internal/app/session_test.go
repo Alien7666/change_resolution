@@ -40,8 +40,11 @@ func (d *fakeDisplay) record(operation string, target domain.Target, mode domain
 	return err
 }
 
-func (d *fakeDisplay) ResolveTarget(prefix string) (domain.Target, error) {
-	err := d.record("resolve", domain.Target{Identity: domain.MonitorIdentity{HardwareID: prefix}}, domain.Mode{}, domain.LayoutPlan{})
+// ResolveTarget records the whole identity it was asked for instead of echoing one
+// key back, which is what lets a test assert the session hands the profile's monitor
+// through untouched rather than only the part of it that used to be a string.
+func (d *fakeDisplay) ResolveTarget(identity domain.MonitorIdentity) (domain.Target, error) {
+	err := d.record("resolve", domain.Target{Identity: identity}, domain.Mode{}, domain.LayoutPlan{})
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.target, err
@@ -341,7 +344,7 @@ func TestEnableCapturesCurrentModeTestsThenApplies(t *testing.T) {
 	}
 	calls := f.display.takeCalls()
 	assertOperations(t, calls, "resolve", "layout", "test", "apply")
-	if calls[0].target.Identity.HardwareID != f.profile.Monitor.HardwareID || calls[2].mode != f.profile.GameMode || calls[3].mode != f.profile.GameMode {
+	if calls[0].target.Identity != f.profile.Monitor || calls[2].mode != f.profile.GameMode || calls[3].mode != f.profile.GameMode {
 		t.Fatalf("wrong target or mode: %+v", calls)
 	}
 	if got := f.s.Snapshot(); !got.Managed || !got.FourByThree || got.State != StateWaitingForGame {

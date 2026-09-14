@@ -385,12 +385,30 @@ func (w *window) takeAutoRestoreFailure(snapshot app.Snapshot) error {
 	return snapshot.Err
 }
 
-// updateAvailability latches the two conditions that must disable the 4:3 toggle:
-// a missing target monitor and an unsupported target mode. A clean read clears it.
+// updateAvailability latches the conditions that must disable the 4:3 toggle. Three
+// of them are ways the target monitor cannot be resolved -- it is not attached, the
+// configured identity hits several monitors, or the display device it resolves to is
+// mirrored onto another screen -- and the fourth is a target mode the driver refuses.
+// A clean read clears the latch.
+//
+// The two resolution refusals are kept apart because the way out of them differs: a
+// missing monitor comes back on its own when it wakes up or is switched back to this
+// input, so re-reading is the answer, while ambiguity and mirroring need the user to
+// change something. Telling them the same thing for all three would send them to
+// re-read a state that re-reading cannot fix.
 func (w *window) updateAvailability(snapshot app.Snapshot) {
 	switch {
 	case errors.Is(snapshot.Err, display.ErrTargetNotFound):
 		w.unavailableReason = "找不到 " + monitorName + "，已停用 4:3 切換。"
+	case errors.Is(snapshot.Err, display.ErrTargetAmbiguous):
+		// The candidates live in the error text because they are the only thing that
+		// makes this actionable: the user has to know which screens were hit before
+		// they can pick one in the settings.
+		w.unavailableReason = "設定的顯示器同時對應到多台，已停用顯示模式切換，請重新選擇顯示器。\n" +
+			snapshot.Err.Error()
+	case errors.Is(snapshot.Err, display.ErrTargetMirrored):
+		w.unavailableReason = "設定的顯示器與另一台共用同一個顯示裝置（複製／鏡射），" +
+			"本工具無法只變更其中一台，已停用顯示模式切換。\n" + snapshot.Err.Error()
 	case errors.Is(snapshot.Err, display.ErrModeNotSupported):
 		w.unavailableReason = "顯示器不支援 1920×1440 @ 180 Hz，已停用 4:3 切換。"
 	case snapshot.Err == nil && snapshot.Target.DeviceName != "":

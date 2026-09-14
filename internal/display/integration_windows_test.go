@@ -810,7 +810,10 @@ func TestWindowsControllerCanTestMiMonitorMode(t *testing.T) {
 		t.Skip("set RUN_DISPLAY_INTEGRATION=1")
 	}
 	c := NewWindowsController()
-	target, err := c.ResolveTarget(`MONITOR\XMI27B2`)
+	// The seed identity is the one the shipping tool ran on -- no instance path and
+	// ModelWasUnique true -- so this read is also the check that the hardware-ID rung
+	// still finds the Mi Monitor on the real adapter list.
+	target, err := c.ResolveTarget(domain.LegacySeedProfile().Monitor)
 	if err != nil {
 		t.Fatal(err)
 	}

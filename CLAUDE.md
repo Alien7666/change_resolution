@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Windows-only Go system-tray tool. Manually toggles the Mi Monitor (matched by hardware-ID prefix `MONITOR\XMI27B2`, never a fixed `DISPLAY1` index) between its current mode and a built-in `1920×1440 @ 180 Hz` game mode via `ChangeDisplaySettingsExW`, then restores the saved mode 3 seconds after `VALORANT-Win64-Shipping.exe` disappears from the process list. Startup only reads and displays state; it never changes a display mode on its own.
+Windows-only Go system-tray tool. Manually toggles the target monitor resolved from `domain.MonitorIdentity`: first by whole, case-insensitive device-interface-path equality, then by a guarded unique-model hardware-ID fallback. It applies the session profile's game mode through `ChangeDisplaySettingsExW`, then restores the saved mode after the profile's watched process disappears for its configured delay. Startup only reads and displays state; it never changes a display mode on its own.
 
 Design spec: `docs/superpowers/specs/2026-09-13-go-display-tray-design.md`. Implementation plan: `docs/superpowers/plans/2026-09-13-go-display-tray.md`.
 
 ## Package layout
 
 - `internal/domain` — `Mode`, `MonitorIdentity`, `MatchLevel`, `Target`, `Profile`, `MaxDimension`, and `LegacySeedProfile()`. Plain data, no Win32 dependency.
-- `internal/display` — `Controller` interface (`ResolveTarget`, `CurrentMode`, `TestMode`, `ApplyMode`) plus the Win32 adapter (`EnumDisplayDevicesW`, `EnumDisplaySettingsW`, `ChangeDisplaySettingsExW`). Never sets `CDS_UPDATEREGISTRY`, `DM_POSITION`, or `CDS_SET_PRIMARY`; every change targets only the resolved Mi Monitor device.
+- `internal/display` — `Controller` interface (`ResolveTarget`, `CurrentMode`, `CurrentLayout`, `TestMode`, `ApplyLayout`) plus the Win32 adapter (`EnumDisplayDevicesW`, `EnumDisplaySettingsW`, `ChangeDisplaySettingsExW`). `ResolveTarget` accepts the complete monitor identity and refuses missing, ambiguous, or mirrored targets. Never sets `CDS_UPDATEREGISTRY`, `DM_POSITION`, or `CDS_SET_PRIMARY`; every change targets only the resolved target device.
 - `internal/process` — `Checker` interface and the read-only Toolhelp implementation (`CreateToolhelp32Snapshot` + `Process32First/Next`). Matches only the executable name; never calls `OpenProcess`, reads memory, or inspects windows/command lines.
 - `internal/app` — `gameTracker` (pure presence/delay state transitions) and `Session` (serialized `Enable`/`Disable`/`Shutdown`/`Refresh`, background game-presence watcher, `SetOnChange` notifications). This is where the state machine described in the design spec lives, fully covered by fake-backed tests.
 - `internal/ui` — Walk main window and notification-area (tray) icon; renders `app.Snapshot` and forwards user actions to `Session`.
@@ -64,10 +64,10 @@ Remove-Item Env:RUN_DISPLAY_INTEGRATION
 - Startup must remain read-only: read and display state, never change a display mode.
 - Match the configured monitor through the identity ladder in `domain.MonitorIdentity`: the device interface path first, compared whole and case-insensitively; the hardware ID only as a fallback, only when the model was unique at the moment the user configured it, and only when it matches exactly one attached monitor. Never match by a fixed `DISPLAY1` index, and never take the first of several matches — ambiguity is an honest refusal, not a coin flip.
 - The game mode is whatever the user configured. `domain.LegacySeedProfile()` is not that configuration: it exists only to pre-fill the first-run wizard with the original `1920×1440 @ 180 Hz` values, and is never the profile a shipping session runs on.
-- Never launch VALORANT, inject or hook code, open its process, read its memory, or modify Riot/Vanguard/game files. Only observe the executable name `VALORANT-Win64-Shipping.exe` via Toolhelp.
-- Restore 3 seconds after the game goes from seen/running to absent; manual disable restores immediately and cancels any pending automatic restore.
+- Never launch the configured executable, inject or hook code, open its process, read its memory, or modify its application files. Only observe the configured executable name via Toolhelp.
+- Restore after the configured executable goes from seen/running to absent for the configured delay; manual disable restores immediately and cancels any pending automatic restore.
 - Never use `CDS_UPDATEREGISTRY`; always test a target mode (`CDS_TEST`) before applying it (`CDS_TEST`/apply, never combined).
-- Never modify the other three displays' modes or positions — only the resolved Mi Monitor target is touched.
+- Never modify any other display's mode or position — only the resolved target monitor is touched.
 - UI strings are in Traditional Chinese (繁體中文); preserve when editing `internal/ui`.
 
 ## Legacy Python scripts

@@ -5,6 +5,7 @@ package ui
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -53,11 +54,69 @@ func TestUpdateAvailabilityLatchesMissingTarget(t *testing.T) {
 	}
 }
 
+// ambiguousResolve is the error shape resolveIdentity produces when the configured
+// identity hits more than one attached monitor. The candidates are in the message
+// because the display package has no other way to carry them, and the window has to
+// pass them on: reselecting the monitor is the only way out of this latch, and the
+// user cannot reselect what the tool will not name.
+func ambiguousResolve() error {
+	return fmt.Errorf("resolve target: %w: %s 同時命中 %s、%s，請重新選擇顯示器",
+		display.ErrTargetAmbiguous, `MONITOR\XMI27B2`, `\\.\DISPLAY1`, `\\.\DISPLAY3`)
+}
+
+func mirroredResolve() error {
+	return fmt.Errorf("resolve target: %w: %s 同時驅動 %s，工具無法只變更其中一台，請先關閉複製／鏡射顯示",
+		display.ErrTargetMirrored, `\\.\DISPLAY1`, `\\.\DISPLAY3`)
+}
+
+func TestUpdateAvailabilityLatchesAnAmbiguousTarget(t *testing.T) {
+	w := &window{}
+
+	w.updateAvailability(app.Snapshot{State: app.StateError, Err: ambiguousResolve()})
+	if w.unavailableReason == "" {
+		t.Fatal("an ambiguous target did not disable display mode switching")
+	}
+	for _, device := range []string{`\\.\DISPLAY1`, `\\.\DISPLAY3`} {
+		if !strings.Contains(w.unavailableReason, device) {
+			t.Errorf("reason %q does not name candidate %s", w.unavailableReason, device)
+		}
+	}
+	if !strings.Contains(w.unavailableReason, "顯示模式切換") {
+		t.Errorf("reason %q does not name the disabled operation neutrally", w.unavailableReason)
+	}
+	if strings.Contains(w.unavailableReason, "4:3") {
+		t.Errorf("reason %q contradicts profiles whose configured mode is not 4:3", w.unavailableReason)
+	}
+}
+
+// A mirrored adapter is not something re-reading can clear and not something the
+// tool can work around, so the reason has to say what the user would have to change:
+// the tool cannot drive one of two monitors that share a display device.
+func TestUpdateAvailabilityLatchesAMirroredTarget(t *testing.T) {
+	w := &window{}
+
+	w.updateAvailability(app.Snapshot{State: app.StateError, Err: mirroredResolve()})
+	if w.unavailableReason == "" {
+		t.Fatal("a mirrored target did not disable display mode switching")
+	}
+	if !strings.Contains(w.unavailableReason, "無法只變更其中一台") {
+		t.Errorf("reason %q does not explain why a mirrored pair cannot be changed", w.unavailableReason)
+	}
+	if !strings.Contains(w.unavailableReason, "顯示模式切換") {
+		t.Errorf("reason %q does not name the disabled operation neutrally", w.unavailableReason)
+	}
+	if strings.Contains(w.unavailableReason, "4:3") {
+		t.Errorf("reason %q contradicts profiles whose configured mode is not 4:3", w.unavailableReason)
+	}
+}
+
 func TestUpdateAvailabilityClearsLatchOnCleanRead(t *testing.T) {
 	for name, snapshot := range map[string]app.Snapshot{
 		"unsupported mode": {State: app.StateError, Err: preflightRejection()},
 		"missing target": {State: app.StateError,
 			Err: fmt.Errorf("resolve target: %w", display.ErrTargetNotFound)},
+		"ambiguous target": {State: app.StateError, Err: ambiguousResolve()},
+		"mirrored target":  {State: app.StateError, Err: mirroredResolve()},
 	} {
 		t.Run(name, func(t *testing.T) {
 			w := &window{}
@@ -107,7 +166,7 @@ type stubDisplays struct {
 	resolves   int
 }
 
-func (d *stubDisplays) ResolveTarget(string) (domain.Target, error) {
+func (d *stubDisplays) ResolveTarget(domain.MonitorIdentity) (domain.Target, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.resolves++
@@ -156,6 +215,8 @@ func TestRefreshStaysAvailableWhileTheTargetIsUnavailable(t *testing.T) {
 		"missing target": {State: app.StateError,
 			Err: fmt.Errorf("resolve target: %w", display.ErrTargetNotFound)},
 		"unsupported mode": {State: app.StateError, Err: preflightRejection()},
+		"ambiguous target": {State: app.StateError, Err: ambiguousResolve()},
+		"mirrored target":  {State: app.StateError, Err: mirroredResolve()},
 	} {
 		t.Run(name, func(t *testing.T) {
 			w := &window{}
