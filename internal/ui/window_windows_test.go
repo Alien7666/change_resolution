@@ -176,6 +176,19 @@ func (d *stubDisplays) ResolveTarget(domain.MonitorIdentity) (domain.Target, err
 	return domain.Target{DeviceName: `\.\DISPLAY4`, Identity: domain.MonitorIdentity{HardwareID: `MONITOR\XMI27B2`}}, nil
 }
 
+// Targets is on the interface for the settings dialog, which this window does not
+// open yet. It answers with the same monitor ResolveTarget does, without counting as
+// a resolve.
+func (d *stubDisplays) Targets() ([]domain.Target, error) {
+	return []domain.Target{{
+		DeviceName: `\.\DISPLAY4`,
+		Identity: domain.MonitorIdentity{
+			HardwareID: `MONITOR\XMI27B2`,
+			Label:      "Mi Monitor 27",
+		},
+	}}, nil
+}
+
 func (d *stubDisplays) CurrentMode(domain.Target) (domain.Mode, error) {
 	return domain.Mode{Width: 2560, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}, nil
 }

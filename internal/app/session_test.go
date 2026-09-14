@@ -40,6 +40,16 @@ func (d *fakeDisplay) record(operation string, target domain.Target, mode domain
 	return err
 }
 
+// Targets is the public monitor list the settings dialog reads. The session never
+// calls it -- it resolves one configured identity rather than browsing monitors --
+// and recording the call is what lets a test say so.
+func (d *fakeDisplay) Targets() ([]domain.Target, error) {
+	err := d.record("targets", domain.Target{}, domain.Mode{}, domain.LayoutPlan{})
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return []domain.Target{d.target}, err
+}
+
 // ResolveTarget records the whole identity it was asked for instead of echoing one
 // key back, which is what lets a test assert the session hands the profile's monitor
 // through untouched rather than only the part of it that used to be a string.

@@ -85,6 +85,12 @@ type win32API interface {
 
 type windowsNative struct {
 	api win32API
+	// namer supplies the model names the CCD API reports. It is a seam rather than a
+	// direct call so that a machine where the API is unavailable, and a test that
+	// wants no names at all, are ordinary cases instead of untested branches. A nil
+	// namer means exactly that: no friendly names, and the ladder starts one rung
+	// lower.
+	namer friendlyNamer
 }
 
 type user32API struct{}
@@ -97,7 +103,7 @@ var (
 )
 
 func NewWindowsController() Controller {
-	return newController(&windowsNative{api: user32API{}})
+	return newController(&windowsNative{api: user32API{}, namer: newCCDNamer()})
 }
 
 // listTargets reports one target per attached monitor, carrying the identity the
@@ -110,8 +116,10 @@ func NewWindowsController() Controller {
 //
 // A monitor is reported even when the second read is not answered. The interface
 // path is an enrichment: a monitor without one is still selectable by hardware ID,
-// and dropping it would take away the rung that does work.
+// and dropping it would take away the rung that does work. The same is true of the
+// model name read through the CCD API, which is display-only and never matched on.
 func (n *windowsNative) listTargets() ([]domain.Target, error) {
+	names := n.friendlyNames()
 	var targets []domain.Target
 	err := n.eachAttachedAdapter(func(adapter displayDevice, adapterName string) error {
 		for monitorIndex := uint32(0); ; monitorIndex++ {
@@ -122,10 +130,6 @@ func (n *windowsNative) listTargets() ([]domain.Target, error) {
 			}
 			identity := domain.MonitorIdentity{
 				HardwareID: windows.UTF16ToString(monitor.DeviceID[:]),
-				// DeviceString is the monitor's own name and is display-only. Both
-				// reads report it; the plain one is taken because it always happens.
-				// Task 4 puts the CCD friendly name in front of it.
-				Label: windows.UTF16ToString(monitor.DeviceString[:]),
 			}
 			withInterface := displayDevice{Cb: uint32(unsafe.Sizeof(displayDevice{}))}
 			if ok, _ := n.api.enumDisplayDevices(
@@ -133,6 +137,15 @@ func (n *windowsNative) listTargets() ([]domain.Target, error) {
 			); ok {
 				identity.InstancePath = windows.UTF16ToString(withInterface.DeviceID[:])
 			}
+			// The label is the one part of an identity that is never compared, and it
+			// is the only part the user reads. The interface path is what joins the
+			// CCD name to this monitor; DeviceString is what the driver called it;
+			// the hardware ID is the floor.
+			identity.Label = chooseLabel(
+				lookupFriendlyName(names, identity.InstancePath),
+				windows.UTF16ToString(monitor.DeviceString[:]),
+				identity.HardwareID,
+			)
 			targets = append(targets, domain.Target{DeviceName: adapterName, Identity: identity})
 		}
 		return nil
@@ -141,6 +154,26 @@ func (n *windowsNative) listTargets() ([]domain.Target, error) {
 		return nil, err
 	}
 	return targets, nil
+}
+
+// friendlyNames reads every monitor's model name once for the whole enumeration.
+// QueryDisplayConfig walks the entire desktop, so asking per monitor would repeat
+// the work and, worse, could describe several different desktops in one list.
+//
+// Every failure is swallowed here on purpose, and this is the one place in the
+// package where that is right. A label is display-only: it never takes part in
+// matching and never reaches ChangeDisplaySettingsExW, so failing to find a prettier
+// one is not something the user can act on. Turning it into an error would replace a
+// complete, correct monitor list with a refusal.
+func (n *windowsNative) friendlyNames() map[string]string {
+	if n.namer == nil {
+		return nil
+	}
+	names, err := n.namer.friendlyNames()
+	if err != nil {
+		return nil
+	}
+	return names
 }
 
 // currentLayout reads every attached display. A display whose settings cannot be

@@ -51,6 +51,33 @@ func (f *fakeNative) applyLayout(plan domain.LayoutPlan) error {
 	return f.applyErr
 }
 
+// Targets is the public monitor list the settings dialog is built on. It is
+// deliberately the same fresh read ResolveTarget performs and never a cached one:
+// \\.\DISPLAYn is assigned dynamically, so a list handed out earlier may by now name
+// other screens. Nothing outside this package reaches into the Win32 layer for it.
+func TestTargetsReportsEveryAttachedMonitorFromAFreshRead(t *testing.T) {
+	api := &fakeNative{targets: []domain.Target{
+		{DeviceName: `\.\DISPLAY1`, Identity: domain.MonitorIdentity{
+			HardwareID: `MONITOR\XMI27B2\0009`, Label: "Mi Monitor 27"}},
+		{DeviceName: `\.\DISPLAY2`, Identity: domain.MonitorIdentity{
+			HardwareID: `MONITOR\ACR0D0D\0004`, Label: "Acer XB271HU"}},
+	}}
+	c := newController(api)
+
+	targets, err := c.Targets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(targets, api.targets) {
+		t.Fatalf("Targets()=%#v, want %#v", targets, api.targets)
+	}
+
+	api.listErr = errors.New("EnumDisplayDevicesW failed")
+	if _, err := c.Targets(); !errors.Is(err, api.listErr) {
+		t.Fatalf("err=%v, want the enumeration failure itself", err)
+	}
+}
+
 // ResolveTarget is the enumeration plus the pure matcher and nothing else: the
 // identity reaches resolveIdentity unaltered, and the target that comes back carries
 // the rung that matched. The ladder's own behaviour is covered by the

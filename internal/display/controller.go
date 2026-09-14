@@ -46,6 +46,17 @@ var (
 )
 
 type Controller interface {
+	// Targets reports every attached monitor, each with the identity a profile is
+	// matched against and the label a person reads. It is the monitor list the
+	// settings dialog is built from, which is why it is on the interface at all:
+	// nothing outside this package may reach into the Win32 layer to enumerate
+	// monitors for itself.
+	//
+	// Several entries may share a DeviceName. That is not a duplicate; it is a
+	// cloned or mirrored adapter driving more than one monitor, and it is the only
+	// evidence a caller has of that arrangement.
+	Targets() ([]domain.Target, error)
+
 	// ResolveTarget finds the one attached monitor the configured identity names.
 	// It answers with a refusal rather than a guess: nothing, several, or a
 	// mirrored adapter are all errors, never a monitor picked out of a list.
@@ -77,12 +88,18 @@ func newController(native nativeAPI) *controller {
 	return &controller{native: native}
 }
 
-// ResolveTarget enumerates the attached monitors and hands them to the pure
-// matcher. The enumeration is redone on every call rather than cached: \\.\DISPLAYn
-// is assigned dynamically, so a name read earlier may by now belong to another
-// screen.
+// Targets is the fresh read every other monitor question is answered from. It is
+// deliberately not cached: \\.\DISPLAYn is assigned dynamically, so a list handed out
+// earlier may by now name other screens.
+func (c *controller) Targets() ([]domain.Target, error) {
+	return c.native.listTargets()
+}
+
+// ResolveTarget enumerates the attached monitors and hands them to the pure matcher.
+// It goes through Targets so that the list the user picked from and the list the tool
+// resolves against are produced by exactly the same read.
 func (c *controller) ResolveTarget(identity domain.MonitorIdentity) (domain.Target, error) {
-	targets, err := c.native.listTargets()
+	targets, err := c.Targets()
 	if err != nil {
 		return domain.Target{}, err
 	}

@@ -158,10 +158,11 @@ func TestWindowsNativeReadsTheDeviceInterfacePathAndTheHardwareID(t *testing.T) 
 
 // The label is display-only and never participates in a comparison, but it is the
 // only thing that tells the user which row of a monitor list is which screen, and
-// listTargets used to throw DeviceString away. Task 4 layers the CCD friendly name
-// on top of this; what this test pins is that the monitor's own name survives the
-// enumeration at all, and that a monitor that reports no name produces an empty
-// label rather than something invented.
+// listTargets used to throw DeviceString away. What this test pins is that the
+// monitor's own name survives the enumeration at all when no CCD name is available,
+// and that a monitor reporting no name at all falls to the bottom rung of the ladder
+// instead of showing the user a blank row. The hardware ID is not invented text: it
+// is the other thing this same read already reported.
 func TestWindowsNativeKeepsTheMonitorsOwnDeviceStringAsALabel(t *testing.T) {
 	api := &fakeWin32{
 		adapters: []displayDevice{
@@ -189,8 +190,8 @@ func TestWindowsNativeKeepsTheMonitorsOwnDeviceStringAsALabel(t *testing.T) {
 	if got := targets[0].Identity.Label; got != "Mi Monitor 27" {
 		t.Errorf("Label=%q, want the monitor's own DeviceString", got)
 	}
-	if got := targets[1].Identity.Label; got != "" {
-		t.Errorf("Label=%q, want an empty label for a monitor that reports no name", got)
+	if got := targets[1].Identity.Label; got != `MONITOR\ACR0D0D\0004` {
+		t.Errorf("Label=%q, want the hardware ID for a monitor that reports no name", got)
 	}
 }
 
@@ -820,5 +821,152 @@ func TestWindowsControllerCanTestMiMonitorMode(t *testing.T) {
 	mode := domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
 	if err := c.TestMode(target, mode); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// EnumDisplayDevicesW answers "Generic PnP Monitor" for most screens, which in a
+// four-row monitor list is the same as answering nothing. The CCD friendly name is
+// what the user recognises, and the join between the two reads is the device
+// interface path, so the name only lands on the monitor it belongs to.
+func TestWindowsNativeLabelsMonitorsWithTheirCCDFriendlyName(t *testing.T) {
+	const acerInterfacePath = `\\?\DISPLAY#ACR0D0D#5&2b9d4d4&0&UID4360#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}`
+	api := &fakeWin32{
+		adapters: []displayDevice{
+			newDisplayDevice(t, `\.\DISPLAY1`, "", displayDeviceAttachedToDesktop),
+			newDisplayDevice(t, `\.\DISPLAY2`, "", displayDeviceAttachedToDesktop),
+		},
+		monitors: map[monitorKey][]displayDevice{
+			{adapter: `\.\DISPLAY1`}: {
+				newMonitorDevice(t, "Generic PnP Monitor", `MONITOR\XMI27B2\0009`),
+			},
+			{adapter: `\.\DISPLAY1`, interfaceName: true}: {
+				newMonitorDevice(t, "Generic PnP Monitor", miMonitorInterfacePath),
+			},
+			{adapter: `\.\DISPLAY2`}: {
+				newMonitorDevice(t, "Generic PnP Monitor", `MONITOR\ACR0D0D\0004`),
+			},
+			{adapter: `\.\DISPLAY2`, interfaceName: true}: {
+				newMonitorDevice(t, "Generic PnP Monitor", acerInterfacePath),
+			},
+		},
+	}
+	// The keys are spelled differently from the enumerated paths on purpose: the CCD
+	// API and EnumDisplayDevicesW do not agree on casing, and a case-sensitive join
+	// would quietly give every monitor the wrong name or none at all.
+	namer := &fakeNamer{names: map[string]string{
+		strings.ToLower(miMonitorInterfacePath): "Mi Monitor 27",
+		strings.ToLower(acerInterfacePath):      "Acer XB271HU",
+	}}
+	native := &windowsNative{api: api, namer: namer}
+
+	targets, err := native.listTargets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"Mi Monitor 27", "Acer XB271HU"}
+	if len(targets) != len(want) {
+		t.Fatalf("targets=%#v, want %d", targets, len(want))
+	}
+	for i, label := range want {
+		if targets[i].Identity.Label != label {
+			t.Errorf("targets[%d].Label=%q, want %q", i, targets[i].Identity.Label, label)
+		}
+	}
+}
+
+// The friendly name is an enrichment and never a precondition. A CCD read that fails
+// outright -- an old Windows, a driver that will not answer, a desktop changing
+// under the read -- costs the user a prettier label and nothing else: the
+// enumeration still reports every monitor, and every monitor still carries the name
+// its own driver reported.
+func TestWindowsNativeFallsBackToTheDeviceStringWhenTheCCDReadFails(t *testing.T) {
+	api := &fakeWin32{
+		adapters: []displayDevice{
+			newDisplayDevice(t, `\.\DISPLAY1`, "", displayDeviceAttachedToDesktop),
+		},
+		monitors: map[monitorKey][]displayDevice{
+			{adapter: `\.\DISPLAY1`}: {
+				newMonitorDevice(t, "Acer XB271HU", `MONITOR\ACR0D0D\0004`),
+			},
+			{adapter: `\.\DISPLAY1`, interfaceName: true}: {
+				newMonitorDevice(t, "Acer XB271HU", miMonitorInterfacePath),
+			},
+		},
+	}
+	namer := &fakeNamer{err: errors.New("QueryDisplayConfig: the driver is not responding")}
+	native := &windowsNative{api: api, namer: namer}
+
+	targets, err := native.listTargets()
+	if err != nil {
+		t.Fatalf("a failed name lookup became an enumeration error: %v", err)
+	}
+	if len(targets) != 1 || targets[0].Identity.Label != "Acer XB271HU" {
+		t.Fatalf("targets=%#v, want one labelled by its own DeviceString", targets)
+	}
+}
+
+// The bottom rung. A monitor whose CCD name is missing and whose own name is the
+// placeholder Windows invents is still worth a row the user can tell apart, and the
+// hardware ID at least names the model.
+func TestWindowsNativeFallsBackToTheHardwareIDWhenNoNameIsUsable(t *testing.T) {
+	api := &fakeWin32{
+		adapters: []displayDevice{
+			newDisplayDevice(t, `\.\DISPLAY1`, "", displayDeviceAttachedToDesktop),
+		},
+		monitors: map[monitorKey][]displayDevice{
+			{adapter: `\.\DISPLAY1`}: {
+				newMonitorDevice(t, "Generic PnP Monitor", `MONITOR\XMI27B2\0009`),
+			},
+		},
+	}
+	native := &windowsNative{api: api, namer: &fakeNamer{}}
+
+	targets, err := native.listTargets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Identity.Label != `MONITOR\XMI27B2\0009` {
+		t.Fatalf("targets=%#v, want the hardware ID as the label", targets)
+	}
+}
+
+// The whole configuration is read once per enumeration, not once per monitor.
+// QueryDisplayConfig walks every path on the machine, so calling it per monitor
+// would re-read the same desktop four times and, worse, could observe four
+// different desktops.
+func TestWindowsNativeReadsTheFriendlyNamesOncePerEnumeration(t *testing.T) {
+	namer := &fakeNamer{}
+	native := &windowsNative{api: measuredDesktop(t), namer: namer}
+
+	if _, err := native.listTargets(); err != nil {
+		t.Fatal(err)
+	}
+	if namer.calls != 1 {
+		t.Errorf("friendly-name lookups=%d, want exactly one per enumeration", namer.calls)
+	}
+}
+
+// Reading the real display configuration is a read, so it stays inside the opt-in
+// gate's promise of "enumeration and CDS_TEST only". It is also the only thing that
+// proves the struct sizes above against the API that actually writes into them: a
+// wrong size shows up here as a missing or mangled name, not as a silent success.
+func TestWindowsControllerIntegrationReadsEveryMonitorsFriendlyName(t *testing.T) {
+	if os.Getenv("RUN_DISPLAY_INTEGRATION") != "1" {
+		t.Skip("set RUN_DISPLAY_INTEGRATION=1")
+	}
+	targets, err := NewWindowsController().Targets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) == 0 {
+		t.Fatal("no attached monitor was reported")
+	}
+	for _, target := range targets {
+		t.Logf("%s label=%q hardwareID=%q instancePath=%q",
+			target.DeviceName, target.Identity.Label,
+			target.Identity.HardwareID, target.Identity.InstancePath)
+		if target.Identity.Label == "" {
+			t.Errorf("%s carries no label; the ladder must always end somewhere", target.DeviceName)
+		}
 	}
 }
