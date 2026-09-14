@@ -23,8 +23,11 @@ Everything the shipped plan constrained still holds. These are the ones this pla
 - **Startup stays read-only**, including first run. Detecting monitors, enumerating modes, listing process names and reading GPU scaling are all reads. Nothing in the wizard applies a display mode, and there is no preview.
 - **Never `CDS_UPDATEREGISTRY`, never `NV_DISPLAYCONFIG_SAVE_TO_PERSISTENCE`.** Both are the same mistake in two APIs. `CDS_TEST` before every apply; `VALIDATE_ONLY` (`0x01`) before every NVAPI set; the NVAPI apply flag word is exactly `0x00`.
 - **Never take the first of several matches.** Monitor identity, NVAPI target selection and adapter resolution all fail loudly on ambiguity rather than pick one.
-- **No NVAPI set while the session owns a display mode.** This rule is not stated verbatim in either spec; it is what the two of them together require, and it is recorded here because an implementer will otherwise hit the contradiction alone. The scaling spec's R2 guarantees "no NVAPI set between `saved` being built and being cleared", while the first version's scaling button is independent of the 4:3 toggle and therefore reachable at any moment. The only reconciliation that keeps R2 true is: **while `Session.managed` is true, both scaling apply and scaling restore are refused with a reason** ("請先恢復原始解析度再變更 GPU 縮放"), exactly as the profile spec already disables 設定… while managed. The single exception is `Shutdown`'s scaling restore, which runs *after* the display restore has succeeded and `saved` has been cleared — which is R2 itself.
-- **Scaling failures never touch the display side.** They must not change `managed`, `saved`, the 4:3 toggle's availability, or block `Shutdown`. The reverse holds too.
+- **A scaling change while the session owns a display mode runs a full cycle; it is not refused.** The two specs look contradictory here and an implementer will hit it alone, so the resolution is recorded in both places. The scaling spec's R2 guarantees "no NVAPI set between `saved` being built and being cleared", while the first version's scaling button is independent of the game-mode toggle and is therefore reachable at any moment. Refusing the button while `Session.managed` is true was the cheap reconciliation and it is **rejected**: the moment a user notices black bars is precisely while the game mode is applied, so a button disabled exactly then is a button that does not exist. The rule is the scaling spec's **R5** — one operation under one acquisition of `opMu`: `stopWatcher()` → the whole display restore (R2) → the NVAPI set → the whole re-apply (R1, re-resolving identity, layout and plan from scratch and rebuilding `saved` from that fresh layout) → release `opMu` → join the watcher. No device name crosses the set, because `saved` is consumed and cleared before it and rebuilt after it, so R2 stays true verbatim — it just holds in two stretches instead of one. Both scaling buttons, apply and restore, behave identically. The accepted cost is that the screens change mode twice more than they otherwise would. `Shutdown` is unchanged and stays a different shape: leave-only, restoring `scalingSaved` instead of applying a requested value, never re-applying anything, and never blocked by a scaling failure.
+- **The cycle's three failure points are decided, not left to the implementer.** Display restore fails → abort before **any** NVAPI call (`saved` is still live, and a set there is exactly what R2 forbids), keep `managed` and `saved` so the user can retry, call `ensureWatcher()`, and say both that the restore failed and that scaling was not changed. Scaling set fails → do **not** re-apply the game mode; leave the user on the restored arrangement, unowned, and re-read the effective scaling value as the existing rule already requires. Re-apply fails → book the scaling write that succeeded exactly as a non-cycle press would (ownership taken on an apply, released on a restore — never rolled back, or exit could not undo it) and take **no** display ownership (`managed` stays false, `saved` stays empty); the toggle stays usable and a retry is one ordinary `Enable`. The principle underneath both rulings: the cycle never holds a mode it did not successfully apply, and never holds an arrangement it did not successfully save.
+- **The game watcher cannot act during the cycle, and the mechanism is the existing one.** `stopWatcher()` increments the generation *before* cancelling, so a poll already waiting at `opMu` finds `generation != s.generation` and returns before `tracker.Observe` is ever reached — which is precisely how a delayed restore that comes due mid-cycle is prevented from interleaving. `s.managed` legitimately goes false between the restore and the re-apply, and `observeGame`'s existing `!s.managed` check makes that a second, independent stop rather than a "the game ended, restore now" signal. `opMu` is never released between the cycle's steps. Do not invent a fourth mechanism. **The cycle must not swallow a pending automatic restore, either.** The watcher it re-arms gets a brand-new `gameTracker` *object* — `missing`, `missingAt` and `fired` always start at zero, which is exactly why the tracker is not preserved wholesale — but its `seen` flag is seeded from a new session-level `gameSeen bool` that lives and dies with `managed`. A game that ends during the cycle is therefore still "seen" afterwards, so the first post-cycle poll that finds the process absent opens a **fresh, full-length** delay and restores normally. The shipped promise (restore after the watched process goes from present to absent) holds across a cycle unchanged; no half-elapsed countdown survives it.
+- **`設定…` stays disabled while `Session.managed` is true.** The profile spec's rule is untouched by the cycle, and the asymmetry is deliberate rather than inconsistent: changing the profile voids what `saved` *means* — it was recorded around one target monitor and one target mode, and no ordering repairs that — while changing scaling only threatens the device *names* inside it, and names are re-derivable by consuming `saved` before the set and rebuilding it after.
+- **Scaling failures never touch the display side.** They must not change the toggle's availability, block `Shutdown`, or themselves change `managed` or `saved`. The reverse holds too. The cycle looks like an exception and is not: on that path `managed` and `saved` are changed by the *successful display restore* in step 2, never by the scaling call that failed afterwards.
 - **CI never sets `RUN_DISPLAY_INTEGRATION` and never sets `RUN_NVAPI_INTEGRATION`.** The second is a new, separate gate: `RUN_DISPLAY_INTEGRATION` promises "`CDS_TEST` and read-only enumeration only", and reusing it for NVAPI would empty that promise. Neither workflow file needs editing — `go test ./...` picks up new packages on its own. If a workflow edit ever looks necessary, that is a signal the gating is wrong, not that the workflow is.
 - **Tests never read or write the user's real config.** `RESOLUTION_TRAY_CONFIG` overrides the whole path; every config test sets it to a `t.TempDir()` path.
 - **UI strings stay Traditional Chinese (繁體中文)**, and none of them may be a literal that contradicts the configuration: no hard-coded `1920×1440`, no hard-coded `Mi Monitor`, no hard-coded `4:3` in a place that describes the configured mode.
@@ -824,7 +827,7 @@ Each section unlocks the next. Nothing in the dialog applies a mode, and there i
 
 - [ ] **Step 4: Wire the entry points and the save**
 
-Add 設定… to the main window and to the tray menu above the separator. **Both are disabled whenever the session owns an applied mode**, with the reason beside them (請先恢復原始解析度再變更設定) — changing the target monitor or mode mid-session would strand the saved arrangement. Save runs `config.Save` (atomic) and then `Provider.Replace`; a failed write keeps the dialog open with the user's input intact and shows the error, and the previous config file is necessarily untouched because the write is temp-then-rename.
+Add 設定… to the main window and to the tray menu above the separator. **Both are disabled whenever the session owns an applied mode**, with the reason beside them (請先恢復原始解析度再變更設定) — changing the target monitor or mode mid-session would strand the saved arrangement. This rule is **not** relaxed by the GPU-scaling cycle in Task 15, and the asymmetry is deliberate: a profile change voids what `saved` *means* (it was recorded around one target monitor and one target mode, and no ordering repairs that), while a scaling change only threatens the device *names* inside it, which the cycle re-derives by consuming `saved` before the NVAPI set and rebuilding it from a fresh layout after. Save runs `config.Save` (atomic) and then `Provider.Replace`; a failed write keeps the dialog open with the user's input intact and shows the error, and the previous config file is necessarily untouched because the write is temp-then-rename.
 
 Startup: absent config → open the dialog as 初次設定, pre-filled from `LegacySeedProfile()` when `MONITOR\XMI27B2` is attached and reports `1920×1440 @ 180 Hz`, with a line reading 偵測到既有設定，確認後儲存. 稍後再設定 leaves no file and the next start is a first run again. Also complete the 重新設定 exit from Task 11: back the unreadable file up as `config.bad-<timestamp>.json` and open the same dialog, only after the user confirms.
 
@@ -1002,7 +1005,6 @@ func TestEnableResolvesTheTargetAfterAnyScalingSetNotBefore(t *testing.T)       
 func TestRestoreAppliesTheDisplayLayoutBeforeAnyScalingRestore(t *testing.T)       // R2
 func TestShutdownRestoresScalingOnlyAfterTheDisplayRestoreSucceeded(t *testing.T)  // R2
 func TestAFailedDisplayRestoreSkipsTheScalingRestoreEntirely(t *testing.T)         // R2
-func TestScalingIsRefusedWhileTheSessionOwnsAnAppliedMode(t *testing.T)            // the reconciliation rule
 func TestNoScalingSetHappensInsideAnApplyLayout(t *testing.T)                      // R3
 func TestScalingFailuresNeverChangeManagedSavedOrToggleAvailability(t *testing.T)
 func TestDisplayFailuresNeverChangeScalingOwnershipOrSavedValue(t *testing.T)
@@ -1010,23 +1012,62 @@ func TestScalingRestoreFailureDoesNotBlockShutdown(t *testing.T)
 func TestSnapshotDeviceNameIsRefreshedAfterAScalingSet(t *testing.T)
 ```
 
+Then the cycle, which is the behaviour this task exists to get right:
+
+```go
+func TestScalingWhileManagedRestoresThenSetsThenReappliesInThatOrder(t *testing.T)   // R5, happy path
+func TestTheCycleReresolvesTheTargetAndLayoutAfterTheScalingSet(t *testing.T)        // R5, and R1 as a live path
+func TestTheCycleRebuildsSavedFromTheFreshLayoutNotTheConsumedOne(t *testing.T)      // R5
+func TestTheScalingRestoreButtonRunsTheSameCycleAsTheApplyButton(t *testing.T)       // both buttons, one path
+func TestACycleWhoseDisplayRestoreFailsNeverReachesNVAPI(t *testing.T)               // failure point 1
+func TestACycleWhoseScalingSetFailsLeavesTheDesktopRestoredAndUnowned(t *testing.T)  // failure point 2
+func TestACycleWhoseReapplyFailsKeepsTheScalingResultAndOwnsNoDisplayMode(t *testing.T) // failure point 3
+func TestTheWatcherCannotRestoreWhileTheCycleIsRunning(t *testing.T)                 // generation + opMu
+func TestAGameThatEndsDuringTheCycleStillRestoresOnAFullDelayAfterwards(t *testing.T) // seeded seen, fresh countdown
+```
+
+These are the tests the Step 1 shared recorder earns its keep on, and they are the reason that recorder must survive this task rather than be simplified away. The cycle is the **only** production path that issues an NVAPI set before a `ResolveTarget`, so it is the one place where a stale `\\.\DISPLAYn` would actually reach `ChangeDisplaySettingsExW` and change the wrong screen. With the recorder renaming every device after every successful set, a re-apply that reuses *anything* from before the set — the target, the layout, the plan, or the consumed `saved` — fails with "device does not exist" instead of quietly passing.
+
+`TestTheCycleReresolvesTheTargetAndLayoutAfterTheScalingSet` is what makes R1 non-vacuous in v1. Until the cycle exists, nothing in the product calls a scaling set before an `Enable`, so R1 is enforced only by a test; the cycle turns it into a path users actually run. Assert the call order on the shared recorder: `ResolveTarget` and `CurrentLayout` both appear *after* the `scaling.Apply`, and neither the target nor the layout from before the set is reused.
+
+`TestTheWatcherCannotRestoreWhileTheCycleIsRunning` drives the controllable clock so a pending automatic restore comes due between the cycle's restore and its re-apply. Assert that the tracker's restore never fires, that the process checker's observation is discarded on the generation check rather than on the `managed` check (both stop it; the generation is the one that stops it *first* and is therefore the one being tested), and that the desktop is changed exactly twice — restore, re-apply — never three times.
+
+`TestAGameThatEndsDuringTheCycleStillRestoresOnAFullDelayAfterwards` is the other half of that, and it is the one that keeps a shipped promise intact. Let the watched process disappear *during* the cycle, then let the cycle finish and advance the fake clock. Assert three things: the restore does fire; it fires a **full** `RestoreDelay` after the **first post-cycle poll that saw the process absent**, not measured from any instant before the cycle; and it does not fire early. Also assert the negative that makes the mechanism visible — the replacement tracker's `missing`, `missingAt` and `fired` are all zero-valued, only its `seen` was seeded.
+
+The three failure-point tests each assert the whole end state, not just the error: which of `managed`, `saved`, `scalingOwned` and `scalingSaved` changed, where the desktop ended up, how many display applies and NVAPI sets happened, whether the watcher was restored, and whether the toggle is usable afterwards. Failure point 1 additionally asserts the NVAPI fake was **never called at all**, and failure point 3 asserts the session ends in exactly the ordinary unmanaged state plus whatever that successful scaling write left behind — no half-ownership, no special recovery path, and no rollback of a write that really happened.
+
 - [ ] **Step 3: Run them and confirm they fail for the right reason**
 
-Run: `go test ./internal/app -run Scaling`
+Run: `go test ./internal/app -run 'Scaling|Cycle'`
 
 Expected: FAIL. Read the failures — any that fail with "device does not exist" rather than an assertion mismatch is the recorder doing its job and pointing at a real stale-name path.
 
 - [ ] **Step 4: Implement the session side**
 
-Three fields, parallel to and independent of `managed` / `saved`:
+Three scaling fields, parallel to and independent of `managed` / `saved`, plus one watcher field that belongs to the display side:
 
 ```go
 scalingOwned bool   // true only after this run successfully changed scaling
 scalingSaved scaling.Value // the effective value read back before the change; never inferred
 scalingID    uint32
+
+gameSeen     bool // "the watched process has been seen running during this ownership";
+                  // same lifetime as managed, seeds each startWatcher's tracker
 ```
 
-Ordering, under `opMu`: entering is GPU then display, leaving is display then GPU. Any GDI name used to reach NVAPI is consumed into a displayId inside `internal/scaling` and never leaves it; the display side does its own fresh `ResolveTarget` afterwards. No NVAPI set ever happens inside `applyLayout`, whose rollback state is keyed by device name. While `managed` is true, both scaling apply and scaling restore return a refusal with a reason (see Global Constraints).
+Ordering, under `opMu`: entering is GPU then display, leaving is display then GPU. Any GDI name used to reach NVAPI is consumed into a displayId inside `internal/scaling` and never leaves it; the display side does its own fresh `ResolveTarget` afterwards. No NVAPI set ever happens inside `applyLayout`, whose rollback state is keyed by device name.
+
+While `managed` is true, a scaling press — apply or restore, they behave identically — runs the full cycle (R5) as **one** operation under **one** acquisition of `opMu`:
+
+1. `stopWatcher()`, which increments the generation before cancelling, so a poll already waiting at the gate returns without evaluating its tracker;
+2. the whole of `restoreSaved`. A failure here aborts before any NVAPI call, keeps `managed` and `saved`, calls `ensureWatcher()` and returns — exactly `Disable`'s failure path — with a message naming both the restore failure and the fact that scaling was not changed;
+3. the scaling apply or restore. A failure here does **not** re-apply the game mode: the desktop stays on the restored arrangement, unowned, and the effective scaling value is re-read and shown as the existing rule requires;
+4. the whole of `Enable`'s apply half, re-resolved from scratch — fresh `ResolveTarget`, fresh `CurrentLayout`, fresh `PlanModeChange`, `CDS_TEST`, `ApplyLayout` — with `saved` rebuilt from that fresh layout and `startWatcher()` at the end, re-armed on a new `gameTracker` whose `seen` is seeded from `s.gameSeen` and whose countdown fields are zero — so a game that ended mid-cycle still triggers a normal, full-length automatic restore. A failure here books the scaling write that succeeded (ownership taken on an apply, released on a restore) and takes no display ownership;
+5. release `opMu`, **then** `joinWatcher` the watcher stopped in step 1. Never join while holding the lock.
+
+Add `StateScalingCycle`, held for the whole cycle with the status line naming the phase (恢復原始排列… / 寫入縮放設定… / 重新套用 …). `Snapshot.Managed` stays true for the cycle's whole duration even though the internal `s.managed` legitimately goes false between steps 2 and 4; put that in a comment at the `updateSnapshot` call, because it reads like a bug and someone will "fix" it. Every exit from the cycle corrects `Snapshot.Managed` to what is actually true.
+
+`ensureWatcher`'s existing rule is reconciled, not overturned: the replacement watcher still starts from a **fresh tracker object**, because a preserved one carries `fired == true` and would never arm again. Only the `seen` boolean is seeded. One deliberate consequence beyond the cycle: after a failed automatic restore, the keep-alive watcher now re-arms on a full delay by itself instead of waiting for the game to be seen running again, which is what that function's comment already promises.
 
 `Shutdown` is re-ordered: stop watcher → display restore → **scaling restore, if owned** → `closed = true` → close notifications. A scaling restore failure raises one tray balloon and **does not** take the `ensureWatcher` keep-alive path and **does not** stop the exit; a display restore failure still does both, exactly as today. The two are deliberately different because a display left in the wrong mode is a broken desktop, while an unrestored scaling value is runtime-only and dies at the next reboot or driver reload.
 
@@ -1053,7 +1094,7 @@ Expected: all tests pass under 20 repeats; the renaming fake is active in every 
 
 ---
 
-### Task 16: Put GPU scaling on screen without touching the 4:3 controls
+### Task 16: Put GPU scaling on screen with its own availability state
 
 **Files:**
 - Modify: `internal/ui/window_windows.go`
@@ -1073,10 +1114,15 @@ func TestScalingButtonTextSwitchesToRestoreAndPrintsTheValueItWillRestore(t *tes
 func TestScalingLineShowsTheEffectiveValueNotTheRequestedOne(t *testing.T)
 func TestAMismatchedReadBackIsShownAsBothValuesAndIsNotAnError(t *testing.T)
 func TestNonNativeChoiceShowsTheMeasuredScalingWarning(t *testing.T)
-func TestScalingButtonIsDisabledWhileTheSessionOwnsAnAppliedMode(t *testing.T)
+func TestScalingButtonStaysEnabledWhileTheSessionOwnsAnAppliedMode(t *testing.T)
+func TestScalingButtonWarnsThatTheScreensChangeModeTwiceMoreWhileManaged(t *testing.T)
+func TestEveryMutatingControlIsDisabledDuringTheScalingCycle(t *testing.T)
+func TestSettingsStaysDisabledWhileManagedEvenThoughScalingDoesNot(t *testing.T)
 ```
 
 `updateAvailability` currently latches one `unavailableReason` string and `availableControls` derives one `interactive` flag from it, which would let a single NVAPI error disable the 4:3 toggle. That is the concrete UI change this task exists for.
+
+The four newly-named tests encode the Task 15 decision on the UI side. The scaling button is **enabled** while the session owns a mode — that is the only moment the user can see the black bars it fixes — but its label or the line beside it says what pressing it costs (畫面會先恢復原始排列、變更縮放、再切回遊戲模式). `設定…` is the deliberate contrast and stays disabled, for the reason recorded in Global Constraints. And while `Snapshot.State` is `StateScalingCycle`, every mutating control is disabled, including the scaling button itself: `opMu` already makes a second click merely queue, but a queued command against a desktop that is mid-change is not something to offer.
 
 - [ ] **Step 2: Run them to verify they fail**
 
@@ -1096,6 +1142,8 @@ GPU 縮放：無法讀取——找不到 NVIDIA 驅動      ← unavailable
 ```
 
 A mismatched read-back prints both values and is not styled as an error; the button does not render as "on". And the tool never claims the black bars are gone — it reports only what the driver says the scaling setting is.
+
+While the cycle runs, the row and the status line come from `StateScalingCycle` and name the phase rather than the result: 正在變更 GPU 縮放：恢復原始排列… / 寫入縮放設定… / 重新套用 1920 × 1440 @ 180 Hz…. `Snapshot.Managed` stays true throughout, so nothing in the window flickers to 啟用 at the moment pressing it would be meaningless. Each of the three failure exits has its own wording, and each must say what the desktop is doing now as well as what failed: restore failed → the mode is still applied and scaling was not changed; scaling failed → the desktop is back at the original arrangement and nothing is owned; re-apply failed → the scaling value did change, the desktop is at the original arrangement, and the toggle will put the mode back.
 
 - [ ] **Step 4: Upgrade the non-native reminder from static to measured**
 
@@ -1192,6 +1240,8 @@ None of the following can be automated, and each is here because something in th
 **New to this release:**
 
 1. **A non-native resolution with the scaling button — and the measurement that is still missing.** The scaling spec is explicit that every write experiment was performed at the panel's native `2560×1440`, while the whole reason the feature exists is the non-native case. Do it in this order and write down each result: read and record the current scaling value at native resolution; switch to the configured 4:3 mode; **then** set scaling to `2`; read it back and record whether the read-back matches; confirm the other three displays' resolutions, refresh rates and colour depths are unchanged and the desktop has no gap or overlap; restore scaling and record whether the restore was faithful; **and after every single step, record whether any `\\.\DISPLAYn` changed.** A mismatched read-back here is not a bug — it is the normalisation the spec predicted and it must be recorded, not fixed.
+
+   **Then do it again without leaving the game mode first**, which is the cycle: with the game mode applied and owned, press the scaling button and confirm all three legs — the desktop returns to the original arrangement, the scaling value changes, and the game mode comes back — that every display's resolution, refresh rate and colour depth is identical before and after, that the primary is still at `(0,0)`, and that the watcher is running again afterwards. Record whether any `\\.\DISPLAYn` changed at each leg. This is the one path in the product where a stale device name could reach `ChangeDisplaySettingsExW`, so it is the one path worth watching by hand.
 2. **The growing direction on real hardware.** Pick a mode larger than the current one and apply it. `orderForApply`'s grow branch, and the outward-shift half of the planner, have unit tests but have never touched a real driver: the shipped tool only ever narrowed the target. Confirm the neighbours move before the target's mode lands, that the desktop is never momentarily overlapping, that Windows does not repack the arrangement, and that restoring returns every display to its original coordinate.
 3. **Two monitors of the same model.** If the user ever has two `XMI27B2`-class panels attached at once: confirm they appear as two rows with distinct interface paths, that selecting one records `ModelWasUnique: false`, that only the selected one is ever changed, and that swapping the cables between ports makes the tool refuse and ask for a reselection rather than applying the mode to the other panel.
 4. **The complete first run on a second monitor.** Delete (or point `RESOLUTION_TRAY_CONFIG` away from) the config, start the tool, and walk the wizard end to end choosing a different monitor than the Mi Monitor. Confirm nothing changed on screen at any point during the wizard, that 稍後再設定 leaves no file, and that saving produces a working profile with one click.
