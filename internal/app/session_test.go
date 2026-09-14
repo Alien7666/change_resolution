@@ -23,6 +23,7 @@ type fakeDisplay struct {
 	mu      sync.Mutex
 	target  domain.Target
 	current domain.Mode
+	modes   []domain.Mode
 	layout  domain.Layout
 	calls   []displayCall
 	fail    map[string]error
@@ -58,6 +59,16 @@ func (d *fakeDisplay) ResolveTarget(identity domain.MonitorIdentity) (domain.Tar
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.target, err
+}
+
+// EnumModes is what a monitor reports it can do. The session does not browse modes
+// today -- the profile names one -- so recording the call is what lets a test say the
+// session asked a monitor nothing it did not need to.
+func (d *fakeDisplay) EnumModes(target domain.Target) ([]domain.Mode, error) {
+	err := d.record("modes", target, domain.Mode{}, domain.LayoutPlan{})
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.modes, err
 }
 
 func (d *fakeDisplay) CurrentMode(target domain.Target) (domain.Mode, error) {

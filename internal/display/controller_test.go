@@ -17,13 +17,16 @@ type nativeTest struct {
 type fakeNative struct {
 	targets    []domain.Target
 	mode       domain.Mode
+	modes      []domain.Mode
 	layout     domain.Layout
 	listErr    error
 	currentErr error
+	modesErr   error
 	layoutErr  error
 	testErr    error
 	applyErr   error
 	currentFor string
+	modesFor   string
 	tests      []nativeTest
 	applied    []domain.LayoutPlan
 }
@@ -35,6 +38,11 @@ func (f *fakeNative) listTargets() ([]domain.Target, error) {
 func (f *fakeNative) currentMode(deviceName string) (domain.Mode, error) {
 	f.currentFor = deviceName
 	return f.mode, f.currentErr
+}
+
+func (f *fakeNative) enumModes(deviceName string) ([]domain.Mode, error) {
+	f.modesFor = deviceName
+	return f.modes, f.modesErr
 }
 
 func (f *fakeNative) currentLayout() (domain.Layout, error) {
@@ -126,6 +134,39 @@ func TestCurrentModeUsesOnlyResolvedDevice(t *testing.T) {
 	}
 	if api.currentFor != target.DeviceName {
 		t.Fatalf("device=%q", api.currentFor)
+	}
+}
+
+// EnumModes asks one monitor what it can do, so it may name one device and it must
+// be the resolved one -- enumerating the wrong adapter would fill the picker with
+// another screen's modes, and every one of them would pass the CDS_TEST pre-flight
+// on the monitor that actually reported them.
+func TestEnumModesUsesOnlyResolvedDevice(t *testing.T) {
+	modes := []domain.Mode{miMonitorNative, miMonitorGame}
+	api := &fakeNative{modes: modes}
+	c := newController(api)
+	target := domain.Target{DeviceName: `\.\DISPLAY1`, Identity: domain.MonitorIdentity{HardwareID: `MONITOR\XMI27B2\0009`}}
+
+	got, err := c.EnumModes(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, modes) {
+		t.Fatalf("modes=%#v, want %#v", got, modes)
+	}
+	if api.modesFor != target.DeviceName {
+		t.Fatalf("device=%q, want the resolved target %q", api.modesFor, target.DeviceName)
+	}
+	if len(api.tests) != 0 || len(api.applied) != 0 {
+		t.Fatalf("enumerating modes changed something: tests=%#v applied=%#v", api.tests, api.applied)
+	}
+
+	// A failed enumeration is the caller's to explain -- "this monitor reports no
+	// usable mode" and "the monitor could not be read" are different messages -- so
+	// the failure arrives whole rather than flattened into an empty list.
+	api.modesErr = errors.New("EnumDisplaySettingsW failed")
+	if _, err := c.EnumModes(target); !errors.Is(err, api.modesErr) {
+		t.Fatalf("err=%v, want the enumeration failure itself", err)
 	}
 }
 

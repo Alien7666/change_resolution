@@ -62,6 +62,16 @@ type Controller interface {
 	// mirrored adapter are all errors, never a monitor picked out of a list.
 	ResolveTarget(identity domain.MonitorIdentity) (domain.Target, error)
 	CurrentMode(target domain.Target) (domain.Mode, error)
+
+	// EnumModes reports every mode the target monitor says it can run, filtered down
+	// to the ones this tool could actually apply and put in a fixed order. It is the
+	// list the mode picker is built from and the source the fallback mode is derived
+	// from when a profile records none.
+	//
+	// An empty list is a legitimate answer, not an error: it means this monitor
+	// reported nothing usable, which the caller says out loud rather than papering
+	// over with a mode of its own.
+	EnumModes(target domain.Target) ([]domain.Mode, error)
 	CurrentLayout() (domain.Layout, error)
 	TestMode(target domain.Target, mode domain.Mode) error
 	ApplyLayout(plan domain.LayoutPlan) error
@@ -75,6 +85,7 @@ type nativeAPI interface {
 	// not the tool's alone to change.
 	listTargets() ([]domain.Target, error)
 	currentMode(deviceName string) (domain.Mode, error)
+	enumModes(deviceName string) ([]domain.Mode, error)
 	currentLayout() (domain.Layout, error)
 	testMode(deviceName string, mode domain.Mode) error
 	applyLayout(plan domain.LayoutPlan) error
@@ -108,6 +119,16 @@ func (c *controller) ResolveTarget(identity domain.MonitorIdentity) (domain.Targ
 
 func (c *controller) CurrentMode(target domain.Target) (domain.Mode, error) {
 	return c.native.currentMode(target.DeviceName)
+}
+
+// EnumModes asks one monitor what it can do. It is a read and changes nothing, which
+// is what lets the first-run wizard call it before the user has configured anything.
+//
+// The device name it passes down is the resolved target's, and it is the only device
+// named: enumerating a different adapter would fill the picker with another screen's
+// modes, and they would then be applied to this one.
+func (c *controller) EnumModes(target domain.Target) ([]domain.Mode, error) {
+	return c.native.enumModes(target.DeviceName)
 }
 
 // CurrentLayout reads every attached display's mode and desktop position. It is a

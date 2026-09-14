@@ -15,11 +15,18 @@ type win32Call struct {
 }
 
 // enumSettingsCall is one EnumDisplaySettingsW crossing, recorded so a test can hold
-// every read to the resolved device, ENUM_CURRENT_SETTINGS and the buffer size.
+// every read to the resolved device, the mode number it asked for and the buffer size.
+//
+// fields and displayFlags are the DEVMODEW members as they were *on the way in*, not
+// as the fake answered. They are what proves the caller handed GDI a zeroed struct:
+// a walk that reused one buffer would arrive with the previous answer's declarations
+// still in it, and every read past the first would be interpreting stale bits.
 type enumSettingsCall struct {
-	device     string
-	modeNumber uint32
-	size       uint16
+	device       string
+	modeNumber   uint32
+	size         uint16
+	fields       uint32
+	displayFlags uint32
 }
 
 // monitorKey is how the fake indexes the monitor side of EnumDisplayDevicesW. The
@@ -38,10 +45,25 @@ type fakeWin32 struct {
 	current            devMode
 	modes              map[string]devMode
 	displayDeviceSizes []uint32
-	enumSettings       []enumSettingsCall
-	calls              []win32Call
-	changeResult       int32
-	changeResults      map[string]int32
+
+	// enumModes is the indexed half of EnumDisplaySettingsW: the list a driver walks
+	// out one index at a time, keyed by adapter. A device with no list answers FALSE
+	// at index 0, which is how a real driver says "that was all of them" and is why a
+	// desktop that declares no list still terminates the walk.
+	enumModes map[string][]devMode
+
+	// endlessModeWalk models the driver that never says "that was all of them". It
+	// exists for one test, because the loop that reads the list has no other
+	// terminator and a driver that lies here would otherwise hang the whole tool.
+	endlessModeWalk bool
+
+	// currentReadFails names the devices whose ENUM_CURRENT_SETTINGS read is refused,
+	// which is what a monitor detaching between two reads looks like from here.
+	currentReadFails map[string]bool
+	enumSettings     []enumSettingsCall
+	calls            []win32Call
+	changeResult     int32
+	changeResults    map[string]int32
 
 	// resultFor decides a crossing's result by call index, which is how a test makes
 	// a display accept its change and then refuse to give it back.
@@ -80,12 +102,35 @@ func (f *fakeWin32) enumDisplaySettings(deviceName *uint16, modeNumber uint32, m
 	name := windows.UTF16PtrToString(deviceName)
 	f.enumSettings = append(f.enumSettings, enumSettingsCall{
 		device: name, modeNumber: modeNumber, size: mode.DmSize,
+		fields: mode.DmFields, displayFlags: mode.DmDisplayFlags,
 	})
+	if modeNumber != enumCurrentSettings {
+		return f.answerIndexedMode(name, modeNumber, mode)
+	}
+	if f.currentReadFails[name] {
+		return false, nil
+	}
 	if known, ok := f.modes[name]; ok {
 		*mode = known
 		return true, nil
 	}
 	*mode = f.current
+	return true, nil
+}
+
+// answerIndexedMode is the walk a driver answers one index at a time. FALSE past the
+// end of the list is the only thing that ends it, so it is also the only thing that
+// stops the caller's loop.
+func (f *fakeWin32) answerIndexedMode(name string, modeNumber uint32, mode *devMode) (bool, error) {
+	listed := f.enumModes[name]
+	if f.endlessModeWalk {
+		*mode = listedMode(640, 480, 60, 32)
+		return true, nil
+	}
+	if int(modeNumber) >= len(listed) {
+		return false, nil
+	}
+	*mode = listed[modeNumber]
 	return true, nil
 }
 
@@ -206,6 +251,33 @@ func newMonitorDevice(t *testing.T, deviceString, deviceID string) displayDevice
 	copyUTF16(t, device.DeviceString[:], deviceString)
 	copyUTF16(t, device.DeviceID[:], deviceID)
 	return device
+}
+
+// listedMode is one entry of the driver's enumeration: a DEVMODEW declaring exactly
+// the four members a mode is made of, which is what a clean driver reports.
+func listedMode(width, height, refresh, bitsPerPixel uint32) devMode {
+	return devMode{
+		DmFields:           dmPelsWidth | dmPelsHeight | dmDisplayFrequency | dmBitsPerPel,
+		DmPelsWidth:        width,
+		DmPelsHeight:       height,
+		DmDisplayFrequency: refresh,
+		DmBitsPerPel:       bitsPerPixel,
+	}
+}
+
+// interlaced marks an entry the way a driver marks an interlaced timing: in
+// dmDisplayFlags, a different member from the declarations, which is exactly why a
+// conversion that forgot to carry it would look correct everywhere else.
+func interlaced(mode devMode) devMode {
+	mode.DmDisplayFlags |= dmInterlaced
+	return mode
+}
+
+// withoutField is a driver that filled a member in but never said so. The value beside
+// an undeclared bit is not the driver's answer, it is whatever was in the buffer.
+func withoutField(mode devMode, field uint32) devMode {
+	mode.DmFields &^= field
+	return mode
 }
 
 func copyUTF16(t *testing.T, dst []uint16, value string) {

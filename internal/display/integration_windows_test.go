@@ -3,6 +3,7 @@ package display
 import (
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"unsafe"
@@ -967,6 +968,266 @@ func TestWindowsControllerIntegrationReadsEveryMonitorsFriendlyName(t *testing.T
 			target.Identity.HardwareID, target.Identity.InstancePath)
 		if target.Identity.Label == "" {
 			t.Errorf("%s carries no label; the ladder must always end somewhere", target.DeviceName)
+		}
+	}
+}
+
+// soleDisplayDesktop is a one-monitor desktop at the Mi Monitor's native mode, which
+// is all the mode-enumeration tests need: enumModes reads one adapter and never
+// looks at the arrangement.
+func soleDisplayDesktop(t *testing.T, device string) *fakeWin32 {
+	t.Helper()
+	return fakeDesktop(t, domain.Layout{Displays: []domain.DisplayState{{
+		DeviceName: device, Mode: miMonitorNative, Position: domain.Point{}, Primary: true,
+	}}})
+}
+
+// The filter has unit tests of its own, and they would all still pass if the
+// conversion out of DEVMODEW dropped dmFields or dmDisplayFlags on the floor: an
+// entry whose declarations arrived as zero is dropped by the required-fields rule,
+// and one whose flags arrived as zero is silently kept. So the dirty list is walked
+// through the adapter too, and the dirt is the shape a real driver produces -- a
+// scaling-variant duplicate, an interlaced timing, a placeholder refresh rate, a
+// 16-bit entry, and one member the driver filled in without declaring.
+func TestWindowsNativeEnumModesFiltersTheListTheDriverReports(t *testing.T) {
+	const device = `\.\DISPLAY1`
+	api := soleDisplayDesktop(t, device)
+	api.enumModes = map[string][]devMode{device: {
+		listedMode(2560, 1440, 180, 32),
+		listedMode(1920, 1440, 180, 32),
+		listedMode(1920, 1440, 180, 32),
+		interlaced(listedMode(1920, 1440, 180, 32)),
+		listedMode(1920, 1440, 1, 32),
+		listedMode(1920, 1440, 180, 16),
+		withoutField(listedMode(1280, 1024, 60, 32), dmPelsHeight),
+	}}
+	native := &windowsNative{api: api}
+
+	got, err := native.enumModes(device)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []domain.Mode{miMonitorNative, miMonitorGame}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("enumModes=%#v,\nwant %#v", got, want)
+	}
+}
+
+// The mode on the screen is always in the list. A driver that does not enumerate the
+// mode it is currently running -- a custom timing built in the control panel, a list
+// the driver trimmed -- would otherwise produce a picker that does not contain what
+// the user is looking at. The separate ENUM_CURRENT_SETTINGS read is what supplies
+// it, so this also pins that enumModes performs that read at all.
+func TestWindowsNativeEnumModesIncludesACurrentModeTheDriverDidNotList(t *testing.T) {
+	const device = `\.\DISPLAY1`
+	api := soleDisplayDesktop(t, device)
+	api.enumModes = map[string][]devMode{device: {listedMode(1920, 1440, 180, 32)}}
+	native := &windowsNative{api: api}
+
+	got, err := native.enumModes(device)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []domain.Mode{miMonitorNative, miMonitorGame}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("enumModes=%#v,\nwant the current mode merged in: %#v", got, want)
+	}
+}
+
+// A monitor whose reported list is entirely unusable is a state the settings flow
+// describes rather than an error it reports. Here even the current mode is one the
+// tool would not apply, so nothing is left -- and an empty list must come back as an
+// empty list, because the caller's message ("this monitor reports no usable mode")
+// is different from the one it prints when a read failed.
+func TestWindowsNativeEnumModesReportsAnEmptyCatalogueRatherThanAnError(t *testing.T) {
+	const device = `\.\DISPLAY1`
+	api := soleDisplayDesktop(t, device)
+	api.modes[device] = listedMode(1920, 1440, 180, 16)
+	api.enumModes = map[string][]devMode{device: {listedMode(1920, 1440, 1, 32)}}
+	native := &windowsNative{api: api}
+
+	got, err := native.enumModes(device)
+	if err != nil {
+		t.Fatalf("an empty catalogue was reported as a failure: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("enumModes=%#v, want nothing", got)
+	}
+}
+
+// The walk is EnumDisplaySettingsW(device, i, &dm) from i = 0 until it answers FALSE,
+// and every call gets a freshly zeroed DEVMODEW with dmSize re-asserted. Reusing one
+// buffer is the tempting version and it is wrong twice over: GDI is not promised to
+// leave dmSize intact, and the previous answer's dmFields and dmDisplayFlags would
+// still be set, so the filter would judge each entry partly on the one before it.
+func TestWindowsNativeEnumModesWalksFromZeroWithAFreshBufferEachCall(t *testing.T) {
+	const device = `\.\DISPLAY4`
+	api := soleDisplayDesktop(t, device)
+	api.enumModes = map[string][]devMode{device: {
+		interlaced(listedMode(2560, 1440, 180, 32)),
+		listedMode(1920, 1440, 180, 32),
+		listedMode(1280, 1024, 60, 32),
+	}}
+	native := &windowsNative{api: api}
+
+	if _, err := native.enumModes(device); err != nil {
+		t.Fatal(err)
+	}
+
+	var indexed []uint32
+	currentReads := 0
+	for i, call := range api.enumSettings {
+		if call.device != device {
+			t.Errorf("read %d lpszDeviceName=%q, want %q", i, call.device, device)
+		}
+		if want := uint16(unsafe.Sizeof(devMode{})); call.size != want {
+			t.Errorf("read %d input DEVMODEW.dmSize=%d, want %d", i, call.size, want)
+		}
+		if call.fields != 0 || call.displayFlags != 0 {
+			t.Errorf("read %d reused a buffer: dmFields=%#x dmDisplayFlags=%#x, want a zeroed DEVMODEW",
+				i, call.fields, call.displayFlags)
+		}
+		if call.modeNumber == enumCurrentSettings {
+			currentReads++
+			continue
+		}
+		indexed = append(indexed, call.modeNumber)
+	}
+	if want := []uint32{0, 1, 2, 3}; !reflect.DeepEqual(indexed, want) {
+		t.Errorf("iModeNum sequence=%v, want %v: from zero, one at a time, one past the end", indexed, want)
+	}
+	if currentReads != 1 {
+		t.Errorf("ENUM_CURRENT_SETTINGS reads=%d, want exactly one", currentReads)
+	}
+}
+
+// FALSE past the end of the list is the walk's only terminator, so a driver that
+// never gives it would spin forever inside a call the user made from the settings
+// dialog -- a hang with no message and no way out. The bound is a guard on that, not
+// a filter: it is far past any real driver's list.
+func TestWindowsNativeEnumModesStopsWhenTheDriverNeverEndsTheWalk(t *testing.T) {
+	const device = `\.\DISPLAY1`
+	api := soleDisplayDesktop(t, device)
+	api.endlessModeWalk = true
+	native := &windowsNative{api: api}
+
+	got, err := native.enumModes(device)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) == 0 {
+		t.Fatal("the walk returned nothing at all")
+	}
+	if reads := uint32(len(api.enumSettings)); reads > maxEnumeratedModes+1 {
+		t.Fatalf("reads=%d, want the walk bounded at %d plus the current-settings read",
+			reads, maxEnumeratedModes)
+	}
+}
+
+// The current mode is not optional here: the whole list is built around it, and a
+// device whose live settings cannot be read is a device that is no longer there.
+// Returning the enumerated list anyway would hand the settings dialog a catalogue
+// for a monitor that has gone, and every mode in it would be a choice the user
+// cannot make.
+func TestWindowsNativeEnumModesFailsWhenTheCurrentModeCannotBeRead(t *testing.T) {
+	const device = `\.\DISPLAY1`
+	api := soleDisplayDesktop(t, device)
+	api.currentReadFails = map[string]bool{device: true}
+	api.enumModes = map[string][]devMode{device: {listedMode(1920, 1440, 180, 32)}}
+	native := &windowsNative{api: api}
+
+	got, err := native.enumModes(device)
+	if err == nil {
+		t.Fatalf("enumModes=%#v, want the failed read reported", got)
+	}
+	if !strings.Contains(err.Error(), "EnumDisplaySettingsW") {
+		t.Fatalf("err=%v does not name the call that failed", err)
+	}
+}
+
+// Enumerating modes is a read. It changes nothing, which is what lets the first-run
+// wizard call it, so the test that says so is worth more than it looks: a single
+// CDS_TEST here would be inside the opt-in gate's promise and still wrong, because
+// the wizard runs before the user has chosen anything to test.
+func TestWindowsNativeEnumModesNeverCrossesIntoChangeDisplaySettings(t *testing.T) {
+	const device = `\.\DISPLAY1`
+	api := soleDisplayDesktop(t, device)
+	api.enumModes = map[string][]devMode{device: {listedMode(1920, 1440, 180, 32)}}
+	native := &windowsNative{api: api}
+
+	if _, err := native.enumModes(device); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.calls) != 0 {
+		t.Fatalf("enumerating modes changed something: %+v", api.calls)
+	}
+}
+
+// Enumeration is a read, so it stays inside the opt-in gate's promise of
+// "enumeration and CDS_TEST only". It is also the only place the walk meets a real
+// driver's list, which is where the dirt the filter exists for actually lives: the
+// numbers logged here are the evidence that the rules hold against hundreds of real
+// entries rather than a handful of fixtures.
+func TestWindowsControllerIntegrationEnumeratesEveryMonitorsModes(t *testing.T) {
+	if os.Getenv("RUN_DISPLAY_INTEGRATION") != "1" {
+		t.Skip("set RUN_DISPLAY_INTEGRATION=1")
+	}
+	c := NewWindowsController()
+	targets, err := c.Targets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) == 0 {
+		t.Fatal("no attached monitor was reported")
+	}
+	for _, target := range targets {
+		modes, err := c.EnumModes(target)
+		if err != nil {
+			t.Errorf("%s: %v", target.DeviceName, err)
+			continue
+		}
+		current, err := c.CurrentMode(target)
+		if err != nil {
+			t.Errorf("%s: %v", target.DeviceName, err)
+			continue
+		}
+		native, _ := domain.NativeMode(modes)
+		t.Logf("%s %q: %d modes, current %s, native %s (%s)",
+			target.DeviceName, target.Identity.Label, len(modes), describeMode(current),
+			describeMode(native), domain.AspectLabel(native.Width, native.Height))
+		if len(modes) == 0 {
+			t.Errorf("%s reported no usable mode at all", target.DeviceName)
+			continue
+		}
+
+		seen := make(map[modeKey]bool, len(modes))
+		carriesCurrent := false
+		for i, mode := range modes {
+			if i < 12 {
+				t.Logf("    %s  %s", describeMode(mode), domain.AspectLabel(mode.Width, mode.Height))
+			}
+			if mode.BitsPerPixel != applicableBitsPerPixel {
+				t.Errorf("%s: %s survived the colour-depth filter", target.DeviceName, describeMode(mode))
+			}
+			if mode.RefreshHz < minimumRefreshHz || mode.Width == 0 || mode.Height == 0 {
+				t.Errorf("%s: %s survived the value filter", target.DeviceName, describeMode(mode))
+			}
+			key := modeKey{width: mode.Width, height: mode.Height, refreshHz: mode.RefreshHz}
+			if seen[key] {
+				t.Errorf("%s: %s appears twice", target.DeviceName, describeMode(mode))
+			}
+			seen[key] = true
+			if i > 0 && !domain.LargerMode(modes[i-1], mode) {
+				t.Errorf("%s: %s is listed before %s", target.DeviceName,
+					describeMode(modes[i-1]), describeMode(mode))
+			}
+			if mode == current {
+				carriesCurrent = true
+			}
+		}
+		if !carriesCurrent {
+			t.Errorf("%s: the catalogue does not contain the mode the monitor is running, %s",
+				target.DeviceName, describeMode(current))
 		}
 	}
 }

@@ -189,6 +189,17 @@ func (d *stubDisplays) Targets() ([]domain.Target, error) {
 	}}, nil
 }
 
+// EnumModes is on the interface for the mode picker, which this window does not open
+// yet. It answers with a list containing the monitor's current mode, because that is
+// the one invariant the catalogue guarantees, and it is a read like the rest of this
+// stub: nothing here may change a display.
+func (d *stubDisplays) EnumModes(domain.Target) ([]domain.Mode, error) {
+	return []domain.Mode{
+		{Width: 2560, Height: 1440, RefreshHz: 180, BitsPerPixel: 32},
+		{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32},
+	}, nil
+}
+
 func (d *stubDisplays) CurrentMode(domain.Target) (domain.Mode, error) {
 	return domain.Mode{Width: 2560, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}, nil
 }

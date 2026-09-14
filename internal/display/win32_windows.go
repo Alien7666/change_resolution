@@ -22,11 +22,10 @@ const (
 	// and each monitor is enumerated twice.
 	eddGetDeviceInterfaceName uint32 = 0x00000001
 
-	dmPosition         uint32 = 0x00000020
-	dmBitsPerPel       uint32 = 0x00040000
-	dmPelsWidth        uint32 = 0x00080000
-	dmPelsHeight       uint32 = 0x00100000
-	dmDisplayFrequency uint32 = 0x00400000
+	// The four dmFields bits a mode is made of live in modes.go, beside the filter
+	// that reads them. dmPosition stays here because it belongs to the arrangement,
+	// not to a mode: it is the one member every non-target display declares.
+	dmPosition uint32 = 0x00000020
 
 	// CDS_UPDATEREGISTRY (0x00000001) is deliberately absent from this file: the mode
 	// change must stay a run-time one that dies with the process. CDS_NORESET
@@ -34,6 +33,13 @@ const (
 	// out.
 	cdsTest       uint32 = 0x00000002
 	cdsFullscreen uint32 = 0x00000004
+
+	// maxEnumeratedModes bounds the indexed EnumDisplaySettingsW walk. The walk's only
+	// terminator is the driver answering FALSE past the end of its list, so a driver
+	// that never does would spin inside a call the user made from the settings dialog:
+	// a hang with no message and no way out. Real lists run to a few hundred entries,
+	// so this is a guard against a broken driver and never a filter on a working one.
+	maxEnumeratedModes uint32 = 4096
 
 	dispChangeSuccessful  int32 = 0
 	dispChangeRestart     int32 = 1
@@ -230,6 +236,48 @@ func (n *windowsNative) currentMode(deviceName string) (domain.Mode, error) {
 		return domain.Mode{}, err
 	}
 	return modeOf(dm), nil
+}
+
+// enumModes reads everything the target monitor reports it can do.
+//
+// EnumDisplaySettingsW is walked by index from 0 until it answers FALSE, and every
+// call gets a freshly zeroed DEVMODEW with dmSize re-asserted. The zeroing is not
+// tidiness: dmFields and dmDisplayFlags are what the filter judges an entry on, and a
+// reused buffer would carry the previous answer's bits into the next verdict. dmSize
+// is re-asserted for the same reason loadCurrentMode re-asserts it -- GDI is not
+// promised to leave the caller's buffer size intact.
+//
+// The separate ENUM_CURRENT_SETTINGS read is what guarantees the mode on the screen
+// is in the list even when the driver does not enumerate it. Failing that read fails
+// the whole call: the device name came from a monitor list read moments ago, so a
+// device that cannot be read now is a device that has gone, and a catalogue for a
+// monitor that is no longer there is a list of choices the user cannot make.
+//
+// Nothing here writes. This is the call the first-run wizard makes before the user
+// has chosen anything, and it must stay safe to make at any moment.
+func (n *windowsNative) enumModes(deviceName string) ([]domain.Mode, error) {
+	devicePtr, err := windows.UTF16PtrFromString(deviceName)
+	if err != nil {
+		return nil, fmt.Errorf("device name: %w", err)
+	}
+	current, err := n.loadCurrentMode(devicePtr, deviceName)
+	if err != nil {
+		return nil, err
+	}
+	var raw []rawMode
+	for index := uint32(0); index < maxEnumeratedModes; index++ {
+		dm := devMode{DmSize: uint16(unsafe.Sizeof(devMode{}))}
+		ok, _ := n.api.enumDisplaySettings(devicePtr, index, &dm)
+		if !ok {
+			break
+		}
+		raw = append(raw, rawMode{
+			Mode:         modeOf(dm),
+			Fields:       dm.DmFields,
+			DisplayFlags: dm.DmDisplayFlags,
+		})
+	}
+	return catalogue(raw, modeOf(current)), nil
 }
 
 // testMode is the CDS_TEST pre-flight on the target alone. It declares only the
