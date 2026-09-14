@@ -72,7 +72,7 @@ Everything the shipped plan constrained still holds. These are the ones this pla
 - Produces: `domain.MonitorIdentity`, `domain.MatchLevel`, the generalized `domain.Profile`, `domain.LegacySeedProfile()`, `domain.MaxDimension`.
 - Consumes: nothing new. No Win32, no I/O.
 
-- [ ] **Step 1: Rewrite the domain test around identity and the seed**
+- [x] **Step 1: Rewrite the domain test around identity and the seed**
 
 Replace `internal/domain/profile_test.go`. It currently asserts that the built-in values *are* the product's configuration; after this task they are only the wizard's pre-fill, and the test must say so. Cover:
 
@@ -84,13 +84,13 @@ func TestMaxDimensionBoundsAModeTheToolWouldRefuse(t *testing.T)
 
 The second test is the load-bearing one: the seed has an empty `InstancePath` because nobody has ever picked a monitor on this machine, and `ModelWasUnique: true` because the original tool only ever ran with one Mi Monitor attached. That combination is exactly what keeps the shipped behaviour working between Task 5 and Task 12 — the identity ladder falls through to the hardware-ID rung. Say that in a comment; it is not obvious and it will be deleted by someone who thinks the empty field is an oversight.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `go test ./internal/domain`
 
 Expected: FAIL — `LegacySeedProfile`, `MonitorIdentity` and `MaxDimension` do not exist.
 
-- [ ] **Step 3: Implement the domain types**
+- [x] **Step 3: Implement the domain types**
 
 ```go
 type MonitorIdentity struct {
@@ -130,11 +130,11 @@ const MaxDimension = 1 << 16
 
 `Target.HardwareID` moves under `Identity`; keep `DeviceName` where it is. `display/layout.go`'s unexported `maxDimension` becomes a reference to `domain.MaxDimension` so `internal/config` can validate against the same bound in Task 2 without importing `internal/display`.
 
-- [ ] **Step 4: Fix the call sites that stop compiling**
+- [x] **Step 4: Fix the call sites that stop compiling**
 
 `session.go` reads `s.profile.MonitorHardwareID` in `readCurrent`, `readLayout` and `restoreSaved`; it becomes `s.profile.Monitor.HardwareID`. `ResolveTarget` still takes a prefix string until Task 5 — do not change its signature here. `session_test.go`'s `fixtureLayout` and `newFixture` call `domain.DefaultProfile()`; they become `domain.LegacySeedProfile()`. `main_windows.go` likewise. Nothing else changes behaviour: the tool after this task is byte-for-byte the same tool.
 
-- [ ] **Step 5: Correct the two CLAUDE.md bullets that now contradict the specs**
+- [x] **Step 5: Correct the two CLAUDE.md bullets that now contradict the specs**
 
 `CLAUDE.md`'s "Hard constraints" list still says the game mode is exactly `1920×1440` and the monitor is exactly `MONITOR\XMI27B2`. Both specs replace those. An implementing agent reading that list mid-plan will obey it and undo this work, so fix it now rather than in the documentation task:
 
@@ -143,7 +143,7 @@ const MaxDimension = 1 << 16
 
 Leave the rest of `CLAUDE.md` alone; the full refresh (package layout, new commands, new env var) is Task 17.
 
-- [ ] **Step 6: Verify and commit the domain change**
+- [x] **Step 6: Verify and commit the domain change**
 
 ```powershell
 $env:PATH = "C:\Program Files\Go\bin;$env:PATH"
