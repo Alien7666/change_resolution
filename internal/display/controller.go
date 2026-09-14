@@ -40,6 +40,11 @@ type Controller interface {
 }
 
 type nativeAPI interface {
+	// listTargets reports one target per attached monitor, not per adapter, each
+	// carrying the full identity read from Win32. A cloned or mirrored adapter
+	// drives several monitors, so several targets can share one DeviceName; that
+	// repetition is the only evidence a caller has that the adapter it resolved is
+	// not the tool's alone to change.
 	listTargets() ([]domain.Target, error)
 	currentMode(deviceName string) (domain.Mode, error)
 	currentLayout() (domain.Layout, error)

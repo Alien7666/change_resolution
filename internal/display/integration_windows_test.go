@@ -8,148 +8,11 @@ import (
 	"unsafe"
 
 	"github.com/Alien7666/change_resolution/internal/domain"
-	"golang.org/x/sys/windows"
 )
 
 // cdsUpdateRegistry is the flag this package must never send: it would write a
 // temporary game mode into the user's permanent settings.
 const cdsUpdateRegistry uint32 = 0x00000001
-
-// win32Call is one ChangeDisplaySettingsExW crossing.
-type win32Call struct {
-	device string
-	mode   *devMode
-	flags  uint32
-}
-
-// enumSettingsCall is one EnumDisplaySettingsW crossing, recorded so a test can hold
-// every read to the resolved device, ENUM_CURRENT_SETTINGS and the buffer size.
-type enumSettingsCall struct {
-	device     string
-	modeNumber uint32
-	size       uint16
-}
-
-type fakeWin32 struct {
-	adapters           []displayDevice
-	monitors           map[string][]displayDevice
-	current            devMode
-	modes              map[string]devMode
-	displayDeviceSizes []uint32
-	enumSettings       []enumSettingsCall
-	calls              []win32Call
-	changeResult       int32
-	changeResults      map[string]int32
-
-	// resultFor decides a crossing's result by call index, which is how a test makes
-	// a display accept its change and then refuse to give it back.
-	resultFor func(index int, call win32Call) int32
-
-	// afterChange runs after every applied change and lets a test act as a driver
-	// that rearranges the desktop on its own, which is what the post-apply check is
-	// there to catch.
-	afterChange func(f *fakeWin32, call win32Call)
-}
-
-func (f *fakeWin32) enumDisplayDevices(
-	deviceName *uint16,
-	index uint32,
-	device *displayDevice,
-	_ uint32,
-) (bool, error) {
-	f.displayDeviceSizes = append(f.displayDeviceSizes, device.Cb)
-	devices := f.adapters
-	if deviceName != nil {
-		devices = f.monitors[windows.UTF16PtrToString(deviceName)]
-	}
-	if int(index) >= len(devices) {
-		return false, nil
-	}
-	cb := device.Cb
-	*device = devices[index]
-	device.Cb = cb
-	return true, nil
-}
-
-func (f *fakeWin32) enumDisplaySettings(deviceName *uint16, modeNumber uint32, mode *devMode) (bool, error) {
-	name := windows.UTF16PtrToString(deviceName)
-	f.enumSettings = append(f.enumSettings, enumSettingsCall{
-		device: name, modeNumber: modeNumber, size: mode.DmSize,
-	})
-	if known, ok := f.modes[name]; ok {
-		*mode = known
-		return true, nil
-	}
-	*mode = f.current
-	return true, nil
-}
-
-func (f *fakeWin32) changeDisplaySettingsEx(deviceName *uint16, mode *devMode, flags uint32) int32 {
-	name := windows.UTF16PtrToString(deviceName)
-	call := win32Call{device: name, flags: flags}
-	if mode != nil {
-		written := *mode
-		call.mode = &written
-	}
-	index := len(f.calls)
-	f.calls = append(f.calls, call)
-	result := f.resultOf(index, call)
-	if result != dispChangeSuccessful || call.mode == nil || flags&cdsTest != 0 {
-		return result
-	}
-	f.write(name, *call.mode)
-	if f.afterChange != nil {
-		f.afterChange(f, call)
-	}
-	return result
-}
-
-func (f *fakeWin32) resultOf(index int, call win32Call) int32 {
-	if f.resultFor != nil {
-		return f.resultFor(index, call)
-	}
-	if result, ok := f.changeResults[call.device]; ok {
-		return result
-	}
-	return f.changeResult
-}
-
-// write takes only the members the caller declared in dmFields, which is the whole
-// point of declaring them: a display that is only moved must come out of an apply
-// with the mode it went in with.
-func (f *fakeWin32) write(name string, written devMode) {
-	if f.modes == nil {
-		f.modes = make(map[string]devMode)
-	}
-	state, ok := f.modes[name]
-	if !ok {
-		state = f.current
-	}
-	if written.DmFields&dmPosition != 0 {
-		state.DmPosition = written.DmPosition
-	}
-	if written.DmFields&dmPelsWidth != 0 {
-		state.DmPelsWidth = written.DmPelsWidth
-	}
-	if written.DmFields&dmPelsHeight != 0 {
-		state.DmPelsHeight = written.DmPelsHeight
-	}
-	if written.DmFields&dmDisplayFrequency != 0 {
-		state.DmDisplayFrequency = written.DmDisplayFrequency
-	}
-	if written.DmFields&dmBitsPerPel != 0 {
-		state.DmBitsPerPel = written.DmBitsPerPel
-	}
-	f.modes[name] = state
-}
-
-func (f *fakeWin32) lastMode(t *testing.T) devMode {
-	t.Helper()
-	if len(f.calls) == 0 || f.calls[len(f.calls)-1].mode == nil {
-		t.Fatalf("no DEVMODEW reached ChangeDisplaySettingsExW: %+v", f.calls)
-	}
-	return *f.calls[len(f.calls)-1].mode
-}
 
 func TestWindowsStructsMatchWin32ABI(t *testing.T) {
 	if got := unsafe.Sizeof(displayDevice{}); got != 840 {
@@ -169,20 +32,22 @@ func TestWindowsStructsMatchWin32ABI(t *testing.T) {
 func TestWindowsFlagsMatchWin32AndExcludeUpdateRegistry(t *testing.T) {
 	const cdsNoReset uint32 = 0x10000000
 	for name, got := range map[string]uint32{
-		"DM_POSITION":           dmPosition,
-		"DM_BITSPERPEL":         dmBitsPerPel,
-		"DM_PELSWIDTH":          dmPelsWidth,
-		"DM_PELSHEIGHT":         dmPelsHeight,
-		"DM_DISPLAYFREQUENCY":   dmDisplayFrequency,
-		"CDS_TEST":              cdsTest,
-		"CDS_FULLSCREEN":        cdsFullscreen,
-		"DISPLAY_DEVICE_ATTACH": displayDeviceAttachedToDesktop,
+		"DM_POSITION":                   dmPosition,
+		"DM_BITSPERPEL":                 dmBitsPerPel,
+		"DM_PELSWIDTH":                  dmPelsWidth,
+		"DM_PELSHEIGHT":                 dmPelsHeight,
+		"DM_DISPLAYFREQUENCY":           dmDisplayFrequency,
+		"CDS_TEST":                      cdsTest,
+		"CDS_FULLSCREEN":                cdsFullscreen,
+		"DISPLAY_DEVICE_ATTACH":         displayDeviceAttachedToDesktop,
+		"EDD_GET_DEVICE_INTERFACE_NAME": eddGetDeviceInterfaceName,
 	} {
 		want := map[string]uint32{
 			"DM_POSITION": 0x00000020, "DM_BITSPERPEL": 0x00040000,
 			"DM_PELSWIDTH": 0x00080000, "DM_PELSHEIGHT": 0x00100000,
 			"DM_DISPLAYFREQUENCY": 0x00400000, "CDS_TEST": 0x00000002,
 			"CDS_FULLSCREEN": 0x00000004, "DISPLAY_DEVICE_ATTACH": 0x00000001,
+			"EDD_GET_DEVICE_INTERFACE_NAME": 0x00000001,
 		}[name]
 		if got != want {
 			t.Errorf("%s=%#x, want %#x", name, got, want)
@@ -204,18 +69,29 @@ func TestWindowsFlagsMatchWin32AndExcludeUpdateRegistry(t *testing.T) {
 	}
 }
 
+// miMonitorInterfacePath is the shape EnumDisplayDevicesW reports under
+// EDD_GET_DEVICE_INTERFACE_NAME. The UID... segment names the graphics card output
+// port, which is what makes the path able to tell two units of one model apart.
+const miMonitorInterfacePath = `\\?\DISPLAY#XMI27B2#5&2b9d4d4&0&UID4357#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}`
+
+// The expected Target is spelled out whole rather than field by field: listTargets
+// is the only place an identity enters the tool, so an exact comparison is also the
+// assertion that it invents nothing beyond what the two reads reported.
 func TestWindowsNativeMapsMonitorHardwareIDToAttachedAdapter(t *testing.T) {
 	api := &fakeWin32{
 		adapters: []displayDevice{
 			newDisplayDevice(t, `\.\DETACHED`, "", 0),
 			newDisplayDevice(t, `\.\DISPLAY1`, "", displayDeviceAttachedToDesktop),
 		},
-		monitors: map[string][]displayDevice{
-			`\.\DETACHED`: {
-				newDisplayDevice(t, "", `MONITOR\IGNORED\0001`, 0),
+		monitors: map[monitorKey][]displayDevice{
+			{adapter: `\.\DETACHED`}: {
+				newMonitorDevice(t, "Ignored Monitor", `MONITOR\IGNORED\0001`),
 			},
-			`\.\DISPLAY1`: {
-				newDisplayDevice(t, "", `MONITOR\XMI27B2\0009`, 0),
+			{adapter: `\.\DISPLAY1`}: {
+				newMonitorDevice(t, "Mi Monitor 27", `MONITOR\XMI27B2\0009`),
+			},
+			{adapter: `\.\DISPLAY1`, interfaceName: true}: {
+				newMonitorDevice(t, "Mi Monitor 27", miMonitorInterfacePath),
 			},
 		},
 	}
@@ -225,14 +101,170 @@ func TestWindowsNativeMapsMonitorHardwareIDToAttachedAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := domain.Target{DeviceName: `\.\DISPLAY1`, Identity: domain.MonitorIdentity{HardwareID: `MONITOR\XMI27B2\0009`}}
+	want := domain.Target{
+		DeviceName: `\.\DISPLAY1`,
+		Identity: domain.MonitorIdentity{
+			InstancePath: miMonitorInterfacePath,
+			HardwareID:   `MONITOR\XMI27B2\0009`,
+			Label:        "Mi Monitor 27",
+		},
+	}
 	if len(targets) != 1 || targets[0] != want {
-		t.Fatalf("targets=%#v", targets)
+		t.Fatalf("targets=%#v, want exactly one %#v", targets, want)
 	}
 	for _, size := range api.displayDeviceSizes {
 		if size != uint32(unsafe.Sizeof(displayDevice{})) {
 			t.Fatalf("DISPLAY_DEVICEW cb=%d", size)
 		}
+	}
+}
+
+// EDD_GET_DEVICE_INTERFACE_NAME replaces the content of DISPLAY_DEVICEW.DeviceID
+// rather than adding a member to the struct, so one call can report the hardware ID
+// or the interface path but never both. Each monitor index is therefore read twice,
+// and this test is what holds the implementation to that: the fake answers the two
+// keys with different DeviceID content, so a single read could only ever fill one of
+// the two rungs of the identity ladder.
+func TestWindowsNativeReadsTheDeviceInterfacePathAndTheHardwareID(t *testing.T) {
+	api := &fakeWin32{
+		adapters: []displayDevice{
+			newDisplayDevice(t, `\.\DISPLAY1`, "", displayDeviceAttachedToDesktop),
+		},
+		monitors: map[monitorKey][]displayDevice{
+			{adapter: `\.\DISPLAY1`}: {
+				newMonitorDevice(t, "Mi Monitor 27", `MONITOR\XMI27B2\0009`),
+			},
+			{adapter: `\.\DISPLAY1`, interfaceName: true}: {
+				newMonitorDevice(t, "Mi Monitor 27", miMonitorInterfacePath),
+			},
+		},
+	}
+	native := &windowsNative{api: api}
+
+	targets, err := native.listTargets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 {
+		t.Fatalf("targets=%#v", targets)
+	}
+	if got := targets[0].Identity.HardwareID; got != `MONITOR\XMI27B2\0009` {
+		t.Errorf("HardwareID=%q", got)
+	}
+	if got := targets[0].Identity.InstancePath; got != miMonitorInterfacePath {
+		t.Errorf("InstancePath=%q", got)
+	}
+}
+
+// The label is display-only and never participates in a comparison, but it is the
+// only thing that tells the user which row of a monitor list is which screen, and
+// listTargets used to throw DeviceString away. Task 4 layers the CCD friendly name
+// on top of this; what this test pins is that the monitor's own name survives the
+// enumeration at all, and that a monitor that reports no name produces an empty
+// label rather than something invented.
+func TestWindowsNativeKeepsTheMonitorsOwnDeviceStringAsALabel(t *testing.T) {
+	api := &fakeWin32{
+		adapters: []displayDevice{
+			newDisplayDevice(t, `\.\DISPLAY1`, "", displayDeviceAttachedToDesktop),
+			newDisplayDevice(t, `\.\DISPLAY2`, "", displayDeviceAttachedToDesktop),
+		},
+		monitors: map[monitorKey][]displayDevice{
+			{adapter: `\.\DISPLAY1`}: {
+				newMonitorDevice(t, "Mi Monitor 27", `MONITOR\XMI27B2\0009`),
+			},
+			{adapter: `\.\DISPLAY2`}: {
+				newMonitorDevice(t, "", `MONITOR\ACR0D0D\0004`),
+			},
+		},
+	}
+	native := &windowsNative{api: api}
+
+	targets, err := native.listTargets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("targets=%#v", targets)
+	}
+	if got := targets[0].Identity.Label; got != "Mi Monitor 27" {
+		t.Errorf("Label=%q, want the monitor's own DeviceString", got)
+	}
+	if got := targets[1].Identity.Label; got != "" {
+		t.Errorf("Label=%q, want an empty label for a monitor that reports no name", got)
+	}
+}
+
+// A cloned or mirrored adapter drives more than one monitor, and Win32 reports both
+// under the same \\.\DISPLAYn. listTargets reports one target per monitor, so the
+// two share a DeviceName -- that repetition is the only evidence Task 5's mirror
+// check has to work from, because the tool cannot change the mode of one of two
+// monitors that share an adapter and must refuse rather than change both.
+func TestWindowsNativeReportsOneTargetPerMonitorNotPerAdapter(t *testing.T) {
+	const clonedPath = `\\?\DISPLAY#ACR0D0D#5&2b9d4d4&0&UID4358#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}`
+	api := &fakeWin32{
+		adapters: []displayDevice{
+			newDisplayDevice(t, `\.\DISPLAY1`, "", displayDeviceAttachedToDesktop),
+		},
+		monitors: map[monitorKey][]displayDevice{
+			{adapter: `\.\DISPLAY1`}: {
+				newMonitorDevice(t, "Mi Monitor 27", `MONITOR\XMI27B2\0009`),
+				newMonitorDevice(t, "Acer", `MONITOR\ACR0D0D\0004`),
+			},
+			{adapter: `\.\DISPLAY1`, interfaceName: true}: {
+				newMonitorDevice(t, "Mi Monitor 27", miMonitorInterfacePath),
+				newMonitorDevice(t, "Acer", clonedPath),
+			},
+		},
+	}
+	native := &windowsNative{api: api}
+
+	targets, err := native.listTargets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("targets=%#v, want one per monitor", targets)
+	}
+	for i, target := range targets {
+		if target.DeviceName != `\.\DISPLAY1` {
+			t.Fatalf("target %d DeviceName=%q, want the shared adapter", i, target.DeviceName)
+		}
+	}
+	if targets[0].Identity.InstancePath == targets[1].Identity.InstancePath {
+		t.Fatalf("both monitors carry one interface path: %#v", targets)
+	}
+}
+
+// The second read is an enrichment, not a precondition. A monitor whose interface
+// path cannot be read is still selectable by hardware ID, so an unanswered second
+// call leaves InstancePath empty and drops nothing: refusing to report the monitor
+// would take away the rung that still works.
+func TestWindowsNativeStillReportsAMonitorWhoseInterfacePathIsUnavailable(t *testing.T) {
+	api := &fakeWin32{
+		adapters: []displayDevice{
+			newDisplayDevice(t, `\.\DISPLAY1`, "", displayDeviceAttachedToDesktop),
+		},
+		monitors: map[monitorKey][]displayDevice{
+			{adapter: `\.\DISPLAY1`}: {
+				newMonitorDevice(t, "Mi Monitor 27", `MONITOR\XMI27B2\0009`),
+			},
+		},
+	}
+	native := &windowsNative{api: api}
+
+	targets, err := native.listTargets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := domain.Target{
+		DeviceName: `\.\DISPLAY1`,
+		Identity: domain.MonitorIdentity{
+			HardwareID: `MONITOR\XMI27B2\0009`,
+			Label:      "Mi Monitor 27",
+		},
+	}
+	if len(targets) != 1 || targets[0] != want {
+		t.Fatalf("targets=%#v, want exactly one %#v", targets, want)
 	}
 }
 
@@ -341,38 +373,6 @@ func TestWindowsNativeTestModePreservesDriverStateAndUsesExactFlags(t *testing.T
 	if want := uint16(unsafe.Sizeof(devMode{})); staged.DmSize != want {
 		t.Fatalf("DEVMODEW.dmSize=%d, want %d", staged.DmSize, want)
 	}
-}
-
-// fakeDesktop is a driver reporting the given arrangement, and it keeps that
-// arrangement in step with the writes it accepts, so a test can read the desktop
-// back after an apply or a rollback the same way the tool does.
-func fakeDesktop(t *testing.T, layout domain.Layout) *fakeWin32 {
-	t.Helper()
-	adapters := make([]displayDevice, 0, len(layout.Displays))
-	modes := make(map[string]devMode, len(layout.Displays))
-	for _, display := range layout.Displays {
-		state := displayDeviceAttachedToDesktop
-		if display.Primary {
-			state |= displayDevicePrimaryDevice
-		}
-		adapters = append(adapters, newDisplayDevice(t, display.DeviceName, "", state))
-		modes[display.DeviceName] = devMode{
-			DmFields:           0xffffffff,
-			DmPosition:         pointL{X: display.Position.X, Y: display.Position.Y},
-			DmPelsWidth:        display.Mode.Width,
-			DmPelsHeight:       display.Mode.Height,
-			DmDisplayFrequency: display.Mode.RefreshHz,
-			DmBitsPerPel:       display.Mode.BitsPerPixel,
-			DmDisplayFlags:     77,
-		}
-	}
-	return &fakeWin32{adapters: adapters, modes: modes}
-}
-
-// measuredDesktop is the real four monitor arrangement this tool runs on.
-func measuredDesktop(t *testing.T) *fakeWin32 {
-	t.Helper()
-	return fakeDesktop(t, measuredLayout())
 }
 
 // offsetTargetLayout is the measured desktop with the target in the middle of the
@@ -818,24 +818,4 @@ func TestWindowsControllerCanTestMiMonitorMode(t *testing.T) {
 	if err := c.TestMode(target, mode); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func newDisplayDevice(t *testing.T, name, hardwareID string, stateFlags uint32) displayDevice {
-	t.Helper()
-	device := displayDevice{StateFlags: stateFlags}
-	copyUTF16(t, device.DeviceName[:], name)
-	copyUTF16(t, device.DeviceID[:], hardwareID)
-	return device
-}
-
-func copyUTF16(t *testing.T, dst []uint16, value string) {
-	t.Helper()
-	encoded, err := windows.UTF16FromString(value)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(encoded) > len(dst) {
-		t.Fatalf("UTF-16 fixture too long: %q", value)
-	}
-	copy(dst, encoded)
 }

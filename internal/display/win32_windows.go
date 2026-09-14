@@ -15,6 +15,13 @@ const (
 	displayDeviceAttachedToDesktop uint32 = 0x00000001
 	displayDevicePrimaryDevice     uint32 = 0x00000004
 
+	// eddGetDeviceInterfaceName (EDD_GET_DEVICE_INTERFACE_NAME) makes
+	// EnumDisplayDevicesW report a monitor device interface path in
+	// DISPLAY_DEVICEW.DeviceID. It replaces that member content rather than adding
+	// a member, so the hardware ID and the interface path cannot come from one call
+	// and each monitor is enumerated twice.
+	eddGetDeviceInterfaceName uint32 = 0x00000001
+
 	dmPosition         uint32 = 0x00000020
 	dmBitsPerPel       uint32 = 0x00040000
 	dmPelsWidth        uint32 = 0x00080000
@@ -93,6 +100,17 @@ func NewWindowsController() Controller {
 	return newController(&windowsNative{api: user32API{}})
 }
 
+// listTargets reports one target per attached monitor, carrying the identity the
+// profile is matched against. Each monitor index is enumerated twice, and that is
+// forced by the API rather than chosen: EDD_GET_DEVICE_INTERFACE_NAME does not add
+// a member to DISPLAY_DEVICEW, it replaces the content of DeviceID. Without the flag
+// that member holds the hardware ID (MONITOR\XMI27B2\0009, a model); with it, the
+// device interface path (\\?\DISPLAY#XMI27B2#...#UID4357#{...}, a unit on a particular
+// output port). Both rungs of the identity ladder are needed, so both reads happen.
+//
+// A monitor is reported even when the second read is not answered. The interface
+// path is an enrichment: a monitor without one is still selectable by hardware ID,
+// and dropping it would take away the rung that does work.
 func (n *windowsNative) listTargets() ([]domain.Target, error) {
 	var targets []domain.Target
 	err := n.eachAttachedAdapter(func(adapter displayDevice, adapterName string) error {
@@ -102,12 +120,20 @@ func (n *windowsNative) listTargets() ([]domain.Target, error) {
 			if !ok {
 				break
 			}
-			targets = append(targets, domain.Target{
-				DeviceName: adapterName,
-				Identity: domain.MonitorIdentity{
-					HardwareID: windows.UTF16ToString(monitor.DeviceID[:]),
-				},
-			})
+			identity := domain.MonitorIdentity{
+				HardwareID: windows.UTF16ToString(monitor.DeviceID[:]),
+				// DeviceString is the monitor's own name and is display-only. Both
+				// reads report it; the plain one is taken because it always happens.
+				// Task 4 puts the CCD friendly name in front of it.
+				Label: windows.UTF16ToString(monitor.DeviceString[:]),
+			}
+			withInterface := displayDevice{Cb: uint32(unsafe.Sizeof(displayDevice{}))}
+			if ok, _ := n.api.enumDisplayDevices(
+				&adapter.DeviceName[0], monitorIndex, &withInterface, eddGetDeviceInterfaceName,
+			); ok {
+				identity.InstancePath = windows.UTF16ToString(withInterface.DeviceID[:])
+			}
+			targets = append(targets, domain.Target{DeviceName: adapterName, Identity: identity})
 		}
 		return nil
 	})
