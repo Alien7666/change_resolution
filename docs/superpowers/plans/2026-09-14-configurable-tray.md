@@ -858,7 +858,7 @@ Expected: a first run on a machine with no config produces a working config with
 
 Every judgement lives above the seam and every piece of pointer bookkeeping lives below it. This task is the whole of the former, is fully covered by a fake, and runs on any machine — including a CI runner with no NVIDIA GPU.
 
-- [ ] **Step 1: Write the failing decision tests**
+- [x] **Step 1: Write the failing decision tests**
 
 From the scaling spec's "不需要 GPU" list:
 
@@ -877,11 +877,11 @@ func TestUnavailableNvapiCallsNothing(t *testing.T)
 
 `TestSaveToPersistence...` scans the package's own source for `0x02` and asserts it appears on exactly the constant-declaration line — the same trick as the existing `TestWindowsFlagsMatchWin32AndExcludeUpdateRegistry`, which is the template. `TestUnavailableNvapiCallsNothing` is the path CI actually reaches end to end, so it is not optional. `4` must decode as *unrecognised*, never as a neighbouring known value.
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `go test ./internal/scaling`
 
-- [ ] **Step 3: Implement the decision layer**
+- [x] **Step 3: Implement the decision layer**
 
 The spec's type sketch, verbatim in shape:
 
@@ -907,7 +907,7 @@ const (
 
 The apply sequence is fixed: re-read the whole config, select exactly one target, change exactly one `uint32`, render the payload before and after into a deterministic string (pointers flattened to `nil`/`non-nil`), require the diff to be exactly that one scaling line, `VALIDATE_ONLY`, apply with flags exactly `0`, then re-read and report the value that came back. **The UI never shows a requested value as if it were effective**; `Outcome.State` is the only source.
 
-- [ ] **Step 4: Verify and commit the decision layer**
+- [x] **Step 4: Verify and commit the decision layer**
 
 ```powershell
 gofmt -l ./internal ./cmd
