@@ -450,7 +450,7 @@ Expected: all tests pass. On the author's machine the seed profile (empty instan
 
 No picker can exist before this: the wizard's mode table, the "native ratio" reminder and the derived fallback mode all read from here.
 
-- [ ] **Step 1: Write the failing catalogue tests**
+- [x] **Step 1: Write the failing catalogue tests**
 
 The filter/dedupe/sort is pure. So it can live in a file with no build tag, define a tag-free raw form and move the four `DM_*` field bits plus `DM_INTERLACED` into `modes.go` (leave the `CDS_*` flags and their `CDS_UPDATEREGISTRY`-is-deliberately-absent comment exactly where they are, and keep `TestWindowsFlagsMatchWin32AndExcludeUpdateRegistry` passing):
 
@@ -466,25 +466,25 @@ func catalogue(raw []rawMode, current domain.Mode) []domain.Mode
 
 Cases: a mode missing any of the four required `dmFields` bits is dropped; zero width or height is dropped; `refreshHz` of 0 or 1 is dropped; `DM_INTERLACED` is dropped; non-32 bpp is dropped; duplicates on `(width, height, refresh)` collapse to one; the ordering is pixel count descending, then width descending, then refresh descending within a resolution; **the current mode is appended and marked when the driver did not enumerate it**; and an input that filters down to nothing returns an empty catalogue rather than an error, so the caller can say "this monitor reports no usable mode".
 
-- [ ] **Step 2: Write the failing aspect tests**
+- [x] **Step 2: Write the failing aspect tests**
 
 `internal/domain/aspect_test.go`, table-driven and exactly the spec's examples: `1920×1440 → 4:3`, `2560×1440 → 16:9`, `3440×1440 → 21:9`, `1280×1024 → 5:4`, `1366×768 → 1.78:1`, `2560×1600 → 16:10`, `3840×1080 → 32:9`. Plus `DeriveFallback`: the largest pixel count wins, ties break on width, and the highest refresh within that resolution is chosen; an empty catalogue returns `ok == false` so the caller disables the button instead of guessing.
 
-- [ ] **Step 3: Run both to verify they fail**
+- [x] **Step 3: Run both to verify they fail**
 
 Run: `go test ./internal/display ./internal/domain`
 
-- [ ] **Step 4: Implement the catalogue, the aspect label and the enumeration**
+- [x] **Step 4: Implement the catalogue, the aspect label and the enumeration**
 
 `AspectLabel` reduces by `gcd`, maps the known table (`4:3`, `5:4`, `3:2`, `16:10`, `16:9`, `64:27`→`21:9`, `43:18`→`21:9`, `32:9`), then prints `a:b` when the reduced denominator is ≤ 32, and otherwise a two-decimal `1.78:1`. No fuzzy matching anywhere.
 
 The Windows side calls `EnumDisplaySettingsW(device, i, &dm)` from `i = 0` until it returns `FALSE`, **zeroing the `DEVMODEW` and re-setting `dmSize` before every call** — the same reason `loadCurrentMode` re-asserts `DmSize` today: do not assume GDI preserved the caller's buffer size. Convert each result to `rawMode` and hand the batch to `catalogue` along with a separate `ENUM_CURRENT_SETTINGS` read. This is purely a read and is safe at any time, including during first run.
 
-- [ ] **Step 5: Extend the fake desktop and the opt-in test**
+- [x] **Step 5: Extend the fake desktop and the opt-in test**
 
 The fake `user32` answers indexed `enumDisplaySettings` calls from a per-device mode list, including a deliberately dirty one (an interlaced entry, a 1 Hz entry, a 16-bit entry, a duplicate) so the filter is exercised through the real adapter, not only through `catalogue` directly. Add an opt-in case under `RUN_DISPLAY_INTEGRATION` that enumerates the real target's modes and logs the catalogue — still a read.
 
-- [ ] **Step 6: Verify and commit mode enumeration**
+- [x] **Step 6: Verify and commit mode enumeration**
 
 ```powershell
 gofmt -l ./internal ./cmd
