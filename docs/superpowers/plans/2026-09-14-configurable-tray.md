@@ -377,7 +377,7 @@ Expected: unit tests pass; the opt-in read reports real monitor names; no setter
 
 **This is the largest single code change in the plan, and the step text should not pretend otherwise.** `ResolveTarget` is on the `Controller` interface, so this one signature touches: the real controller, the fake `nativeAPI` in `controller_test.go`, the fake `user32` desktop, `Session.readCurrent`, `Session.readLayout`, `Session.restoreSaved`, the `fakeDisplay` in `session_test.go`, the `stubDisplays` in `window_windows_test.go`, and the `ResolveTarget` string literal in every test that passes `MONITOR\XMI27B2`. Expect to touch roughly a dozen test functions across three packages, all mechanically. Do the pure matcher first so the mechanical part has something correct to lean on.
 
-- [ ] **Step 1: Write the failing identity-matching tests**
+- [x] **Step 1: Write the failing identity-matching tests**
 
 `resolveIdentity(targets []domain.Target, want domain.MonitorIdentity) (domain.Target, error)` is pure and takes a fake monitor list. Cover, from the spec's ladder:
 
@@ -394,11 +394,11 @@ func TestResolveIdentityReturnsNotFoundWithoutGuessing(t *testing.T)
 
 The `ModelWasUnique == false` case is the one with a counter-intuitive rule: even a single hardware-ID hit is refused, because with two of the model configured, one hit most likely means the other is asleep or unplugged, not that this is the one the user wanted. Put the reasoning in the test comment.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `go test ./internal/display -run ResolveIdentity`
 
-- [ ] **Step 3: Implement the ladder**
+- [x] **Step 3: Implement the ladder**
 
 ```go
 var (
@@ -411,15 +411,15 @@ func resolveIdentity(targets []domain.Target, want domain.MonitorIdentity) (doma
 
 Instance path: whole-string `strings.EqualFold`, never a prefix. Hardware ID: whole-string `EqualFold` on the model portion, only when `want.ModelWasUnique`, and only when exactly one candidate matches. Mirror check: after a match, if any *other* target in the list carries the same `DeviceName`, refuse with `ErrTargetMirrored` — the tool cannot change one of two monitors sharing an adapter, and saying so is better than changing both.
 
-- [ ] **Step 4: Change the interface and fix every call site**
+- [x] **Step 4: Change the interface and fix every call site**
 
 `Controller.ResolveTarget` takes `domain.MonitorIdentity`. `Session` passes `s.profile.Monitor`. The fakes take an identity and answer from a list rather than echoing a prefix — `fakeDisplay.ResolveTarget` in `session_test.go` currently records `domain.Target{HardwareID: prefix}`, which must become the identity it was asked for. `stubDisplays` in the UI test likewise. Run `go build ./... && go test ./...` repeatedly and fix compilation breakage in one pass rather than guessing which files are affected.
 
-- [ ] **Step 5: Surface the new sentinels in the UI latch**
+- [x] **Step 5: Surface the new sentinels in the UI latch**
 
 `ui.updateAvailability` latches on `ErrTargetNotFound` and `ErrModeNotSupported`. Add `ErrTargetAmbiguous` and `ErrTargetMirrored` with their own reasons (the ambiguity message lists the candidates' `\\.\DISPLAYn` and asks the user to reselect; the mirror message explains the tool cannot change one of a mirrored pair). Add a UI test per sentinel, mirroring `TestUpdateAvailabilityLatchesMissingTarget`.
 
-- [ ] **Step 6: Verify and commit identity resolution**
+- [x] **Step 6: Verify and commit identity resolution**
 
 ```powershell
 gofmt -l ./internal ./cmd
@@ -628,15 +628,15 @@ Expected: all tests pass, including 20 repeats of the app package; no occurrence
 
 Small and self-contained, but the wizard cannot offer a process picker without it, and doing it here keeps Task 12 focused on the dialog.
 
-- [ ] **Step 1: Write the failing dedupe/sort test**
+- [x] **Step 1: Write the failing dedupe/sort test**
 
 `uniqueSortedNames([]string) []string`: case-insensitive dedupe keeping the first spelling seen, sorted case-insensitively, empty entries dropped. Table-driven; no Win32.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `go test ./internal/process`
 
-- [ ] **Step 3: Implement `Lister` on the existing snapshot walk**
+- [x] **Step 3: Implement `Lister` on the existing snapshot walk**
 
 ```go
 type Lister interface {
@@ -646,7 +646,7 @@ type Lister interface {
 
 `toolhelpChecker` gains `Names`, reusing the same `CreateToolhelp32Snapshot` + `Process32First/Next` walk that `Running` uses, collecting `entry.ExeFile` and nothing else. **No new API may appear in this file** — no `OpenProcess`, no module enumeration, no command lines, no paths. Listing names is exactly as safe as matching one, and the wizard showing names rather than paths is also what makes a path-shaped `processName` nearly impossible to produce from the UI.
 
-- [ ] **Step 4: Verify and commit the lister**
+- [x] **Step 4: Verify and commit the lister**
 
 ```powershell
 gofmt -l ./internal ./cmd
