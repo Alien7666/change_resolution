@@ -174,7 +174,7 @@ Expected: everything passes, the binary behaves identically, and no file still m
 
 This task is pure Go and file I/O into a temp directory. It touches no Win32, no display, no UI, and nothing else in the tree depends on it yet — it is deliberately sequenced early because it is the one large chunk of this release that can be finished without fighting the display layer.
 
-- [ ] **Step 1: Write the failing parse/validation table**
+- [x] **Step 1: Write the failing parse/validation table**
 
 Create `internal/config/config_test.go` as one table-driven test plus a few named ones. The spec's rejection table is the test list; every row is a case:
 
@@ -193,7 +193,7 @@ Create `internal/config/config_test.go` as one table-driven test plus a few name
 - `processName` containing `\` `/` `:` `<` `>` `"` `?` `*` `|` or a control character, or equal to `.` or `..`, or longer than 255 → rejects the whole file (Toolhelp reports bare image names and the matcher compares for equality, so a path-shaped value could never fire — it would look configured and silently never work);
 - `processName` without `.exe` → accepted.
 
-- [ ] **Step 2: Write the failing store test**
+- [x] **Step 2: Write the failing store test**
 
 Create `internal/config/store_test.go`:
 
@@ -203,13 +203,13 @@ Create `internal/config/store_test.go`:
 - **every rejection path writes zero bytes.** Point a rejecting `Load` at a directory and assert no file was created, no `.tmp` was created, and the original file's mod-time is unchanged. This assertion is the whole point of the "no partial loading" rule and it must be explicit;
 - `Backup` renames an unreadable file to `config.bad-<timestamp>.json` and returns the new path, and does so only when called.
 
-- [ ] **Step 3: Run both tests to verify they fail**
+- [x] **Step 3: Run both tests to verify they fail**
 
 Run: `go test ./internal/config`
 
 Expected: FAIL — the package does not exist.
 
-- [ ] **Step 4: Implement the schema and validation**
+- [x] **Step 4: Implement the schema and validation**
 
 ```go
 const Version = 1
@@ -235,13 +235,13 @@ var (
 
 Decode with `json.Decoder` so the syntax-error offset is available; convert the offset to line and column by counting newlines in the input up to it. Numeric fields decode into `uint32` / `uint64`. Validation returns on the first failure with a message naming the field — a config file is a boundary and is treated as untrusted input, but the user is the author, so the message has to tell them which line to fix.
 
-- [ ] **Step 5: Implement the store**
+- [x] **Step 5: Implement the store**
 
 `Path()` prefers `RESOLUTION_TRAY_CONFIG` (the whole path, not a directory), otherwise `os.UserConfigDir()` + `ResolutionTray` + `config.json`. `Save` creates the directory, writes `config.json.tmp` beside the target, `Sync`s, closes, then renames — same directory is a correctness requirement, a cross-volume rename is not atomic. Never truncate in place. `Load` reads, `Parse`s, and returns; it writes nothing on any path, including success.
 
 Write the JSON with two-space indentation, UTF-8 without BOM, LF line endings, `version` first.
 
-- [ ] **Step 6: Verify and commit the configuration package**
+- [x] **Step 6: Verify and commit the configuration package**
 
 ```powershell
 gofmt -l ./internal ./cmd
@@ -270,11 +270,11 @@ Expected: all tests pass; `git status --short` shows no stray file under a temp 
 
 `listTargets` has to start reporting the device interface path before an identity can be stored anywhere, so this task comes before the config is ever written from a picker and before matching changes.
 
-- [ ] **Step 1: Split and reshape the fake desktop before adding to it**
+- [x] **Step 1: Split and reshape the fake desktop before adding to it**
 
 `internal/display/integration_windows_test.go` is 841 lines and holds both the fake `user32` and every test that uses it; the file name also no longer describes what is in it. Move `fakeWin32`, `win32Call`, `enumSettingsCall`, `fakeDesktop`, `measuredDesktop`, `newDisplayDevice` and `copyUTF16` into `fake_win32_windows_test.go`, unchanged in behaviour. Then reshape the monitor side: `monitors` becomes keyed by adapter name *and* by whether the caller asked for the interface name, because those two calls return different content in the same `DeviceID` field. Keep every existing test passing with no assertion edits — this step is a pure move plus one field, and `go test ./internal/display` proves it.
 
-- [ ] **Step 2: Write the failing identity enumeration tests**
+- [x] **Step 2: Write the failing identity enumeration tests**
 
 In `integration_windows_test.go`:
 
@@ -286,13 +286,13 @@ func TestWindowsNativeReportsOneTargetPerMonitorNotPerAdapter(t *testing.T)
 
 The third is the one that matters later: a cloned/mirrored adapter drives two monitors, and the only way Task 5 can detect that is if `listTargets` returns two targets carrying the same `DeviceName`. Assert exactly that shape here.
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `go test ./internal/display`
 
 Expected: FAIL — targets carry no identity.
 
-- [ ] **Step 4: Implement the double enumeration**
+- [x] **Step 4: Implement the double enumeration**
 
 `EDD_GET_DEVICE_INTERFACE_NAME` is `0x00000001`. The flag **replaces** the content of `DISPLAY_DEVICEW.DeviceID`: with the flag it holds the interface path (`\\?\DISPLAY#XMI27B2#5&2b9d4d4&0&UID4357#{e6f07b5f-...}`), without it the hardware ID (`MONITOR\XMI27B2\0009`). Both are needed, so each monitor index is read twice:
 
@@ -303,7 +303,7 @@ withIfc := n.api.enumDisplayDevices(&adapter.DeviceName[0], monitorIndex, &monit
 
 `Identity.HardwareID` comes from the first, `Identity.InstancePath` from the second, `Identity.Label` from `DeviceString` of either. A failed second call is not fatal: leave `InstancePath` empty and let the ladder fall through — a monitor with no interface path is still selectable by hardware ID.
 
-- [ ] **Step 5: Verify and commit identity enumeration**
+- [x] **Step 5: Verify and commit identity enumeration**
 
 ```powershell
 gofmt -l ./internal ./cmd
