@@ -52,8 +52,8 @@ func (f *fakeNative) applyLayout(plan domain.LayoutPlan) error {
 
 func TestResolveTargetMatchesHardwareIDPrefixCaseInsensitively(t *testing.T) {
 	api := &fakeNative{targets: []domain.Target{
-		{DeviceName: `\.\DISPLAY2`, HardwareID: `MONITOR\ACR0D0D\0004`},
-		{DeviceName: `\.\DISPLAY1`, HardwareID: `monitor\xmi27b2\0009`},
+		{DeviceName: `\.\DISPLAY2`, Identity: domain.MonitorIdentity{HardwareID: `MONITOR\ACR0D0D\0004`}},
+		{DeviceName: `\.\DISPLAY1`, Identity: domain.MonitorIdentity{HardwareID: `monitor\xmi27b2\0009`}},
 	}}
 	c := newController(api)
 	got, err := c.ResolveTarget(`MONITOR\XMI27B2`)
@@ -64,7 +64,7 @@ func TestResolveTargetMatchesHardwareIDPrefixCaseInsensitively(t *testing.T) {
 
 func TestResolveTargetReturnsSentinelWhenNoTargetMatches(t *testing.T) {
 	api := &fakeNative{targets: []domain.Target{{
-		DeviceName: `\.\DISPLAY2`, HardwareID: `MONITOR\ACR0D0D\0004`,
+		DeviceName: `\.\DISPLAY2`, Identity: domain.MonitorIdentity{HardwareID: `MONITOR\ACR0D0D\0004`},
 	}}}
 	c := newController(api)
 
@@ -78,7 +78,7 @@ func TestCurrentModeUsesOnlyResolvedDevice(t *testing.T) {
 	mode := domain.Mode{Width: 2560, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
 	api := &fakeNative{mode: mode}
 	c := newController(api)
-	target := domain.Target{DeviceName: `\.\DISPLAY1`, HardwareID: `MONITOR\XMI27B2\0009`}
+	target := domain.Target{DeviceName: `\.\DISPLAY1`, Identity: domain.MonitorIdentity{HardwareID: `MONITOR\XMI27B2\0009`}}
 
 	got, err := c.CurrentMode(target)
 	if err != nil || got != mode {
@@ -107,7 +107,7 @@ func TestCurrentLayoutReportsEveryDisplayItRead(t *testing.T) {
 func TestTestModeUsesOnlyResolvedDevice(t *testing.T) {
 	api := &fakeNative{}
 	c := newController(api)
-	target := domain.Target{DeviceName: `\.\DISPLAY1`, HardwareID: `MONITOR\XMI27B2\0009`}
+	target := domain.Target{DeviceName: `\.\DISPLAY1`, Identity: domain.MonitorIdentity{HardwareID: `MONITOR\XMI27B2\0009`}}
 	mode := domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
 
 	if err := c.TestMode(target, mode); err != nil {
@@ -149,7 +149,7 @@ func TestTestModeWrapsPreflightRejectionWithSentinel(t *testing.T) {
 	rejection := errors.New(`ChangeDisplaySettingsExW(\.\DISPLAY1): display mode is not supported`)
 	api := &fakeNative{testErr: rejection}
 	c := newController(api)
-	target := domain.Target{DeviceName: `\.\DISPLAY1`, HardwareID: `MONITOR\XMI27B2\0009`}
+	target := domain.Target{DeviceName: `\.\DISPLAY1`, Identity: domain.MonitorIdentity{HardwareID: `MONITOR\XMI27B2\0009`}}
 	mode := domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
 
 	err := c.TestMode(target, mode)

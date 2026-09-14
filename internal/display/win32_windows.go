@@ -104,7 +104,9 @@ func (n *windowsNative) listTargets() ([]domain.Target, error) {
 			}
 			targets = append(targets, domain.Target{
 				DeviceName: adapterName,
-				HardwareID: windows.UTF16ToString(monitor.DeviceID[:]),
+				Identity: domain.MonitorIdentity{
+					HardwareID: windows.UTF16ToString(monitor.DeviceID[:]),
+				},
 			})
 		}
 		return nil

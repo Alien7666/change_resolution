@@ -16,7 +16,12 @@ const (
 	// maxDimension and maxCoordinate are sanity bounds, far beyond any real desktop.
 	// Rejecting anything outside them keeps every later shift inside int32 and turns
 	// a display the tool failed to read (a zero-sized mode) into a refusal to act.
-	maxDimension  = 1 << 16
+	//
+	// The dimension bound is domain.MaxDimension rather than a number of this
+	// package's own: internal/config has to refuse exactly the same modes when it
+	// validates the user's file, and it cannot import internal/display to find out
+	// where the line is.
+	maxDimension  = domain.MaxDimension
 	maxCoordinate = 1 << 24
 )
 

@@ -61,7 +61,7 @@ func (c *controller) ResolveTarget(prefix string) (domain.Target, error) {
 		return domain.Target{}, err
 	}
 	for _, target := range targets {
-		if strings.HasPrefix(strings.ToUpper(target.HardwareID), strings.ToUpper(prefix)) {
+		if strings.HasPrefix(strings.ToUpper(target.Identity.HardwareID), strings.ToUpper(prefix)) {
 			return target, nil
 		}
 	}

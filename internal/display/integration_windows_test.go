@@ -225,7 +225,7 @@ func TestWindowsNativeMapsMonitorHardwareIDToAttachedAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := domain.Target{DeviceName: `\.\DISPLAY1`, HardwareID: `MONITOR\XMI27B2\0009`}
+	want := domain.Target{DeviceName: `\.\DISPLAY1`, Identity: domain.MonitorIdentity{HardwareID: `MONITOR\XMI27B2\0009`}}
 	if len(targets) != 1 || targets[0] != want {
 		t.Fatalf("targets=%#v", targets)
 	}

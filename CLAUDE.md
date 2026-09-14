@@ -10,7 +10,7 @@ Design spec: `docs/superpowers/specs/2026-09-13-go-display-tray-design.md`. Impl
 
 ## Package layout
 
-- `internal/domain` — `Mode`, `Target`, `Profile`, and `DefaultProfile()`. Plain data, no Win32 dependency.
+- `internal/domain` — `Mode`, `MonitorIdentity`, `MatchLevel`, `Target`, `Profile`, `MaxDimension`, and `LegacySeedProfile()`. Plain data, no Win32 dependency.
 - `internal/display` — `Controller` interface (`ResolveTarget`, `CurrentMode`, `TestMode`, `ApplyMode`) plus the Win32 adapter (`EnumDisplayDevicesW`, `EnumDisplaySettingsW`, `ChangeDisplaySettingsExW`). Never sets `CDS_UPDATEREGISTRY`, `DM_POSITION`, or `CDS_SET_PRIMARY`; every change targets only the resolved Mi Monitor device.
 - `internal/process` — `Checker` interface and the read-only Toolhelp implementation (`CreateToolhelp32Snapshot` + `Process32First/Next`). Matches only the executable name; never calls `OpenProcess`, reads memory, or inspects windows/command lines.
 - `internal/app` — `gameTracker` (pure presence/delay state transitions) and `Session` (serialized `Enable`/`Disable`/`Shutdown`/`Refresh`, background game-presence watcher, `SetOnChange` notifications). This is where the state machine described in the design spec lives, fully covered by fake-backed tests.
@@ -62,8 +62,8 @@ Remove-Item Env:RUN_DISPLAY_INTEGRATION
 - Windows `amd64` only; no non-Windows runtime support is needed.
 - `CGO_ENABLED=0` for production builds.
 - Startup must remain read-only: read and display state, never change a display mode.
-- Match the Mi Monitor by hardware-ID prefix `MONITOR\XMI27B2`, never by a fixed `DISPLAY1` index.
-- The built-in game mode is exactly `1920×1440 @ 180 Hz`, 32 bpp.
+- Match the configured monitor through the identity ladder in `domain.MonitorIdentity`: the device interface path first, compared whole and case-insensitively; the hardware ID only as a fallback, only when the model was unique at the moment the user configured it, and only when it matches exactly one attached monitor. Never match by a fixed `DISPLAY1` index, and never take the first of several matches — ambiguity is an honest refusal, not a coin flip.
+- The game mode is whatever the user configured. `domain.LegacySeedProfile()` is not that configuration: it exists only to pre-fill the first-run wizard with the original `1920×1440 @ 180 Hz` values, and is never the profile a shipping session runs on.
 - Never launch VALORANT, inject or hook code, open its process, read its memory, or modify Riot/Vanguard/game files. Only observe the executable name `VALORANT-Win64-Shipping.exe` via Toolhelp.
 - Restore 3 seconds after the game goes from seen/running to absent; manual disable restores immediately and cancels any pending automatic restore.
 - Never use `CDS_UPDATEREGISTRY`; always test a target mode (`CDS_TEST`) before applying it (`CDS_TEST`/apply, never combined).

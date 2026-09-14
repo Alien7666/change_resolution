@@ -1,8 +1,9 @@
 //go:build windows
 
-// Command resolution-tray is the production composition root: it wires the
-// built-in Mi Monitor profile to the Win32 display controller, the read-only
-// Toolhelp process checker, the application session, and the Walk tray UI.
+// Command resolution-tray is the production composition root: it wires a profile
+// to the Win32 display controller, the read-only Toolhelp process checker, the
+// application session, and the Walk tray UI. The profile is still the legacy seed
+// here; loading the user's saved configuration arrives with the settings dialog.
 package main
 
 import (
@@ -19,7 +20,7 @@ func main() {
 	session := app.NewSession(
 		display.NewWindowsController(),
 		processcheck.NewToolhelpChecker(),
-		domain.DefaultProfile(),
+		domain.LegacySeedProfile(),
 	)
 	if err := ui.Run(session); err != nil {
 		log.Fatal(err)

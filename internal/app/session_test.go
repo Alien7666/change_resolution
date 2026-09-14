@@ -41,7 +41,7 @@ func (d *fakeDisplay) record(operation string, target domain.Target, mode domain
 }
 
 func (d *fakeDisplay) ResolveTarget(prefix string) (domain.Target, error) {
-	err := d.record("resolve", domain.Target{HardwareID: prefix}, domain.Mode{}, domain.LayoutPlan{})
+	err := d.record("resolve", domain.Target{Identity: domain.MonitorIdentity{HardwareID: prefix}}, domain.Mode{}, domain.LayoutPlan{})
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.target, err
@@ -226,7 +226,7 @@ var (
 // the desktop the tool must produce, and passing the native mode the one it must
 // come back to.
 func fixtureLayout(targetMode domain.Mode) domain.Layout {
-	offset := int32(targetMode.Width) - int32(domain.DefaultProfile().GameMode.Width)
+	offset := int32(targetMode.Width) - int32(domain.LegacySeedProfile().GameMode.Width)
 	return domain.Layout{Displays: []domain.DisplayState{
 		{DeviceName: targetDevice, Mode: targetMode, Position: domain.Point{}, Primary: true},
 		{DeviceName: rightDevice, Mode: fixtureSide, Position: domain.Point{X: 1920 + offset}},
@@ -237,10 +237,10 @@ func fixtureLayout(targetMode domain.Mode) domain.Layout {
 
 func newFixture(t *testing.T) *sessionFixture {
 	t.Helper()
-	profile := domain.DefaultProfile()
+	profile := domain.LegacySeedProfile()
 	original := fixtureNative
 	displays := &fakeDisplay{
-		target:  domain.Target{DeviceName: targetDevice, HardwareID: profile.MonitorHardwareID},
+		target:  domain.Target{DeviceName: targetDevice, Identity: domain.MonitorIdentity{HardwareID: profile.Monitor.HardwareID}},
 		current: original, layout: fixtureLayout(original), fail: make(map[string]error),
 	}
 	checker := &fakeChecker{called: make(chan string, 8), results: make(chan processResult), closed: make(chan struct{})}
@@ -341,7 +341,7 @@ func TestEnableCapturesCurrentModeTestsThenApplies(t *testing.T) {
 	}
 	calls := f.display.takeCalls()
 	assertOperations(t, calls, "resolve", "layout", "test", "apply")
-	if calls[0].target.HardwareID != f.profile.MonitorHardwareID || calls[2].mode != f.profile.GameMode || calls[3].mode != f.profile.GameMode {
+	if calls[0].target.Identity.HardwareID != f.profile.Monitor.HardwareID || calls[2].mode != f.profile.GameMode || calls[3].mode != f.profile.GameMode {
 		t.Fatalf("wrong target or mode: %+v", calls)
 	}
 	if got := f.s.Snapshot(); !got.Managed || !got.FourByThree || got.State != StateWaitingForGame {
@@ -552,7 +552,7 @@ func TestEnableKeepsUnsupportedModeSentinelInSnapshotErr(t *testing.T) {
 // Resolve failures must keep reaching the UI as display.ErrTargetNotFound.
 func TestRefreshKeepsTargetNotFoundSentinelInSnapshotErr(t *testing.T) {
 	f := newFixture(t)
-	f.display.setFailure("resolve", fmt.Errorf("%w: %s", display.ErrTargetNotFound, f.profile.MonitorHardwareID))
+	f.display.setFailure("resolve", fmt.Errorf("%w: %s", display.ErrTargetNotFound, f.profile.Monitor.HardwareID))
 
 	got, err := f.s.Refresh()
 	if !errors.Is(err, display.ErrTargetNotFound) {

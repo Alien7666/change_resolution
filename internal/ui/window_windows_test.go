@@ -114,7 +114,7 @@ func (d *stubDisplays) ResolveTarget(string) (domain.Target, error) {
 	if d.resolveErr != nil {
 		return domain.Target{}, d.resolveErr
 	}
-	return domain.Target{DeviceName: `\.\DISPLAY4`, HardwareID: `MONITOR\XMI27B2`}, nil
+	return domain.Target{DeviceName: `\.\DISPLAY4`, Identity: domain.MonitorIdentity{HardwareID: `MONITOR\XMI27B2`}}, nil
 }
 
 func (d *stubDisplays) CurrentMode(domain.Target) (domain.Mode, error) {
@@ -194,7 +194,7 @@ func TestRefreshCommandReReadsTheDisplayAndClearsTheLatch(t *testing.T) {
 	displays := &stubDisplays{
 		resolveErr: fmt.Errorf("%w: %s", display.ErrTargetNotFound, `MONITOR\XMI27B2`),
 	}
-	session := app.NewSession(displays, stubProcesses{}, domain.DefaultProfile())
+	session := app.NewSession(displays, stubProcesses{}, domain.LegacySeedProfile())
 	t.Cleanup(func() {
 		if err := session.Shutdown(); err != nil {
 			t.Errorf("cleanup Shutdown: %v", err)
