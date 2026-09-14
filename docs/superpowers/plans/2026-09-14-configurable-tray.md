@@ -331,23 +331,23 @@ Expected: all tests pass; `ResolveTarget` still matches on the hardware-ID prefi
 
 `EnumDisplayDevicesW` frequently answers "Generic PnP Monitor", which is useless in a list where picking the wrong row applies a mode to the wrong screen. This is an independent, read-only addition: if any part of it fails, the label silently falls back and nothing else notices.
 
-- [ ] **Step 1: Write the failing name-ladder tests**
+- [x] **Step 1: Write the failing name-ladder tests**
 
 The ladder itself is pure and gets a table test: a CCD name wins; an empty CCD name falls back to `DeviceString`; a `DeviceString` that is empty or equal to a known-useless placeholder falls back to the hardware ID; a CCD call that errors falls back without surfacing an error anywhere. Add a struct-size assertion test for each CCD struct the binding declares — take the sizes from the Windows SDK headers, do not guess them, and let the opt-in integration test in Step 4 be the thing that proves them against the real API.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `go test ./internal/display`
 
-- [ ] **Step 3: Implement the CCD binding behind a seam**
+- [x] **Step 3: Implement the CCD binding behind a seam**
 
 `GetDisplayConfigBufferSizes` → `QueryDisplayConfig` → `DisplayConfigGetDeviceInfo(DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME)`, all from `user32.dll` through `windows.NewLazySystemDLL` exactly as this file already loads `user32`. Put the lookup behind a small interface (`friendlyNamer`) so the fake desktop can supply names and so a machine where the call is unavailable is a normal test case, not an untested branch. This code is read-only — it must never call any of the `DisplayConfigSetDeviceInfo` / `SetDisplayConfig` family.
 
-- [ ] **Step 4: Extend the opt-in integration test**
+- [x] **Step 4: Extend the opt-in integration test**
 
 Add a case to the existing `RUN_DISPLAY_INTEGRATION`-gated test that resolves friendly names for every attached monitor and logs them. It is a read; it stays inside that gate's promise. CI still never sets the gate.
 
-- [ ] **Step 5: Verify and commit friendly names**
+- [x] **Step 5: Verify and commit friendly names**
 
 ```powershell
 gofmt -l ./internal ./cmd
@@ -933,15 +933,15 @@ Expected: full coverage of every branch above the seam with no GPU present anywh
 **Interfaces:**
 - Produces: `scaling.NewWindowsController()`, the `nvapi` implementation, the struct/version constants.
 
-- [ ] **Step 1: Write the failing layout assertions**
+- [x] **Step 1: Write the failing layout assertions**
 
 These are pure Go layout facts on amd64 and are the highest-value test in the whole scaling feature, because they are what a wrong struct offset would break and they need no GPU. Guard on `runtime.GOARCH == "amd64"` and assert the measured sizes from the spec: `pathInfo` 48, `advTargetInfo` 128, `targetInfo` 24, `sourceMode` 32, `timing` 96, `timingExt` 64; then assert the version stamps computed from them are `0x00020030` (`NV_DISPLAYCONFIG_PATH_INFO_VER2`) and `0x00010080` (`NV_DISPLAYCONFIG_PATH_ADVANCED_TARGET_INFO_VER1`).
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `go test ./internal/scaling`
 
-- [ ] **Step 3: Implement the binding**
+- [x] **Step 3: Implement the binding**
 
 `windows.NewLazySystemDLL("nvapi64.dll")` — `LOAD_LIBRARY_SEARCH_SYSTEM32`, the same way this repo loads `user32.dll`. This is a security requirement, not a style choice: the tool ships as a single portable exe users run out of `Downloads`, which is the textbook DLL-planting location, and the default search order would let a same-named file beside the exe take over. Resolve `nvapi_QueryInterface`, then the six interface ids from NVIDIA's own `nvapi_interface.h`: `NvAPI_Initialize` `0x0150E828`, `NvAPI_DISP_GetDisplayConfig` `0x11ABCCF8`, `NvAPI_DISP_SetDisplayConfig` `0x5D8CF8DE`, `NvAPI_DISP_GetDisplayIdByDisplayName` `0xAE457190`, `NvAPI_GetErrorMessage` `0x6C2D048C`, `NvAPI_Unload` `0xD22BDD7E`.
 
@@ -954,11 +954,11 @@ Two things deserve comments in the file because they are unlike anything else in
 
 Initialize once per process, `NvAPI_Unload` only from `Close()`. Cache `MonitorIdentity → displayId` but re-validate on every use: the freshly read config must contain exactly one target with that id, or the cache is dropped and the name resolved again.
 
-- [ ] **Step 4: Add the opt-in, read-only integration test**
+- [x] **Step 4: Add the opt-in, read-only integration test**
 
 Gate on the **new** `RUN_NVAPI_INTEGRATION=1`. Never reuse `RUN_DISPLAY_INTEGRATION`. Contents: resolve a displayId, run the three-pass read, and a **negative control** that deliberately stamps a wrong version and asserts `NVAPI_INCOMPATIBLE_STRUCT_VERSION (-9)` comes back — that is what turns "no error, so the version is probably right" into "the version is right". This test performs no `SetDisplayConfig` of any kind, not even with `VALIDATE_ONLY`.
 
-- [ ] **Step 5: Verify and commit the binding**
+- [x] **Step 5: Verify and commit the binding**
 
 ```powershell
 gofmt -l ./internal ./cmd
