@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -236,6 +237,10 @@ const (
 	rightDevice  = `\.\DISPLAY2`
 	topRight     = `\.\DISPLAY5`
 	topLeft      = `\.\DISPLAY3`
+	// belowDevice only exists for the arrangements a mode picker makes reachable: a
+	// display under the target moves whenever the target's height changes, and the
+	// fixture's four displays are all beside or above it.
+	belowDevice = `\.\DISPLAY6`
 )
 
 var (
@@ -261,11 +266,22 @@ func fixtureLayout(targetMode domain.Mode) domain.Layout {
 
 func newFixture(t *testing.T) *sessionFixture {
 	t.Helper()
-	profile := domain.LegacySeedProfile()
-	original := fixtureNative
+	return newFixtureWith(t, domain.LegacySeedProfile(), fixtureNative, fixtureLayout(fixtureNative))
+}
+
+// newFixtureWith builds the session around an explicit profile and desktop.
+//
+// The shipped profile only ever narrowed its target, so every test that drives a
+// game mode larger than the one the monitor is running -- which is every mode a
+// picker will offer -- comes through here. The desktop is passed in as well because
+// a target that grows is not the only new shape: an arrangement the planner cannot
+// make safe is one a user can now ask for, and that takes a desktop the fixture's
+// contiguous four does not model.
+func newFixtureWith(t *testing.T, profile domain.Profile, original domain.Mode, desktop domain.Layout) *sessionFixture {
+	t.Helper()
 	displays := &fakeDisplay{
 		target:  domain.Target{DeviceName: targetDevice, Identity: domain.MonitorIdentity{HardwareID: profile.Monitor.HardwareID}},
-		current: original, layout: fixtureLayout(original), fail: make(map[string]error),
+		current: original, layout: desktop, fail: make(map[string]error),
 	}
 	checker := &fakeChecker{called: make(chan string, 8), results: make(chan processResult), closed: make(chan struct{})}
 	clock := &fakeClock{now: time.Unix(100, 0)}
@@ -958,5 +974,138 @@ func TestRestoreAbortsWhenTheSavedArrangementNoLongerFitsTheDesktop(t *testing.T
 	}
 	if got := f.desktop(); !reflect.DeepEqual(got, fixtureLayout(f.original)) {
 		t.Fatalf("restored desktop = %+v", got)
+	}
+}
+
+// fixtureLarger is wider and taller than the desktop's native mode. Every session
+// test above this line narrows the target, because the built-in profile was the
+// only profile there was; the moment a picker lists what the monitor reports, most
+// of what it lists is larger than the mode the monitor is running.
+var fixtureLarger = domain.Mode{Width: 3840, Height: 1600, RefreshHz: 120, BitsPerPixel: 32}
+
+// profileWithGameMode is the configuration a user produces as soon as they can
+// choose: the shipped monitor and watched process, and a mode of their own.
+func profileWithGameMode(mode domain.Mode) domain.Profile {
+	profile := domain.LegacySeedProfile()
+	profile.GameMode = mode
+	return profile
+}
+
+// assertNoOverlappingDisplays holds the desktop to the property the planning layer
+// exists for. Comparing coordinates alone would still pass if the target had grown
+// straight over the display beside it.
+func assertNoOverlappingDisplays(t *testing.T, layout domain.Layout) {
+	t.Helper()
+	for i, a := range layout.Displays {
+		for _, b := range layout.Displays[i+1:] {
+			if a.Position.X < b.Position.X+int32(b.Mode.Width) &&
+				b.Position.X < a.Position.X+int32(a.Mode.Width) &&
+				a.Position.Y < b.Position.Y+int32(b.Mode.Height) &&
+				b.Position.Y < a.Position.Y+int32(a.Mode.Height) {
+				t.Fatalf("%s %+v and %s %+v overlap", a.DeviceName, a, b.DeviceName, b)
+			}
+		}
+	}
+}
+
+// The whole enable path with a mode that is larger than the one the monitor is
+// running: the neighbours have to be pushed outward before the target can occupy
+// the space, and the desktop that comes out of it is the contiguous one.
+func TestEnableAppliesALargerGameModeWithoutOverlappingTheNeighbours(t *testing.T) {
+	f := newFixtureWith(t, profileWithGameMode(fixtureLarger), fixtureNative, fixtureLayout(fixtureNative))
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	calls := f.display.takeCalls()
+	assertOperations(t, calls, "resolve", "layout", "test", "apply")
+	if calls[2].mode != fixtureLarger || calls[3].mode != fixtureLarger {
+		t.Fatalf("tested and applied modes = %+v", calls)
+	}
+	desktop := f.desktop()
+	if !reflect.DeepEqual(desktop, fixtureLayout(fixtureLarger)) {
+		t.Fatalf("desktop = %+v, want %+v", desktop, fixtureLayout(fixtureLarger))
+	}
+	// Said directly rather than left to the comparison: the display beside the
+	// target is exactly one target-width away, so the target grew into space that
+	// was made for it instead of onto its neighbour.
+	right, ok := desktop.Find(rightDevice)
+	if !ok || right.Position.X != int32(fixtureLarger.Width) {
+		t.Fatalf("%s sits at %+v, want x=%d", rightDevice, right.Position, fixtureLarger.Width)
+	}
+	assertNoOverlappingDisplays(t, desktop)
+	if got := f.s.Snapshot(); !got.Managed || !got.FourByThree ||
+		got.CurrentMode != fixtureLarger || got.State != StateWaitingForGame {
+		t.Fatalf("snapshot = %+v", got)
+	}
+	if f.clock.count() != 1 {
+		t.Fatal("Enable must start one watcher")
+	}
+}
+
+// A picked mode can ask for an arrangement that cannot be made safe, and this is
+// the shape that does it: a mode that grows one axis while it gives the other back
+// closes the gap the display below is standing in. The session must refuse before
+// it tests or applies anything, keep the desktop exactly as it found it, and say
+// which two displays collided -- that message is now something a user reads.
+func TestEnableAbortsWhenALargerModeHasNoSafeArrangement(t *testing.T) {
+	original := domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
+	portrait := domain.Mode{Width: 1440, Height: 2560, RefreshHz: 60, BitsPerPixel: 32}
+	desktop := domain.Layout{Displays: []domain.DisplayState{
+		{DeviceName: targetDevice, Mode: original, Position: domain.Point{}, Primary: true},
+		{DeviceName: rightDevice, Mode: portrait, Position: domain.Point{X: 1920, Y: 0}},
+		{DeviceName: belowDevice, Mode: fixtureTop, Position: domain.Point{X: 1920, Y: 2560}},
+	}}
+	wider := domain.Mode{Width: 2560, Height: 1080, RefreshHz: 120, BitsPerPixel: 32}
+	f := newFixtureWith(t, profileWithGameMode(wider), original, desktop)
+
+	err := f.s.Enable()
+	if !errors.Is(err, display.ErrLayoutUnsafe) {
+		t.Fatalf("err = %v, want ErrLayoutUnsafe", err)
+	}
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout")
+	if got := f.desktop(); !reflect.DeepEqual(got, desktop) {
+		t.Fatalf("a refused enable changed the desktop: %+v", got)
+	}
+	got := f.s.Snapshot()
+	if got.Managed || got.State != StateError || !errors.Is(got.Err, display.ErrLayoutUnsafe) {
+		t.Fatalf("snapshot = %+v", got)
+	}
+	for _, device := range []string{rightDevice, belowDevice} {
+		if !strings.Contains(got.Message, device) {
+			t.Fatalf("message = %q, which never names %s", got.Message, device)
+		}
+	}
+	if f.clock.count() != 0 {
+		t.Fatal("a refused enable started a watcher")
+	}
+}
+
+// The other half of the promise, from a larger mode: the saved arrangement was
+// captured around a target that then grew, so restoring it has to narrow the target
+// and walk every neighbour back in. The desktop the user gets back is the one they
+// started with.
+func TestDisableReturnsTheDesktopFromALargerGameMode(t *testing.T) {
+	f := newFixtureWith(t, profileWithGameMode(fixtureLarger), fixtureNative, fixtureLayout(fixtureNative))
+	before := f.desktop()
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.display.takeCalls()
+
+	if err := f.s.Disable(); err != nil {
+		t.Fatal(err)
+	}
+	calls := f.display.takeCalls()
+	assertOperations(t, calls, "resolve", "test", "apply")
+	if calls[1].mode != f.original || calls[2].mode != f.original {
+		t.Fatalf("restore = %+v", calls)
+	}
+	if got := f.desktop(); !reflect.DeepEqual(got, before) {
+		t.Fatalf("restored desktop = %+v, want %+v", got, before)
+	}
+	assertNoOverlappingDisplays(t, f.desktop())
+	if got := f.s.Snapshot(); got.Managed || got.FourByThree ||
+		got.CurrentMode != f.original || got.State != StateNative {
+		t.Fatalf("snapshot = %+v", got)
 	}
 }

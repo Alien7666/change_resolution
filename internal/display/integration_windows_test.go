@@ -389,6 +389,26 @@ func offsetTargetLayout() domain.Layout {
 	}}
 }
 
+// planDeviceOrder and appliedDeviceOrder are the two orders an apply has: the one
+// the plan lists its changes in, which is the order the displays were read in, and
+// the one the calls actually crossed into Win32 in. A grow test is only worth
+// anything while those two disagree.
+func planDeviceOrder(plan domain.LayoutPlan) []string {
+	order := make([]string, len(plan.Changes))
+	for i, change := range plan.Changes {
+		order[i] = change.DeviceName
+	}
+	return order
+}
+
+func appliedDeviceOrder(api *fakeWin32) []string {
+	order := make([]string, len(api.calls))
+	for i, call := range api.calls {
+		order[i] = call.device
+	}
+	return order
+}
+
 func findChange(t *testing.T, plan domain.LayoutPlan, device string) domain.LayoutChange {
 	t.Helper()
 	for _, change := range plan.Changes {
@@ -495,6 +515,121 @@ func TestWindowsNativeApplyLayoutMovesTheOtherDisplaysFirstWhenTheTargetGrows(t 
 	assertApplySequence(t, api, plan, []string{
 		`\.\DISPLAY3`, `\.\DISPLAY2`, `\.\DISPLAY5`, `\.\DISPLAY1`,
 	})
+	// The plan still lists the target second, where the read order put it, so the
+	// sequence above cannot have come from the plan's order. Only the rule moves the
+	// target to the end, and this is the assertion that says so rather than leaving
+	// it to be read off two literals that happen to differ.
+	if planned := planDeviceOrder(plan); reflect.DeepEqual(planned, appliedDeviceOrder(api)) {
+		t.Fatalf("plan order %v is already the apply order; the test cannot tell the rule from the list", planned)
+	}
+	assertDesktop(t, api, layoutFrom(plan, before))
+}
+
+// A mode picker offers plenty of modes that are wider and shorter than the one the
+// monitor is running, and the ordering rule reads "grows" as either axis, not both:
+// 2560x1440 to 3440x1080 takes the growing branch and its mode goes last, even
+// though it hands back 360 px of height at the same time. That is the right reading.
+// The neighbours this desktop has to move are the ones beside the target, and they
+// cannot move outward into space the target has not given up yet -- while the height
+// it frees is space nothing is waiting for, because no display sits below it.
+func TestWindowsNativeApplyLayoutAppliesTheTargetLastWhenItGrowsInOnlyOneAxis(t *testing.T) {
+	before := offsetTargetLayout()
+	api := fakeDesktop(t, before)
+	native := &windowsNative{api: api}
+	plan, err := PlanModeChange(before, `\.\DISPLAY1`, mixedAxisMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := native.applyLayout(plan); err != nil {
+		t.Fatal(err)
+	}
+	assertApplySequence(t, api, plan, []string{
+		`\.\DISPLAY3`, `\.\DISPLAY2`, `\.\DISPLAY5`, `\.\DISPLAY1`,
+	})
+	if planned := planDeviceOrder(plan); reflect.DeepEqual(planned, appliedDeviceOrder(api)) {
+		t.Fatalf("plan order %v is already the apply order; the test cannot tell the rule from the list", planned)
+	}
+	assertDesktop(t, api, layoutFrom(plan, before))
+}
+
+// desktopStates reads the fake desktop back the way the tool would, so a test can
+// look at an arrangement that existed only between two Win32 calls.
+func desktopStates(api *fakeWin32, devices []string) []domain.DisplayState {
+	states := make([]domain.DisplayState, 0, len(devices))
+	for _, device := range devices {
+		reported := api.modes[device]
+		states = append(states, domain.DisplayState{
+			DeviceName: device,
+			Mode:       modeOf(reported),
+			Position:   domain.Point{X: reported.DmPosition.X, Y: reported.DmPosition.Y},
+		})
+	}
+	return states
+}
+
+// overlappingPair names the two displays of an arrangement that sit on each other,
+// which is the thing orderForApply exists to keep out of every intermediate desktop.
+func overlappingPair(states []domain.DisplayState) (string, string, bool) {
+	for i := range states {
+		for j := i + 1; j < len(states); j++ {
+			if overlaps(states[i], states[j]) {
+				return states[i].DeviceName, states[j].DeviceName, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// The ordering rule is one decision per apply, not one per display, and a
+// mixed-axis mode is where that costs something. 1920x1440 to 2560x1080 grows the
+// width, so every neighbour moves first -- including the display below, which is
+// waiting on the height the target has not given up yet. For exactly one call the
+// two of them overlap.
+//
+// The trade is recorded here rather than left to be rediscovered on a live desktop.
+// The other order is no better: applying the target first would put its new width
+// on top of a neighbour that has not moved out of the way. Only a per-display order
+// avoids both, and the plan for this release rules the target last. The failure mode
+// is bounded on the way out: a driver that repacks the desktop instead of accepting
+// the overlapping step is caught by verifyApplied, and everything already changed is
+// rolled back -- the user gets an error, never a silently rearranged desktop.
+//
+// A purely growing target never reaches this: with both deltas outward, no
+// neighbour ever moves toward the target at all.
+func TestWindowsNativeApplyLayoutOrdersOncePerApplyNotOncePerDisplay(t *testing.T) {
+	devices := []string{`\.\DISPLAY1`, `\.\DISPLAY2`, `\.\DISPLAY6`}
+	before := domain.Layout{Displays: []domain.DisplayState{
+		{DeviceName: devices[0], Mode: miMonitorGame, Position: domain.Point{}, Primary: true},
+		{DeviceName: devices[1], Mode: topMode, Position: domain.Point{X: 1920, Y: 0}},
+		{DeviceName: devices[2], Mode: topMode, Position: domain.Point{X: 0, Y: 1440}},
+	}}
+	api := fakeDesktop(t, before)
+	var intermediate [][]domain.DisplayState
+	api.afterChange = func(f *fakeWin32, _ win32Call) {
+		intermediate = append(intermediate, desktopStates(f, devices))
+	}
+	native := &windowsNative{api: api}
+	plan, err := PlanModeChange(before, devices[0], ultrawideMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := native.applyLayout(plan); err != nil {
+		t.Fatal(err)
+	}
+	assertApplySequence(t, api, plan, []string{devices[1], devices[2], devices[0]})
+	if len(intermediate) != 3 {
+		t.Fatalf("recorded %d intermediate desktops, want one per call", len(intermediate))
+	}
+	first, second, found := overlappingPair(intermediate[1])
+	if !found || first != devices[0] || second != devices[2] {
+		t.Fatalf("after the display below moved, overlapping pair = (%q, %q, %v); want %s and %s",
+			first, second, found, devices[0], devices[2])
+	}
+	if _, _, found := overlappingPair(intermediate[2]); found {
+		t.Fatal("the apply ended on an overlapping desktop, which the planner had proved safe")
+	}
 	assertDesktop(t, api, layoutFrom(plan, before))
 }
 

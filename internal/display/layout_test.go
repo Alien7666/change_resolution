@@ -3,6 +3,7 @@ package display
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Alien7666/change_resolution/internal/domain"
@@ -274,5 +275,161 @@ func TestPlanRestoreRefusesASavedLayoutWithoutTheTarget(t *testing.T) {
 	}
 	if len(plan.Changes) != 0 {
 		t.Fatalf("a refused plan still carries changes: %+v", plan)
+	}
+}
+
+// The growing direction's fixtures. Every mode here is larger than the target's
+// current one in at least one axis, which is the half of the planner no user could
+// reach until the mode picker existed.
+var (
+	miMonitorWide = domain.Mode{Width: 3840, Height: 1440, RefreshHz: 120, BitsPerPixel: 32}
+	ultrawideMode = domain.Mode{Width: 2560, Height: 1080, RefreshHz: 120, BitsPerPixel: 32}
+	portraitMode  = domain.Mode{Width: 1440, Height: 2560, RefreshHz: 60, BitsPerPixel: 32}
+	// mixedAxisMode is wider and shorter than the Mi Monitor's native mode, which
+	// is the shape of most of the modes a picker will offer.
+	mixedAxisMode = domain.Mode{Width: 3440, Height: 1080, RefreshHz: 120, BitsPerPixel: 32}
+)
+
+// assertNoOverlaps holds an arrangement to the property the planner exists to
+// guarantee. A grow test that only compared coordinates would still pass if two
+// displays landed on each other, and landing two displays on each other is exactly
+// what Windows answers by repacking the whole desktop.
+func assertNoOverlaps(t *testing.T, states []domain.DisplayState) {
+	t.Helper()
+	for i := range states {
+		for j := i + 1; j < len(states); j++ {
+			if overlaps(states[i], states[j]) {
+				t.Fatalf("%s %+v and %s %+v overlap",
+					states[i].DeviceName, states[i], states[j].DeviceName, states[j])
+			}
+		}
+	}
+}
+
+// The mirror of the gap-closing case, and the one no user could reach until a mode
+// picker existed: a target that gets wider needs the space its neighbours are
+// standing in, so every display to its right moves outward by the width delta.
+// Growing past the mode the monitor started in is not the same as restoring to it --
+// the restore has a saved arrangement to return to, this has nothing but the rule.
+func TestPlanModeChangePushesNeighboursOutwardWhenTheTargetGrows(t *testing.T) {
+	layout := measuredLayout()
+	plan, err := PlanModeChange(layout, `\.\DISPLAY1`, miMonitorWide)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]domain.Point{
+		`\.\DISPLAY1`: {X: 0, Y: 0},
+		`\.\DISPLAY2`: {X: 3840, Y: 0},
+		`\.\DISPLAY5`: {X: 3842, Y: -1080},
+		`\.\DISPLAY3`: {X: 1922, Y: -1080},
+	}
+	if got := positions(t, plan); !reflect.DeepEqual(got, want) {
+		t.Fatalf("positions = %+v, want %+v", got, want)
+	}
+	assertNoOverlaps(t, layoutFrom(plan, layout).Displays)
+}
+
+// Windows keeps the primary at the origin, so a growing target that is not the
+// primary is planned in two moves: the neighbours (the primary among them) are
+// pushed outward, and the whole arrangement is then translated back onto the
+// origin. The translation's sign is the part that has never run on hardware -- get
+// it backwards and the target lands on top of the primary instead of beside it.
+func TestPlanModeChangeAnchorsThePrimaryWhenANonPrimaryTargetGrows(t *testing.T) {
+	tests := map[string]struct {
+		layout domain.Layout
+		mode   domain.Mode
+		want   map[string]domain.Point
+	}{
+		"target grows to the left of the primary": {
+			layout: domain.Layout{Displays: []domain.DisplayState{
+				{DeviceName: `\.\DISPLAY9`, Mode: miMonitorGame, Position: domain.Point{X: -1920, Y: 0}},
+				{DeviceName: `\.\DISPLAY1`, Mode: sideMode, Position: domain.Point{X: 0, Y: 0}, Primary: true},
+			}},
+			mode: miMonitorNative,
+			want: map[string]domain.Point{
+				`\.\DISPLAY9`: {X: -2560, Y: 0},
+				`\.\DISPLAY1`: {X: 0, Y: 0},
+			},
+		},
+		"target grows above the primary": {
+			layout: domain.Layout{Displays: []domain.DisplayState{
+				{DeviceName: `\.\DISPLAY9`, Mode: topMode, Position: domain.Point{X: 0, Y: -1080}},
+				{DeviceName: `\.\DISPLAY1`, Mode: miMonitorGame, Position: domain.Point{X: 0, Y: 0}, Primary: true},
+			}},
+			mode: miMonitorGame,
+			want: map[string]domain.Point{
+				`\.\DISPLAY9`: {X: 0, Y: -1440},
+				`\.\DISPLAY1`: {X: 0, Y: 0},
+			},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			plan, err := PlanModeChange(tt.layout, `\.\DISPLAY9`, tt.mode)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := positions(t, plan); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("positions = %+v, want %+v", got, tt.want)
+			}
+			assertNoOverlaps(t, layoutFrom(plan, tt.layout).Displays)
+		})
+	}
+}
+
+// A picker lists every mode the monitor reports, and plenty of them are wider and
+// shorter than the one it is running: 1920x1440 to 2560x1080 grows one axis while
+// it frees the other. The two axes are planned independently and must stay that
+// way -- the displays to the right move outward by the width delta in the same plan
+// that moves the display below inward by the height delta.
+func TestPlanModeChangeHandlesATargetThatGrowsInOneAxisAndShrinksInTheOther(t *testing.T) {
+	layout := domain.Layout{Displays: []domain.DisplayState{
+		{DeviceName: `\.\DISPLAY1`, Mode: miMonitorGame, Position: domain.Point{}, Primary: true},
+		{DeviceName: `\.\DISPLAY2`, Mode: topMode, Position: domain.Point{X: 1920, Y: 0}},
+		{DeviceName: `\.\DISPLAY6`, Mode: topMode, Position: domain.Point{X: 0, Y: 1440}},
+	}}
+	plan, err := PlanModeChange(layout, `\.\DISPLAY1`, ultrawideMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]domain.Point{
+		`\.\DISPLAY1`: {X: 0, Y: 0},
+		`\.\DISPLAY2`: {X: 2560, Y: 0},
+		`\.\DISPLAY6`: {X: 0, Y: 1080},
+	}
+	if got := positions(t, plan); !reflect.DeepEqual(got, want) {
+		t.Fatalf("positions = %+v, want %+v", got, want)
+	}
+	assertNoOverlaps(t, layoutFrom(plan, layout).Displays)
+}
+
+// "No safe arrangement" stops being theoretical the moment the user picks the mode:
+// a shrinking axis closes the gaps the other displays stand in, and two of them can
+// close onto each other. The refusal is correct, but a refusal the user cannot act
+// on is only half of one -- the message has to say which two displays collided, not
+// merely that the desktop cannot be arranged.
+//
+// A purely growing target cannot produce this: with both deltas outward no pair's
+// separation ever decreases. It takes a mode that gives an axis back.
+func TestValidateArrangementNamesBothDisplaysThatWouldOverlap(t *testing.T) {
+	layout := domain.Layout{Displays: []domain.DisplayState{
+		{DeviceName: `\.\DISPLAY1`, Mode: miMonitorGame, Position: domain.Point{}, Primary: true},
+		{DeviceName: `\.\DISPLAY2`, Mode: portraitMode, Position: domain.Point{X: 1920, Y: 0}},
+		{DeviceName: `\.\DISPLAY6`, Mode: topMode, Position: domain.Point{X: 1920, Y: 2560}},
+	}}
+	plan, err := PlanModeChange(layout, `\.\DISPLAY1`, ultrawideMode)
+	if !errors.Is(err, ErrLayoutUnsafe) {
+		t.Fatalf("err = %v, want ErrLayoutUnsafe", err)
+	}
+	if len(plan.Changes) != 0 {
+		t.Fatalf("a refused plan still carries changes: %+v", plan)
+	}
+	for _, device := range []string{`\.\DISPLAY2`, `\.\DISPLAY6`} {
+		if !strings.Contains(err.Error(), device) {
+			t.Fatalf("err = %q, which never names %s", err, device)
+		}
+	}
+	if strings.Contains(err.Error(), `\.\DISPLAY1`) {
+		t.Fatalf("err = %q names a display that is not part of the collision", err)
 	}
 }

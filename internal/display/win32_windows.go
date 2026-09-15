@@ -326,9 +326,10 @@ type stagedChange struct {
 //	flags = 0                   ->  DISP_CHANGE_SUCCESSFUL
 //
 // A sequential apply has no atomicity of its own, so the three things the staged
-// transaction was meant to buy are bought here instead: orderForApply keeps every
-// intermediate desktop free of overlaps, rollBack puts back whatever was already
-// changed when a later call fails, and verifyApplied holds the result to the plan.
+// transaction was meant to buy are bought here instead: orderForApply keeps the
+// intermediate desktops free of overlaps in the axis that moves, rollBack puts back
+// whatever was already changed when a later call fails, and verifyApplied holds the
+// result to the plan. See orderForApply for the one shape it does not cover.
 //
 // Only the target carries mode fields. Every other display declares DM_POSITION and
 // nothing else, which is what keeps its resolution, refresh rate and colour depth
@@ -393,6 +394,15 @@ func (n *windowsNative) stageChanges(plan domain.LayoutPlan) ([]stagedChange, er
 // between displays is harmless; a transient overlap is not, because Windows repacks
 // a desktop it considers invalid and the tool then no longer knows where anything
 // sits.
+//
+// The order is decided once per apply rather than once per display, which leaves one
+// shape uncovered: when the target grows in one axis and shrinks in the other, a
+// neighbour in the shrinking axis moves inward before the target has given that space
+// up, and overlaps it until the target's own call lands. Deciding per display would
+// close it and is deliberately not done here. The consequence is bounded - a driver
+// that repacks instead of accepting the step is caught by verifyApplied and rolled
+// back - and the behaviour is pinned by
+// TestWindowsNativeApplyLayoutOrdersOncePerApplyNotOncePerDisplay.
 //
 // A target that does not grow in either axis gives up its space the moment its mode
 // lands, so it goes first and its neighbours close the gap behind it. A target that
