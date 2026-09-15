@@ -41,6 +41,7 @@ func TestWindowsFlagsMatchWin32AndExcludeUpdateRegistry(t *testing.T) {
 		"CDS_TEST":                      cdsTest,
 		"CDS_FULLSCREEN":                cdsFullscreen,
 		"DISPLAY_DEVICE_ATTACH":         displayDeviceAttachedToDesktop,
+		"DISPLAY_DEVICE_ACTIVE":         displayDeviceActive,
 		"EDD_GET_DEVICE_INTERFACE_NAME": eddGetDeviceInterfaceName,
 	} {
 		want := map[string]uint32{
@@ -48,6 +49,7 @@ func TestWindowsFlagsMatchWin32AndExcludeUpdateRegistry(t *testing.T) {
 			"DM_PELSWIDTH": 0x00080000, "DM_PELSHEIGHT": 0x00100000,
 			"DM_DISPLAYFREQUENCY": 0x00400000, "CDS_TEST": 0x00000002,
 			"CDS_FULLSCREEN": 0x00000004, "DISPLAY_DEVICE_ATTACH": 0x00000001,
+			"DISPLAY_DEVICE_ACTIVE":         0x00000001,
 			"EDD_GET_DEVICE_INTERFACE_NAME": 0x00000001,
 		}[name]
 		if got != want {
@@ -234,6 +236,36 @@ func TestWindowsNativeReportsOneTargetPerMonitorNotPerAdapter(t *testing.T) {
 	}
 	if targets[0].Identity.InstancePath == targets[1].Identity.InstancePath {
 		t.Fatalf("both monitors carry one interface path: %#v", targets)
+	}
+}
+
+// EnumDisplayDevicesW can retain a monitor that the adapter could present while its
+// GDI view is not currently on. It is not part of the live desktop and must not enter
+// identity matching or manufacture a false mirror refusal beside the active monitor.
+func TestWindowsNativeReportsOnlyActiveMonitorsOnAnAttachedAdapter(t *testing.T) {
+	const inactivePath = `\\?\DISPLAY#OLD0001#5&2b9d4d4&0&UID4999#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}`
+	api := &fakeWin32{
+		adapters: []displayDevice{
+			newDisplayDevice(t, `\.\DISPLAY1`, "", displayDeviceAttachedToDesktop),
+		},
+		monitors: map[monitorKey][]displayDevice{
+			{adapter: `\.\DISPLAY1`}: {
+				newMonitorDevice(t, "Mi Monitor 27", `MONITOR\XMI27B2\0009`),
+				newInactiveMonitorDevice(t, "Old Monitor", `MONITOR\OLD0001\0001`),
+			},
+			{adapter: `\.\DISPLAY1`, interfaceName: true}: {
+				newMonitorDevice(t, "Mi Monitor 27", miMonitorInterfacePath),
+				newInactiveMonitorDevice(t, "Old Monitor", inactivePath),
+			},
+		},
+	}
+
+	targets, err := (&windowsNative{api: api}).listTargets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Identity.InstancePath != miMonitorInterfacePath {
+		t.Fatalf("targets=%#v, want only the active monitor", targets)
 	}
 }
 

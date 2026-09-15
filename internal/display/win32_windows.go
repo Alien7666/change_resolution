@@ -13,6 +13,7 @@ const (
 	enumCurrentSettings uint32 = 0xffffffff
 
 	displayDeviceAttachedToDesktop uint32 = 0x00000001
+	displayDeviceActive            uint32 = 0x00000001
 	displayDevicePrimaryDevice     uint32 = 0x00000004
 
 	// eddGetDeviceInterfaceName (EDD_GET_DEVICE_INTERFACE_NAME) makes
@@ -133,6 +134,9 @@ func (n *windowsNative) listTargets() ([]domain.Target, error) {
 			ok, _ := n.api.enumDisplayDevices(&adapter.DeviceName[0], monitorIndex, &monitor, 0)
 			if !ok {
 				break
+			}
+			if monitor.StateFlags&displayDeviceActive == 0 {
+				continue
 			}
 			identity := domain.MonitorIdentity{
 				HardwareID: windows.UTF16ToString(monitor.DeviceID[:]),

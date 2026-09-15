@@ -78,15 +78,46 @@ func PlanModeChange(layout domain.Layout, targetDevice string, mode domain.Mode)
 // saved coordinate and keeps whatever mode it is running now, because the tool
 // never owned those modes and must not revert a change the user made while the game
 // mode was active.
-func PlanRestore(saved domain.Layout, targetDevice string) (domain.LayoutPlan, error) {
+//
+// Safety is proved against current, not only saved. A neighbour may have changed
+// resolution while the target was managed, and applying its old coordinate while
+// preserving its new size can otherwise overlap another display. The device set and
+// primary role must still be the saved topology too; this planner never guesses how
+// a changed desktop should be restored.
+func PlanRestore(saved, current domain.Layout, targetDevice string) (domain.LayoutPlan, error) {
 	if err := validateLayout(saved); err != nil {
+		return domain.LayoutPlan{}, err
+	}
+	if err := validateLayout(current); err != nil {
 		return domain.LayoutPlan{}, err
 	}
 	if _, ok := saved.Find(targetDevice); !ok {
 		return domain.LayoutPlan{}, fmt.Errorf(
 			"%w: the saved layout does not contain %s", ErrLayoutUnsafe, targetDevice)
 	}
-	arranged := append([]domain.DisplayState(nil), saved.Displays...)
+	if len(saved.Displays) != len(current.Displays) {
+		return domain.LayoutPlan{}, fmt.Errorf(
+			"%w: the attached display set changed from %d to %d displays",
+			ErrLayoutUnsafe, len(saved.Displays), len(current.Displays))
+	}
+
+	arranged := make([]domain.DisplayState, 0, len(saved.Displays))
+	for _, previous := range saved.Displays {
+		live, ok := current.Find(previous.DeviceName)
+		if !ok {
+			return domain.LayoutPlan{}, fmt.Errorf(
+				"%w: the saved layout's %s is no longer attached", ErrLayoutUnsafe, previous.DeviceName)
+		}
+		if live.Primary != previous.Primary {
+			return domain.LayoutPlan{}, fmt.Errorf(
+				"%w: the primary display changed while the layout was managed", ErrLayoutUnsafe)
+		}
+		live.Position = previous.Position
+		if previous.DeviceName == targetDevice {
+			live.Mode = previous.Mode
+		}
+		arranged = append(arranged, live)
+	}
 	if err := validateArrangement(arranged); err != nil {
 		return domain.LayoutPlan{}, err
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -108,6 +109,20 @@ type sessionWatcher struct {
 	done   chan struct{}
 }
 
+// displayBinding is the part of a monitor identity that can prove a saved DISPLAYn
+// still names the same physical monitor. Labels are deliberately absent. The exact
+// interface path is preferred; when Windows cannot report one, an exact full hardware
+// ID is accepted only while it is unique across the captured desktop.
+type displayBinding struct {
+	kind  uint8
+	value string
+}
+
+const (
+	bindingInstancePath uint8 = iota + 1
+	bindingHardwareID
+)
+
 // Session owns the saved desktop layout only after this instance successfully applies
 // GameMode.
 // opMu serializes complete workflows. mu protects snapshots and notifications only;
@@ -127,13 +142,15 @@ type Session struct {
 	// the reason as text while a refusal has to carry the error.
 	fallback fallback
 
-	saved        domain.Layout
-	managed      bool
-	closed       bool
-	generation   uint64
-	watcher      *sessionWatcher
-	watchers     sync.WaitGroup
-	shutdownDone chan struct{}
+	saved               domain.Layout
+	savedBindings       map[string]displayBinding
+	managedTargetDevice string
+	managed             bool
+	closed              bool
+	generation          uint64
+	watcher             *sessionWatcher
+	watchers            sync.WaitGroup
+	shutdownDone        chan struct{}
 
 	snapshot            Snapshot
 	onChange            func(Snapshot)
@@ -327,6 +344,100 @@ func (s *Session) gameModeLabel() string {
 	return domain.ModeLabel(s.profile.GameMode)
 }
 
+func bindingOf(identity domain.MonitorIdentity) (displayBinding, bool) {
+	if identity.InstancePath != "" {
+		return displayBinding{kind: bindingInstancePath, value: strings.ToLower(identity.InstancePath)}, true
+	}
+	if identity.HardwareID != "" {
+		return displayBinding{kind: bindingHardwareID, value: strings.ToLower(identity.HardwareID)}, true
+	}
+	return displayBinding{}, false
+}
+
+// captureDisplayBindings takes a second read of the monitor identities after the
+// layout was read. Every layout device must map to exactly one target, every target
+// must belong to the layout, and the stable keys must be unique. A topology changing
+// between those reads is therefore a refusal rather than a guessed binding.
+func captureDisplayBindings(layout domain.Layout, targets []domain.Target) (map[string]displayBinding, error) {
+	byDevice := make(map[string]domain.Target, len(targets))
+	for _, target := range targets {
+		if target.DeviceName == "" {
+			return nil, fmt.Errorf("%w: a monitor identity reported no device name", display.ErrLayoutUnsafe)
+		}
+		if _, duplicate := byDevice[target.DeviceName]; duplicate {
+			return nil, fmt.Errorf("%w: %s maps to several monitor identities",
+				display.ErrLayoutUnsafe, target.DeviceName)
+		}
+		byDevice[target.DeviceName] = target
+	}
+	if len(byDevice) != len(layout.Displays) {
+		return nil, fmt.Errorf("%w: the layout and monitor identity reads disagree on the display set",
+			display.ErrLayoutUnsafe)
+	}
+
+	bindings := make(map[string]displayBinding, len(layout.Displays))
+	owners := make(map[displayBinding]string, len(layout.Displays))
+	for _, state := range layout.Displays {
+		target, ok := byDevice[state.DeviceName]
+		if !ok {
+			return nil, fmt.Errorf("%w: %s has no monitor identity",
+				display.ErrLayoutUnsafe, state.DeviceName)
+		}
+		binding, ok := bindingOf(target.Identity)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s has no stable monitor identity",
+				display.ErrLayoutUnsafe, state.DeviceName)
+		}
+		if owner, duplicate := owners[binding]; duplicate {
+			return nil, fmt.Errorf("%w: %s and %s report the same monitor identity",
+				display.ErrLayoutUnsafe, owner, state.DeviceName)
+		}
+		owners[binding] = state.DeviceName
+		bindings[state.DeviceName] = binding
+	}
+	return bindings, nil
+}
+
+func (s *Session) readDisplayBindings(layout domain.Layout) (map[string]displayBinding, error) {
+	targets, err := s.displays.Targets()
+	if err != nil {
+		return nil, err
+	}
+	return captureDisplayBindings(layout, targets)
+}
+
+func verifyDisplayBindings(saved, current map[string]displayBinding) error {
+	if len(saved) != len(current) {
+		return fmt.Errorf("%w: the saved monitor identity set changed", display.ErrLayoutUnsafe)
+	}
+	for deviceName, expected := range saved {
+		observed, ok := current[deviceName]
+		if !ok {
+			return fmt.Errorf("%w: the saved monitor identity for %s is missing",
+				display.ErrLayoutUnsafe, deviceName)
+		}
+		if observed != expected {
+			return fmt.Errorf("%w: %s now names a different physical monitor",
+				display.ErrLayoutUnsafe, deviceName)
+		}
+	}
+	return nil
+}
+
+func verifyResolvedBinding(target domain.Target, bindings map[string]displayBinding) error {
+	expected, ok := bindings[target.DeviceName]
+	if !ok {
+		return fmt.Errorf("%w: the resolved target %s has no captured monitor identity",
+			display.ErrLayoutUnsafe, target.DeviceName)
+	}
+	observed, ok := bindingOf(target.Identity)
+	if !ok || observed != expected {
+		return fmt.Errorf("%w: the resolved target %s changed identity during the display read",
+			display.ErrLayoutUnsafe, target.DeviceName)
+	}
+	return nil
+}
+
 func (s *Session) readCurrent() (domain.Target, domain.Mode, error) {
 	target, err := s.displays.ResolveTarget(s.profile.Monitor)
 	if err != nil {
@@ -402,10 +513,18 @@ func (s *Session) Enable() error {
 	if err != nil {
 		return s.fail("plan display layout", err)
 	}
+	bindings, err := s.readDisplayBindings(layout)
+	if err != nil {
+		return s.fail("read display identities", err)
+	}
+	if err := verifyResolvedBinding(target, bindings); err != nil {
+		return s.fail("bind target display", err)
+	}
 	if err := s.apply(target, s.profile.GameMode, plan); err != nil {
 		return err
 	}
-	s.saved, s.managed = layout, true
+	s.saved, s.savedBindings = layout, bindings
+	s.managedTargetDevice, s.managed = target.DeviceName, true
 	state, message := StateWaitingForGame, s.waitingMessage()
 	if s.profile.ProcessName == "" {
 		state, message = StateManualOnly, s.gameModeLabel()+" 已套用（未設定要監看的程式，不會自動恢復）"
@@ -502,6 +621,11 @@ func (s *Session) restoreSaved() error {
 	if err != nil {
 		return s.fail("resolve target for restore", err)
 	}
+	if s.managedTargetDevice == "" || target.DeviceName != s.managedTargetDevice {
+		return s.fail("plan display layout", fmt.Errorf(
+			"%w: the configured monitor moved from %s to %s while its mode was managed",
+			display.ErrLayoutUnsafe, s.managedTargetDevice, target.DeviceName))
+	}
 	saved, ok := s.saved.Find(target.DeviceName)
 	if !ok {
 		return s.fail("plan display layout", fmt.Errorf("%w: the saved layout does not contain %s",
@@ -519,7 +643,17 @@ func (s *Session) restoreSaved() error {
 		return s.fail("plan display layout", fmt.Errorf("%w: the saved layout's %s is no longer attached",
 			display.ErrLayoutUnsafe, missing))
 	}
-	plan, err := display.PlanRestore(s.saved, target.DeviceName)
+	bindings, err := s.readDisplayBindings(attached)
+	if err != nil {
+		return s.fail("read display identities", err)
+	}
+	if err := verifyDisplayBindings(s.savedBindings, bindings); err != nil {
+		return s.fail("plan display layout", err)
+	}
+	if err := verifyResolvedBinding(target, bindings); err != nil {
+		return s.fail("bind target display", err)
+	}
+	plan, err := display.PlanRestore(s.saved, attached, target.DeviceName)
 	if err != nil {
 		return s.fail("plan display layout", err)
 	}
@@ -572,6 +706,8 @@ func (s *Session) finishRestore(target domain.Target, mode domain.Mode, plan dom
 	}
 	s.managed = false
 	s.saved = domain.Layout{}
+	s.savedBindings = nil
+	s.managedTargetDevice = ""
 	s.updateSnapshot(func(snapshot *Snapshot) {
 		snapshot.Target, snapshot.CurrentMode = target, mode
 		snapshot.MatchedBy = target.MatchedBy

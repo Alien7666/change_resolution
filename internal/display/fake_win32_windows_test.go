@@ -247,9 +247,16 @@ func newDisplayDevice(t *testing.T, name, hardwareID string, stateFlags uint32) 
 // label is derived from.
 func newMonitorDevice(t *testing.T, deviceString, deviceID string) displayDevice {
 	t.Helper()
-	device := displayDevice{}
+	device := displayDevice{StateFlags: 0x00000001} // DISPLAY_DEVICE_ACTIVE
 	copyUTF16(t, device.DeviceString[:], deviceString)
 	copyUTF16(t, device.DeviceID[:], deviceID)
+	return device
+}
+
+func newInactiveMonitorDevice(t *testing.T, deviceString, deviceID string) displayDevice {
+	t.Helper()
+	device := newMonitorDevice(t, deviceString, deviceID)
+	device.StateFlags = 0
 	return device
 }
 

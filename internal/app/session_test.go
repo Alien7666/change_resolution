@@ -23,6 +23,7 @@ type displayCall struct {
 type fakeDisplay struct {
 	mu      sync.Mutex
 	target  domain.Target
+	targets []domain.Target
 	current domain.Mode
 	modes   []domain.Mode
 	layout  domain.Layout
@@ -42,14 +43,33 @@ func (d *fakeDisplay) record(operation string, target domain.Target, mode domain
 	return err
 }
 
-// Targets is the public monitor list the settings dialog reads. The session never
-// calls it -- it resolves one configured identity rather than browsing monitors --
-// and recording the call is what lets a test say so.
+// Targets is also the read-only identity snapshot a managed session uses to bind
+// every saved DISPLAYn to the same physical monitor until restore.
 func (d *fakeDisplay) Targets() ([]domain.Target, error) {
 	err := d.record("targets", domain.Target{}, domain.Mode{}, domain.LayoutPlan{})
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return []domain.Target{d.target}, err
+	if len(d.targets) != 0 {
+		return append([]domain.Target(nil), d.targets...), err
+	}
+	// Provider tests build the shared fake directly. Supply the same complete,
+	// trustworthy monitor snapshot the session fixture does without making those
+	// tests know about this fake's new internal field.
+	targets := make([]domain.Target, len(d.layout.Displays))
+	for i, state := range d.layout.Displays {
+		if state.DeviceName == d.target.DeviceName {
+			targets[i] = d.target
+			continue
+		}
+		targets[i] = domain.Target{
+			DeviceName: state.DeviceName,
+			Identity: domain.MonitorIdentity{
+				InstancePath: "test-instance:" + state.DeviceName,
+				HardwareID:   "MONITOR\\TEST\\" + state.DeviceName,
+			},
+		}
+	}
+	return targets, err
 }
 
 // ResolveTarget records the whole identity it was asked for instead of echoing one
@@ -279,14 +299,30 @@ func newFixture(t *testing.T) *sessionFixture {
 // contiguous four does not model.
 func newFixtureWith(t *testing.T, profile domain.Profile, original domain.Mode, desktop domain.Layout) *sessionFixture {
 	t.Helper()
+	targets := make([]domain.Target, len(desktop.Displays))
+	for i, state := range desktop.Displays {
+		targets[i] = domain.Target{
+			DeviceName: state.DeviceName,
+			Identity: domain.MonitorIdentity{
+				InstancePath: "test-instance:" + state.DeviceName,
+				HardwareID:   "MONITOR\\TEST\\" + state.DeviceName,
+			},
+		}
+	}
+	configuredTarget, ok := targetByDevice(targets, targetDevice)
+	if !ok {
+		t.Fatalf("fixture layout has no configured target %s", targetDevice)
+	}
+	configuredTarget.Identity.HardwareID = profile.Monitor.HardwareID
+	configuredTarget.MatchedBy = domain.MatchHardwareID
+	for i := range targets {
+		if targets[i].DeviceName == targetDevice {
+			targets[i] = configuredTarget
+		}
+	}
 	displays := &fakeDisplay{
-		target: domain.Target{
-			DeviceName: targetDevice,
-			Identity:   domain.MonitorIdentity{HardwareID: profile.Monitor.HardwareID},
-			// The seed profile carries no instance path, so the rung that matches it
-			// is the hardware ID -- the same rung Snapshot.MatchedBy exists to report.
-			MatchedBy: domain.MatchHardwareID,
-		},
+		target:  configuredTarget,
+		targets: targets,
 		current: original, layout: desktop, fail: make(map[string]error),
 	}
 	checker := &fakeChecker{called: make(chan string, 8), results: make(chan processResult), closed: make(chan struct{})}
@@ -305,6 +341,15 @@ func newFixtureWith(t *testing.T, profile domain.Profile, original domain.Mode, 
 		}
 	})
 	return f
+}
+
+func targetByDevice(targets []domain.Target, deviceName string) (domain.Target, bool) {
+	for _, target := range targets {
+		if target.DeviceName == deviceName {
+			return target, true
+		}
+	}
+	return domain.Target{}, false
 }
 
 // setDesktop replaces the whole fake desktop, which is how a test models a monitor
@@ -386,8 +431,8 @@ func TestEnableCapturesCurrentModeTestsThenApplies(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := f.display.takeCalls()
-	assertOperations(t, calls, "resolve", "layout", "test", "apply")
-	if calls[0].target.Identity != f.profile.Monitor || calls[2].mode != f.profile.GameMode || calls[3].mode != f.profile.GameMode {
+	assertOperations(t, calls, "resolve", "layout", "targets", "test", "apply")
+	if calls[0].target.Identity != f.profile.Monitor || calls[3].mode != f.profile.GameMode || calls[4].mode != f.profile.GameMode {
 		t.Fatalf("wrong target or mode: %+v", calls)
 	}
 	if got := f.s.Snapshot(); !got.Managed || !got.AtGameMode || got.State != StateWaitingForGame {
@@ -419,8 +464,8 @@ func TestDisableRestoresTheCapturedModeAndArrangement(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := f.display.takeCalls()
-	assertOperations(t, calls, "resolve", "layout", "test", "apply")
-	if calls[2].mode != f.original || calls[3].mode != f.original {
+	assertOperations(t, calls, "resolve", "layout", "targets", "test", "apply")
+	if calls[3].mode != f.original || calls[4].mode != f.original {
 		t.Fatalf("restore = %+v", calls)
 	}
 	if got := f.desktop(); !reflect.DeepEqual(got, before) {
@@ -432,7 +477,7 @@ func TestDisableRestoresTheCapturedModeAndArrangement(t *testing.T) {
 }
 
 func TestEnableFailureDoesNotStartActiveSession(t *testing.T) {
-	for _, operation := range []string{"resolve", "layout", "test", "apply"} {
+	for _, operation := range []string{"resolve", "layout", "targets", "test", "apply"} {
 		t.Run(operation, func(t *testing.T) {
 			f := newFixture(t)
 			failure := errors.New("display failed")
@@ -471,7 +516,7 @@ func TestShutdownRestoresOnlyWhenSessionAppliedMode(t *testing.T) {
 			}
 			calls := f.display.takeCalls()
 			if managed {
-				assertOperations(t, calls, "resolve", "layout", "test", "apply")
+				assertOperations(t, calls, "resolve", "layout", "targets", "test", "apply")
 			} else if len(calls) != 0 {
 				t.Fatalf("startup Shutdown touched display: %+v", calls)
 			}
@@ -496,7 +541,7 @@ func TestManualDisableWinsOverPendingAutomaticRestore(t *testing.T) {
 	if err := f.s.Disable(); err != nil {
 		t.Fatal(err)
 	}
-	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "test", "apply")
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "targets", "test", "apply")
 	if !f.clock.tickers[0].isStopped() {
 		t.Fatal("Disable returned before watcher stopped")
 	}
@@ -632,8 +677,8 @@ func TestGameExitRestoresSavedModeAfterDelay(t *testing.T) {
 
 	got := f.poll(t, 0, 5, processResult{})
 	calls := f.display.takeCalls()
-	assertOperations(t, calls, "resolve", "layout", "test", "apply")
-	if calls[2].mode != f.original || calls[3].mode != f.original {
+	assertOperations(t, calls, "resolve", "layout", "targets", "test", "apply")
+	if calls[3].mode != f.original || calls[4].mode != f.original {
 		t.Fatalf("automatic restore used the wrong mode: %+v", calls)
 	}
 	if got.Managed || got.AtGameMode || got.CurrentMode != f.original || got.State != StateNative {
@@ -669,7 +714,7 @@ func TestGameReturningDuringRestoreWindowCancelsRestore(t *testing.T) {
 	}
 
 	got := f.poll(t, 0, 7, processResult{})
-	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "test", "apply")
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "targets", "test", "apply")
 	if got.Managed || got.CurrentMode != f.original || got.State != StateNative {
 		t.Fatalf("restored snapshot = %+v", got)
 	}
@@ -737,8 +782,8 @@ func TestFailedManualRestoreKeepsTheWatcherRunning(t *testing.T) {
 
 	got = f.poll(t, 1, 6, processResult{})
 	calls := f.display.takeCalls()
-	assertOperations(t, calls, "resolve", "layout", "test", "apply")
-	if calls[3].mode != f.original {
+	assertOperations(t, calls, "resolve", "layout", "targets", "test", "apply")
+	if calls[4].mode != f.original {
 		t.Fatalf("automatic restore used the wrong mode: %+v", calls)
 	}
 	if got.Managed || got.AtGameMode || got.CurrentMode != f.original || got.State != StateNative {
@@ -778,7 +823,7 @@ func TestFailedShutdownRestoreKeepsTheWatcherRunning(t *testing.T) {
 	if err := f.s.Shutdown(); err != nil {
 		t.Fatal(err)
 	}
-	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "test", "apply")
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "targets", "test", "apply")
 }
 
 // Nothing prompts the user when the delayed restore fails, so the session records
@@ -807,7 +852,7 @@ func TestFailedAutomaticRestoreIsCountedOnceAndKeepsTheWatcherRunning(t *testing
 	if !got.Managed {
 		t.Fatalf("failed automatic restore dropped ownership: %+v", got)
 	}
-	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "test", "apply")
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "targets", "test", "apply")
 	if f.clock.count() != 2 {
 		t.Fatalf("watchers started = %d, want a replacement after the failed restore", f.clock.count())
 	}
@@ -831,7 +876,7 @@ func TestFailedAutomaticRestoreIsCountedOnceAndKeepsTheWatcherRunning(t *testing
 	f.poll(t, 1, 9, processResult{running: true})
 	f.poll(t, 1, 10, processResult{})
 	got = f.poll(t, 1, 13, processResult{})
-	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "test", "apply")
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "targets", "test", "apply")
 	if got.Managed || got.CurrentMode != f.original || got.State != StateNative {
 		t.Fatalf("restored snapshot = %+v", got)
 	}
@@ -983,6 +1028,220 @@ func TestRestoreAbortsWhenTheSavedArrangementNoLongerFitsTheDesktop(t *testing.T
 	}
 }
 
+// Every DISPLAYn from the saved layout can still exist after Windows swaps the names
+// of two physical monitors. The freshly resolved target must remain bound to the name
+// it owned when Enable captured the layout; membership alone cannot prove that.
+func TestRestoreRefusesWhenTheResolvedTargetNowUsesAnotherSavedDeviceName(t *testing.T) {
+	f := newFixture(t)
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.display.takeCalls()
+	applied := f.desktop()
+	f.display.mu.Lock()
+	f.display.target.DeviceName = rightDevice
+	f.display.mu.Unlock()
+
+	err := f.s.Disable()
+	if !errors.Is(err, display.ErrLayoutUnsafe) {
+		t.Fatalf("Disable error = %v, want display.ErrLayoutUnsafe", err)
+	}
+	assertOperations(t, f.display.takeCalls(), "resolve")
+	if got := f.s.Snapshot(); !got.Managed || got.State != StateError {
+		t.Fatalf("an aborted restore dropped ownership: %+v", got)
+	}
+	if !reflect.DeepEqual(f.desktop(), applied) {
+		t.Fatal("an aborted restore changed the desktop")
+	}
+
+	f.display.mu.Lock()
+	f.display.target.DeviceName = targetDevice
+	f.display.mu.Unlock()
+	if err := f.s.Disable(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The configured target can keep its DISPLAYn while two neighbours exchange theirs.
+// Device-set equality cannot detect that swap; the saved per-device identities must.
+func TestRestoreRefusesWhenNeighboursExchangeSavedDeviceNames(t *testing.T) {
+	f := newFixture(t)
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.display.takeCalls()
+	applied := f.desktop()
+
+	f.display.mu.Lock()
+	left, right := -1, -1
+	for i, target := range f.display.targets {
+		switch target.DeviceName {
+		case rightDevice:
+			left = i
+		case topRight:
+			right = i
+		}
+	}
+	if left < 0 || right < 0 {
+		f.display.mu.Unlock()
+		t.Fatal("fixture is missing neighbour targets")
+	}
+	f.display.targets[left].Identity, f.display.targets[right].Identity =
+		f.display.targets[right].Identity, f.display.targets[left].Identity
+	f.display.mu.Unlock()
+
+	err := f.s.Disable()
+	if !errors.Is(err, display.ErrLayoutUnsafe) {
+		t.Fatalf("Disable error = %v, want display.ErrLayoutUnsafe", err)
+	}
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "targets")
+	if got := f.s.Snapshot(); !got.Managed || got.State != StateError {
+		t.Fatalf("an aborted restore dropped ownership: %+v", got)
+	}
+	if !reflect.DeepEqual(f.desktop(), applied) {
+		t.Fatal("an aborted restore changed the desktop")
+	}
+
+	f.display.mu.Lock()
+	f.display.targets[left].Identity, f.display.targets[right].Identity =
+		f.display.targets[right].Identity, f.display.targets[left].Identity
+	f.display.mu.Unlock()
+	if err := f.s.Disable(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEnableRefusesAnUntrustworthyOrAmbiguousDisplayBinding(t *testing.T) {
+	tests := map[string]func(*fakeDisplay){
+		"a display has no stable identity": func(d *fakeDisplay) {
+			d.targets[1].Identity = domain.MonitorIdentity{}
+		},
+		"two device names carry the same fallback identity": func(d *fakeDisplay) {
+			d.targets[0].Identity.InstancePath = ""
+			d.targets[1].Identity.InstancePath = ""
+			d.targets[1].Identity.HardwareID = d.targets[0].Identity.HardwareID
+		},
+		"one device name maps to several monitor rows": func(d *fakeDisplay) {
+			duplicate := d.targets[1]
+			duplicate.Identity.InstancePath += ":clone"
+			d.targets = append(d.targets, duplicate)
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			f.display.mu.Lock()
+			mutate(f.display)
+			before := f.display.layout
+			f.display.mu.Unlock()
+
+			err := f.s.Enable()
+			if !errors.Is(err, display.ErrLayoutUnsafe) {
+				t.Fatalf("Enable error = %v, want display.ErrLayoutUnsafe", err)
+			}
+			assertOperations(t, f.display.takeCalls(), "resolve", "layout", "targets")
+			if got := f.s.Snapshot(); got.Managed || got.State != StateError {
+				t.Fatalf("refused binding took ownership: %+v", got)
+			}
+			if !reflect.DeepEqual(f.desktop(), before) {
+				t.Fatal("refused binding changed the desktop")
+			}
+		})
+	}
+}
+
+// EnumDisplayDevicesW may fail to provide an interface path. An exact, unique full
+// hardware ID still gives the session a conservative binding for this managed cycle.
+func TestManagedRestoreUsesUniqueExactHardwareIDsWhenPathsAreUnavailable(t *testing.T) {
+	f := newFixture(t)
+	f.display.mu.Lock()
+	for i := range f.display.targets {
+		f.display.targets[i].Identity.InstancePath = ""
+	}
+	f.display.target.Identity.InstancePath = ""
+	f.display.mu.Unlock()
+
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.Disable(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagedRestoreIgnoresLabelsAndInstancePathCasing(t *testing.T) {
+	f := newFixture(t)
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.display.mu.Lock()
+	for i := range f.display.targets {
+		f.display.targets[i].Identity.InstancePath = strings.ToUpper(f.display.targets[i].Identity.InstancePath)
+		f.display.targets[i].Identity.Label = "a newly reported friendly name"
+	}
+	f.display.target.Identity.InstancePath = strings.ToUpper(f.display.target.Identity.InstancePath)
+	f.display.target.Identity.Label = "a newly reported friendly name"
+	f.display.mu.Unlock()
+
+	if err := f.s.Disable(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Restore preserves a neighbour's current mode. If that mode grew while managed,
+// the saved coordinates must be checked against its new size before TestMode or any
+// native layout apply is attempted.
+func TestRestoreRefusesSavedCoordinatesThatOverlapACurrentNeighbourMode(t *testing.T) {
+	original := domain.Mode{Width: 100, Height: 100, RefreshHz: 60, BitsPerPixel: 32}
+	game := domain.Mode{Width: 80, Height: 100, RefreshHz: 60, BitsPerPixel: 32}
+	side := original
+	desktop := domain.Layout{Displays: []domain.DisplayState{
+		{DeviceName: targetDevice, Mode: original, Position: domain.Point{}, Primary: true},
+		{DeviceName: rightDevice, Mode: side, Position: domain.Point{X: 100}},
+		{DeviceName: topRight, Mode: side, Position: domain.Point{X: 200}},
+	}}
+	f := newFixtureWith(t, profileWithGameMode(game), original, desktop)
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.display.takeCalls()
+
+	grown := domain.Mode{Width: 200, Height: 100, RefreshHz: 60, BitsPerPixel: 32}
+	f.display.mu.Lock()
+	f.display.layout = domain.Layout{Displays: []domain.DisplayState{
+		{DeviceName: targetDevice, Mode: game, Position: domain.Point{}, Primary: true},
+		{DeviceName: rightDevice, Mode: grown, Position: domain.Point{X: 80}},
+		{DeviceName: topRight, Mode: side, Position: domain.Point{X: 280}},
+	}}
+	unsafeCurrent := f.display.layout
+	f.display.mu.Unlock()
+
+	err := f.s.Disable()
+	if !errors.Is(err, display.ErrLayoutUnsafe) {
+		t.Fatalf("Disable error = %v, want display.ErrLayoutUnsafe", err)
+	}
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "targets")
+	if got := f.s.Snapshot(); !got.Managed || got.State != StateError {
+		t.Fatalf("an aborted restore dropped ownership: %+v", got)
+	}
+	if !reflect.DeepEqual(f.desktop(), unsafeCurrent) {
+		t.Fatal("an aborted restore changed the desktop")
+	}
+
+	// Put the external neighbour change back. The retained ownership can now finish
+	// the same restore without rebuilding or guessing at a different snapshot.
+	f.display.mu.Lock()
+	f.display.layout = domain.Layout{Displays: []domain.DisplayState{
+		{DeviceName: targetDevice, Mode: game, Position: domain.Point{}, Primary: true},
+		{DeviceName: rightDevice, Mode: side, Position: domain.Point{X: 80}},
+		{DeviceName: topRight, Mode: side, Position: domain.Point{X: 180}},
+	}}
+	f.display.mu.Unlock()
+	if err := f.s.Disable(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // fixtureLarger is wider and taller than the desktop's native mode. Every session
 // test above this line narrows the target, because the built-in profile was the
 // only profile there was; the moment a picker lists what the monitor reports, most
@@ -1023,8 +1282,8 @@ func TestEnableAppliesALargerGameModeWithoutOverlappingTheNeighbours(t *testing.
 		t.Fatal(err)
 	}
 	calls := f.display.takeCalls()
-	assertOperations(t, calls, "resolve", "layout", "test", "apply")
-	if calls[2].mode != fixtureLarger || calls[3].mode != fixtureLarger {
+	assertOperations(t, calls, "resolve", "layout", "targets", "test", "apply")
+	if calls[3].mode != fixtureLarger || calls[4].mode != fixtureLarger {
 		t.Fatalf("tested and applied modes = %+v", calls)
 	}
 	desktop := f.desktop()
@@ -1102,8 +1361,8 @@ func TestDisableReturnsTheDesktopFromALargerGameMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := f.display.takeCalls()
-	assertOperations(t, calls, "resolve", "layout", "test", "apply")
-	if calls[2].mode != f.original || calls[3].mode != f.original {
+	assertOperations(t, calls, "resolve", "layout", "targets", "test", "apply")
+	if calls[3].mode != f.original || calls[4].mode != f.original {
 		t.Fatalf("restore = %+v", calls)
 	}
 	if got := f.desktop(); !reflect.DeepEqual(got, before) {
@@ -1166,6 +1425,11 @@ func (f *sessionFixture) renameDisplay(from, to string) {
 	for i := range displays {
 		if displays[i].DeviceName == from {
 			displays[i].DeviceName = to
+		}
+	}
+	for i := range f.display.targets {
+		if f.display.targets[i].DeviceName == from {
+			f.display.targets[i].DeviceName = to
 		}
 	}
 	f.display.layout = domain.Layout{Displays: displays}
@@ -1342,7 +1606,7 @@ func TestManualDisableStillWorksWithNoProcessConfigured(t *testing.T) {
 	if err := f.s.Disable(); err != nil {
 		t.Fatal(err)
 	}
-	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "test", "apply")
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "targets", "test", "apply")
 	if got := f.desktop(); !reflect.DeepEqual(got, before) {
 		t.Fatalf("restored desktop = %+v, want %+v", got, before)
 	}

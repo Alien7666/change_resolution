@@ -221,7 +221,7 @@ func TestPlanModeChangeRefusesAnUnusableMode(t *testing.T) {
 // game mode was active keeps that change.
 func TestPlanRestoreReproducesTheSavedArrangement(t *testing.T) {
 	saved := measuredLayout()
-	plan, err := PlanRestore(saved, `\.\DISPLAY1`)
+	plan, err := PlanRestore(saved, saved, `\.\DISPLAY1`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +253,7 @@ func TestPlanModeChangeThenPlanRestoreIsIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	restored, err := PlanRestore(before, `\.\DISPLAY1`)
+	restored, err := PlanRestore(before, layoutFrom(applied, before), `\.\DISPLAY1`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,12 +269,73 @@ func TestPlanModeChangeThenPlanRestoreIsIdentity(t *testing.T) {
 // If the target is no longer one of them the coordinates are stale, and applying
 // them would move displays onto each other.
 func TestPlanRestoreRefusesASavedLayoutWithoutTheTarget(t *testing.T) {
-	plan, err := PlanRestore(measuredLayout(), `\.\DISPLAY7`)
+	saved := measuredLayout()
+	plan, err := PlanRestore(saved, saved, `\.\DISPLAY7`)
 	if !errors.Is(err, ErrLayoutUnsafe) {
 		t.Fatalf("err = %v, want ErrLayoutUnsafe", err)
 	}
 	if len(plan.Changes) != 0 {
 		t.Fatalf("a refused plan still carries changes: %+v", plan)
+	}
+}
+
+// A restore writes saved positions but deliberately preserves every non-target
+// display's current mode. Safety therefore has to be proved with those current sizes,
+// not with the smaller sizes in the saved snapshot.
+func TestPlanRestoreRefusesSavedPositionsThatOverlapACurrentNeighbourMode(t *testing.T) {
+	mode100 := domain.Mode{Width: 100, Height: 100, RefreshHz: 60, BitsPerPixel: 32}
+	mode200 := domain.Mode{Width: 200, Height: 100, RefreshHz: 60, BitsPerPixel: 32}
+	saved := domain.Layout{Displays: []domain.DisplayState{
+		{DeviceName: `\.\DISPLAY1`, Mode: mode100, Position: domain.Point{}, Primary: true},
+		{DeviceName: `\.\DISPLAY2`, Mode: mode100, Position: domain.Point{X: 100}},
+		{DeviceName: `\.\DISPLAY3`, Mode: mode100, Position: domain.Point{X: 200}},
+	}}
+	current := domain.Layout{Displays: []domain.DisplayState{
+		{DeviceName: `\.\DISPLAY1`, Mode: mode100, Position: domain.Point{}, Primary: true},
+		{DeviceName: `\.\DISPLAY2`, Mode: mode200, Position: domain.Point{X: 100}},
+		{DeviceName: `\.\DISPLAY3`, Mode: mode100, Position: domain.Point{X: 300}},
+	}}
+
+	plan, err := PlanRestore(saved, current, `\.\DISPLAY1`)
+	if !errors.Is(err, ErrLayoutUnsafe) {
+		t.Fatalf("err = %v, want ErrLayoutUnsafe", err)
+	}
+	if len(plan.Changes) != 0 {
+		t.Fatalf("unsafe restore returned plan = %+v", plan)
+	}
+}
+
+func TestPlanRestoreRefusesAChangedDeviceSet(t *testing.T) {
+	saved := measuredLayout()
+	current := measuredLayout()
+	current.Displays = append(current.Displays, domain.DisplayState{
+		DeviceName: `\.\DISPLAY9`,
+		Mode:       sideMode,
+		Position:   domain.Point{X: 6000},
+	})
+
+	plan, err := PlanRestore(saved, current, `\.\DISPLAY1`)
+	if !errors.Is(err, ErrLayoutUnsafe) {
+		t.Fatalf("err = %v, want ErrLayoutUnsafe", err)
+	}
+	if len(plan.Changes) != 0 {
+		t.Fatalf("changed topology returned plan = %+v", plan)
+	}
+}
+
+func TestPlanRestoreRefusesAChangedPrimaryDisplay(t *testing.T) {
+	saved := measuredLayout()
+	current := measuredLayout()
+	for i := range current.Displays {
+		current.Displays[i].Primary = current.Displays[i].DeviceName == `\.\DISPLAY2`
+	}
+
+	plan, err := PlanRestore(saved, current, `\.\DISPLAY1`)
+	if !errors.Is(err, ErrLayoutUnsafe) {
+		t.Fatalf("err = %v, want ErrLayoutUnsafe", err)
+	}
+	if len(plan.Changes) != 0 {
+		t.Fatalf("changed primary returned plan = %+v", plan)
 	}
 }
 
