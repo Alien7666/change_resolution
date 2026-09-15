@@ -476,6 +476,10 @@ func decodeError(data []byte, err error) error {
 		return fmt.Errorf("%w：第 %d 行第 %d 欄：欄位 %s 的值是 %s，這裡要的是%s",
 			ErrMalformed, line, column, field, mismatch.Value, wantedTypeName(mismatch.Type))
 	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		line, column := afterLastByteLineColumn(data)
+		return fmt.Errorf("%w：第 %d 行第 %d 欄：%v", ErrMalformed, line, column, err)
+	}
 	if errors.Is(err, io.EOF) {
 		return fmt.Errorf("%w：檔案是空的", ErrMalformed)
 	}
@@ -545,4 +549,20 @@ func lineColumn(data []byte, offset int64) (line, column int) {
 		}
 	}
 	return line, index - lineStart + 1
+}
+
+// afterLastByteLineColumn names the character position a truncated document still
+// needs. It deliberately does not change lineColumn's json-offset behaviour: a JSON
+// syntax offset identifies an existing byte, while io.ErrUnexpectedEOF identifies the
+// next missing byte after data's final byte.
+func afterLastByteLineColumn(data []byte) (line, column int) {
+	line, column = 1, 1
+	for _, byteValue := range data {
+		if byteValue == '\n' {
+			line, column = line+1, 1
+			continue
+		}
+		column++
+	}
+	return line, column
 }

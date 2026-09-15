@@ -471,6 +471,41 @@ func TestParseReportsTheLineAndColumnOfASyntaxError(t *testing.T) {
 	}
 }
 
+// A truncated document has no offending byte. Its useful location is the next byte the
+// parser needed: after the last byte, including the first column of a final blank line.
+func TestParseReportsTheNextMissingPositionForTruncatedJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want []string
+	}{
+		{
+			name: "after the last byte on a populated line",
+			data: "{\n  \"version\": 1,",
+			want: []string{"第 2 行", "第 16 欄", "unexpected EOF"},
+		},
+		{
+			name: "first column after a trailing newline",
+			data: "{\n  \"version\": 1,\n",
+			want: []string{"第 3 行", "第 1 欄", "unexpected EOF"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Parse([]byte(test.data))
+			if !errors.Is(err, ErrMalformed) {
+				t.Fatalf("Parse = %v, want ErrMalformed", err)
+			}
+			for _, want := range test.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 // Naming the field is not enough on its own. Telling someone that their boolean is
 // not an acceptable integer sends them off to fix the wrong thing, so the message
 // says what the field it names actually holds.
