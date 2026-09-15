@@ -60,15 +60,16 @@ type writeCall struct {
 }
 
 type fakeNVAPI struct {
-	initializeStatus  status
-	readStatuses      []status
-	writeStatuses     []status
-	displayID         uint32
-	displayIDs        []uint32
-	displayIDStatus   status
-	displayIDStatuses []status
-	unloadStatus      status
-	configs           []*config
+	initializeStatus   status
+	initializeStatuses []status
+	readStatuses       []status
+	writeStatuses      []status
+	displayID          uint32
+	displayIDs         []uint32
+	displayIDStatus    status
+	displayIDStatuses  []status
+	unloadStatus       status
+	configs            []*config
 
 	initializeCalls  int
 	readCalls        int
@@ -78,7 +79,11 @@ type fakeNVAPI struct {
 }
 
 func (f *fakeNVAPI) initialize() status {
+	index := f.initializeCalls
 	f.initializeCalls++
+	if index < len(f.initializeStatuses) {
+		return f.initializeStatuses[index]
+	}
 	return f.initializeStatus
 }
 
@@ -283,12 +288,16 @@ func TestPayloadDivergenceAbortsBeforeAnyWrite(t *testing.T) {
 	var resolved []domain.MonitorIdentity
 	controller := newController(api, resolverFor(`\\.\DISPLAY1`, &resolved), nil)
 
-	_, err := controller.Apply(domain.MonitorIdentity{InstancePath: "unit-42"}, decodeValue(2))
+	outcome, err := controller.Apply(domain.MonitorIdentity{InstancePath: "unit-42"}, decodeValue(2))
 	if !errors.Is(err, ErrScalingPayloadDiverged) {
 		t.Fatalf("Apply error = %v", err)
 	}
 	if len(api.writes) != 0 {
 		t.Fatalf("divergent payload reached NVAPI: %#v", api.writes)
+	}
+	if outcome.Previous.Effective != decodeValue(6) || outcome.State != outcome.Previous ||
+		outcome.SetAttempted || outcome.Applied || !outcome.ReadBackKnown {
+		t.Fatalf("divergence outcome = %#v", outcome)
 	}
 	if availability := controller.Probe(); availability.Available || !errors.Is(availability.Err, ErrScalingPayloadDiverged) {
 		t.Fatalf("Probe after divergence = %#v", availability)
@@ -312,7 +321,15 @@ func TestWriteSequenceIsValidateThenApplyAndNothingElse(t *testing.T) {
 	if len(api.writes) != 2 || api.readCalls != 2 {
 		t.Fatalf("writes=%d reads=%d", len(api.writes), api.readCalls)
 	}
-	if outcome != (Outcome{Requested: decodeValue(2), State: State{DisplayID: 42, Effective: decodeValue(2)}, Matched: true}) {
+	if outcome != (Outcome{
+		Requested:     decodeValue(2),
+		Previous:      State{DisplayID: 42, Effective: decodeValue(6)},
+		State:         State{DisplayID: 42, Effective: decodeValue(2)},
+		SetAttempted:  true,
+		Applied:       true,
+		ReadBackKnown: true,
+		Matched:       true,
+	}) {
 		t.Fatalf("outcome = %#v", outcome)
 	}
 	if len(resolved) != 1 || len(api.displayNameCalls) != 1 {
@@ -329,7 +346,7 @@ func TestValidateFailureMeansNoApply(t *testing.T) {
 	var resolved []domain.MonitorIdentity
 	controller := newController(api, resolverFor(`\\.\DISPLAY1`, &resolved), nil)
 
-	_, err := controller.Apply(domain.MonitorIdentity{InstancePath: "unit-42"}, decodeValue(2))
+	outcome, err := controller.Apply(domain.MonitorIdentity{InstancePath: "unit-42"}, decodeValue(2))
 	if err == nil {
 		t.Fatal("Apply succeeded after validation failed")
 	}
@@ -338,6 +355,10 @@ func TestValidateFailureMeansNoApply(t *testing.T) {
 	}
 	if api.readCalls != 1 {
 		t.Fatalf("validation failure performed %d reads", api.readCalls)
+	}
+	if outcome.Previous.Effective != decodeValue(6) || outcome.State != outcome.Previous ||
+		outcome.SetAttempted || outcome.Applied || !outcome.ReadBackKnown {
+		t.Fatalf("validation outcome = %#v", outcome)
 	}
 }
 
@@ -356,7 +377,8 @@ func TestANormalisedReadBackIsNotAnError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if outcome.Matched || outcome.State.Effective != decodeValue(1) || outcome.Requested != decodeValue(6) {
+	if outcome.Matched || outcome.State.Effective != decodeValue(1) || outcome.Previous.Effective != decodeValue(2) ||
+		outcome.Requested != decodeValue(6) || !outcome.SetAttempted || !outcome.Applied || !outcome.ReadBackKnown {
 		t.Fatalf("outcome = %#v", outcome)
 	}
 }
@@ -377,8 +399,29 @@ func TestAFailedApplyStillRereadsTheEffectiveValue(t *testing.T) {
 	if err == nil {
 		t.Fatal("Apply succeeded despite the formal set failure")
 	}
-	if api.readCalls != 2 || outcome.State.Effective != decodeValue(1) {
+	if api.readCalls != 2 || outcome.Previous.Effective != decodeValue(6) || outcome.State.Effective != decodeValue(1) ||
+		!outcome.SetAttempted || outcome.Applied || !outcome.ReadBackKnown {
 		t.Fatalf("reads=%d outcome=%#v", api.readCalls, outcome)
+	}
+}
+
+func TestASuccessfulSetWhoseReadBackFailsStillReportsTheSetFacts(t *testing.T) {
+	api := &fakeNVAPI{
+		configs:       []*config{fakeConfig(targetSpec{displayID: 42, scaling: 6})},
+		displayID:     42,
+		readStatuses:  []status{statusOK, -5},
+		writeStatuses: []status{statusOK, statusOK},
+	}
+	var resolved []domain.MonitorIdentity
+	controller := newController(api, resolverFor(`\\.\DISPLAY1`, &resolved), nil)
+
+	outcome, err := controller.Apply(domain.MonitorIdentity{InstancePath: "unit-42"}, decodeValue(2))
+	if err == nil {
+		t.Fatal("Apply succeeded despite the read-back failure")
+	}
+	if outcome.Previous != (State{DisplayID: 42, Effective: decodeValue(6)}) ||
+		outcome.State != (State{}) || !outcome.SetAttempted || !outcome.Applied || outcome.ReadBackKnown || outcome.Matched {
+		t.Fatalf("outcome = %#v", outcome)
 	}
 }
 
@@ -394,8 +437,174 @@ func TestApplyingTheEffectiveValueIsANoOp(t *testing.T) {
 	if len(api.writes) != 0 || api.readCalls != 1 {
 		t.Fatalf("same-value request wrote=%d read=%d", len(api.writes), api.readCalls)
 	}
-	if !outcome.Matched || outcome.State.Effective != decodeValue(2) {
+	if !outcome.Matched || outcome.Previous != outcome.State || outcome.State.Effective != decodeValue(2) ||
+		outcome.SetAttempted || outcome.Applied || !outcome.ReadBackKnown {
 		t.Fatalf("outcome = %#v", outcome)
+	}
+}
+
+func TestRestoreRejectsAChangedDisplayIDBeforeAnyWrite(t *testing.T) {
+	api := &fakeNVAPI{
+		configs:   []*config{fakeConfig(targetSpec{displayID: 77, scaling: 2})},
+		displayID: 77,
+	}
+	var resolved []domain.MonitorIdentity
+	controller := newController(api, resolverFor(`\\.\DISPLAY7`, &resolved), nil)
+
+	outcome, err := controller.Restore(domain.MonitorIdentity{InstancePath: "unit-42"}, 42, decodeValue(6))
+	if !errors.Is(err, ErrScalingTargetChanged) {
+		t.Fatalf("Restore error = %v", err)
+	}
+	if len(api.writes) != 0 || outcome.SetAttempted || outcome.Applied || outcome.ReadBackKnown {
+		t.Fatalf("mismatched restore wrote or claimed state: writes=%d outcome=%#v", len(api.writes), outcome)
+	}
+	if !reflect.DeepEqual(api.displayNameCalls, []string{`\\.\DISPLAY7`}) {
+		t.Fatalf("displayIDByName calls = %#v", api.displayNameCalls)
+	}
+}
+
+func TestRestoreForcesAFreshIdentityResolutionInsteadOfTrustingTheCache(t *testing.T) {
+	api := &fakeNVAPI{
+		configs: []*config{
+			fakeConfig(targetSpec{displayID: 42, scaling: 2}),
+			fakeConfig(targetSpec{displayID: 42, scaling: 2}),
+		},
+		displayIDs: []uint32{42, 77},
+	}
+	var resolved []domain.MonitorIdentity
+	controller := newController(api, resolverFor(`\\.\DISPLAY1`, &resolved), nil)
+	identity := domain.MonitorIdentity{InstancePath: "unit-42"}
+
+	if _, err := controller.Read(identity); err != nil {
+		t.Fatal(err)
+	}
+	_, err := controller.Restore(identity, 42, decodeValue(6))
+	if !errors.Is(err, ErrScalingTargetChanged) {
+		t.Fatalf("Restore error = %v", err)
+	}
+	if len(resolved) != 2 || len(api.displayNameCalls) != 2 || len(api.writes) != 0 {
+		t.Fatalf("restore trusted cache: resolve=%d names=%d writes=%d", len(resolved), len(api.displayNameCalls), len(api.writes))
+	}
+}
+
+func TestRestoreNoOpIsAKnownSuccessfulOutcome(t *testing.T) {
+	api := &fakeNVAPI{configs: []*config{fakeConfig(targetSpec{displayID: 42, scaling: 6})}, displayID: 42}
+	var resolved []domain.MonitorIdentity
+	controller := newController(api, resolverFor(`\\.\DISPLAY1`, &resolved), nil)
+
+	outcome, err := controller.Restore(domain.MonitorIdentity{InstancePath: "unit-42"}, 42, decodeValue(6))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Outcome{
+		Requested:     decodeValue(6),
+		Previous:      State{DisplayID: 42, Effective: decodeValue(6)},
+		State:         State{DisplayID: 42, Effective: decodeValue(6)},
+		ReadBackKnown: true,
+		Matched:       true,
+	}
+	if outcome != want || len(api.writes) != 0 {
+		t.Fatalf("outcome=%#v writes=%d", outcome, len(api.writes))
+	}
+}
+
+func TestRestoreAppliesOnlyAfterTheFreshIdentityMatchesTheOwnedDisplayID(t *testing.T) {
+	initial := fakeConfig(targetSpec{displayID: 42, scaling: 2})
+	readBack := fakeConfig(targetSpec{displayID: 42, scaling: 6})
+	api := &fakeNVAPI{configs: []*config{initial, readBack}, displayID: 42}
+	var resolved []domain.MonitorIdentity
+	controller := newController(api, resolverFor(`\\.\DISPLAY9`, &resolved), nil)
+
+	outcome, err := controller.Restore(domain.MonitorIdentity{InstancePath: "unit-42"}, 42, decodeValue(6))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []uint32{api.writes[0].flags, api.writes[1].flags}; !reflect.DeepEqual(got, []uint32{flagValidateOnly, 0}) {
+		t.Fatalf("write flags = %#v", got)
+	}
+	want := Outcome{
+		Requested:     decodeValue(6),
+		Previous:      State{DisplayID: 42, Effective: decodeValue(2)},
+		State:         State{DisplayID: 42, Effective: decodeValue(6)},
+		SetAttempted:  true,
+		Applied:       true,
+		ReadBackKnown: true,
+		Matched:       true,
+	}
+	if outcome != want || len(resolved) != 1 || len(api.displayNameCalls) != 1 {
+		t.Fatalf("outcome=%#v resolve=%d names=%d", outcome, len(resolved), len(api.displayNameCalls))
+	}
+}
+
+type loaderStep struct {
+	api nvapi
+	err error
+}
+
+func sequencedLoader(steps []loaderStep, calls *int) nvapiLoader {
+	return func() (nvapi, error) {
+		index := *calls
+		*calls = *calls + 1
+		if index >= len(steps) {
+			index = len(steps) - 1
+		}
+		return steps[index].api, steps[index].err
+	}
+}
+
+func TestProbeRetriesATransientLoadFailure(t *testing.T) {
+	api := &fakeNVAPI{}
+	loadCalls := 0
+	var resolved []domain.MonitorIdentity
+	controller := newLoadableController(sequencedLoader([]loaderStep{
+		{err: errors.New("nvapi64.dll missing")},
+		{api: api},
+	}, &loadCalls), resolverFor(`\\.\DISPLAY1`, &resolved))
+
+	if availability := controller.Probe(); availability.Available || !errors.Is(availability.Err, ErrNvapiUnavailable) {
+		t.Fatalf("first Probe = %#v", availability)
+	}
+	if availability := controller.Probe(); !availability.Available || availability.Err != nil {
+		t.Fatalf("second Probe = %#v", availability)
+	}
+	if loadCalls != 2 || api.initializeCalls != 1 {
+		t.Fatalf("loads=%d initialize=%d", loadCalls, api.initializeCalls)
+	}
+}
+
+func TestProbeRetriesATransientInitializationFailure(t *testing.T) {
+	api := &fakeNVAPI{initializeStatuses: []status{-5, statusOK}}
+	loadCalls := 0
+	var resolved []domain.MonitorIdentity
+	controller := newLoadableController(sequencedLoader([]loaderStep{{api: api}}, &loadCalls), resolverFor(`\\.\DISPLAY1`, &resolved))
+
+	if availability := controller.Probe(); availability.Available || !errors.Is(availability.Err, ErrNvapiUnavailable) {
+		t.Fatalf("first Probe = %#v", availability)
+	}
+	if availability := controller.Probe(); !availability.Available || availability.Err != nil {
+		t.Fatalf("second Probe = %#v", availability)
+	}
+	if loadCalls != 1 || api.initializeCalls != 2 {
+		t.Fatalf("loads=%d initialize=%d", loadCalls, api.initializeCalls)
+	}
+}
+
+func TestCloseAfterALoadFailurePreventsAnyRetry(t *testing.T) {
+	loadCalls := 0
+	var resolved []domain.MonitorIdentity
+	controller := newLoadableController(sequencedLoader([]loaderStep{{err: errors.New("missing")}}, &loadCalls), resolverFor(`\\.\DISPLAY1`, &resolved))
+
+	if availability := controller.Probe(); availability.Available {
+		t.Fatalf("Probe = %#v", availability)
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if availability := controller.Probe(); availability.Available || !errors.Is(availability.Err, ErrControllerClosed) {
+		t.Fatalf("Probe after Close = %#v", availability)
+	}
+	if loadCalls != 1 {
+		t.Fatalf("load calls = %d", loadCalls)
 	}
 }
 
@@ -442,7 +651,7 @@ func TestProbeInitializesOnceAndCloseUnloadsOnce(t *testing.T) {
 	}
 }
 
-func TestInitializationFailureMakesTheControllerUnavailable(t *testing.T) {
+func TestInitializationFailureIsUnavailableWithoutHardDisablingTheController(t *testing.T) {
 	api := &fakeNVAPI{initializeStatus: -5}
 	var resolved []domain.MonitorIdentity
 	controller := newController(api, resolverFor(`\\.\DISPLAY1`, &resolved), nil)
@@ -454,7 +663,7 @@ func TestInitializationFailureMakesTheControllerUnavailable(t *testing.T) {
 	if _, err := controller.Read(domain.MonitorIdentity{InstancePath: "unit-42"}); !errors.Is(err, ErrNvapiUnavailable) {
 		t.Fatalf("Read error = %v", err)
 	}
-	if api.initializeCalls != 1 || api.readCalls != 0 || len(resolved) != 0 {
+	if api.initializeCalls != 2 || api.readCalls != 0 || len(resolved) != 0 {
 		t.Fatalf("init=%d read=%d resolve=%d", api.initializeCalls, api.readCalls, len(resolved))
 	}
 }

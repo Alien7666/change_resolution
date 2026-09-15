@@ -53,6 +53,7 @@ var (
 	ErrNotNvidiaDisplay          = errors.New("target monitor is not driven by NVIDIA")
 	ErrScalingTargetNotFound     = errors.New("NVAPI scaling target not found")
 	ErrScalingTargetAmbiguous    = errors.New("NVAPI scaling target is ambiguous")
+	ErrScalingTargetChanged      = errors.New("NVAPI scaling target changed")
 	ErrScalingPayloadDiverged    = errors.New("NVAPI display-config payload diverged")
 	ErrIncompatibleStructVersion = errors.New("NVAPI display-config struct version is incompatible")
 	ErrControllerClosed          = errors.New("scaling controller is closed")
@@ -69,8 +70,22 @@ type State struct {
 // driver-normalised value is a successful operation with Matched false.
 type Outcome struct {
 	Requested Value
-	State     State
-	Matched   bool
+
+	// Previous comes from the same fresh configuration on which this operation
+	// was made. Callers must not reconstruct it with a separate Read because another
+	// process can change scaling between two calls.
+	Previous State
+	State    State
+
+	// SetAttempted means the formal flags=0 path was invoked. Applied means that call
+	// returned NVAPI_OK, even if its mandatory read-back subsequently failed.
+	SetAttempted bool
+	Applied      bool
+
+	// ReadBackKnown says State is authoritative after this operation. It is also true
+	// for a no-op or pre-set refusal, where Previous necessarily remains effective.
+	ReadBackKnown bool
+	Matched       bool
 }
 
 // Availability reports whether this process can use the scaling controller and,
@@ -89,6 +104,7 @@ type Controller interface {
 	Probe() Availability
 	Read(domain.MonitorIdentity) (State, error)
 	Apply(domain.MonitorIdentity, Value) (Outcome, error)
+	Restore(identity domain.MonitorIdentity, expectedDisplayID uint32, value Value) (Outcome, error)
 	Close() error
 }
 
@@ -115,6 +131,8 @@ type nvapi interface {
 // display.Controller.ResolveTarget. The GDI name exists only as a local value long
 // enough to be converted to displayId; the controller stores only the latter.
 type targetResolver func(domain.MonitorIdentity) (domain.Target, error)
+
+type nvapiLoader func() (nvapi, error)
 
 // payloadField is one deterministic line of the native payload. Task 14 supplies
 // every native field in this form, flattening raw pointer values to nil/non-nil.
@@ -145,8 +163,8 @@ type controller struct {
 	mu sync.Mutex
 
 	api     nvapi
+	load    nvapiLoader
 	resolve targetResolver
-	loadErr error
 
 	initialized bool
 	closed      bool
@@ -155,8 +173,20 @@ type controller struct {
 }
 
 func newController(api nvapi, resolve targetResolver, loadErr error) *controller {
+	c := &controller{
+		api: api, resolve: resolve,
+		displayIDs: make(map[domain.MonitorIdentity]uint32),
+	}
+	if loadErr != nil {
+		c.api = nil
+		c.load = func() (nvapi, error) { return nil, loadErr }
+	}
+	return c
+}
+
+func newLoadableController(load nvapiLoader, resolve targetResolver) *controller {
 	return &controller{
-		api: api, resolve: resolve, loadErr: loadErr,
+		load: load, resolve: resolve,
 		displayIDs: make(map[domain.MonitorIdentity]uint32),
 	}
 }
@@ -190,6 +220,27 @@ func (c *controller) Read(identity domain.MonitorIdentity) (State, error) {
 func (c *controller) Apply(identity domain.MonitorIdentity, requested Value) (Outcome, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.applyLocked(identity, requested, nil)
+}
+
+// Restore applies a saved value only if a fresh identity resolution still maps to
+// the displayId on which ownership was taken. The comparison and any set share the
+// controller lock, so a separate Read cannot open a target-swap race.
+func (c *controller) Restore(
+	identity domain.MonitorIdentity,
+	expectedDisplayID uint32,
+	requested Value,
+) (Outcome, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.applyLocked(identity, requested, &expectedDisplayID)
+}
+
+func (c *controller) applyLocked(
+	identity domain.MonitorIdentity,
+	requested Value,
+	expectedDisplayID *uint32,
+) (Outcome, error) {
 	if err := c.ready(); err != nil {
 		return Outcome{Requested: requested}, err
 	}
@@ -200,7 +251,13 @@ func (c *controller) Apply(identity domain.MonitorIdentity, requested Value) (Ou
 	if err != nil {
 		return Outcome{Requested: requested}, err
 	}
-	displayID, target, err := c.resolveTarget(cfg, identity)
+	var displayID uint32
+	var target *configTarget
+	if expectedDisplayID == nil {
+		displayID, target, err = c.resolveTarget(cfg, identity)
+	} else {
+		displayID, target, err = c.resolveExpectedTarget(cfg, identity, *expectedDisplayID)
+	}
 	if err != nil {
 		return Outcome{Requested: requested}, err
 	}
@@ -208,12 +265,19 @@ func (c *controller) Apply(identity domain.MonitorIdentity, requested Value) (Ou
 	if err != nil {
 		return Outcome{Requested: requested}, err
 	}
+	outcome := Outcome{
+		Requested:     requested,
+		Previous:      beforeState,
+		State:         beforeState,
+		ReadBackKnown: true,
+	}
 
 	// Sending a same-value set is all risk and no result: even an identical NVAPI
-	// payload may renumber GDI devices. It is therefore a successful no-op. Task 15
-	// compares its pre-read value with the request and takes no scaling ownership.
+	// payload may renumber GDI devices. It is therefore a successful no-op, made
+	// explicit to Task 15 by SetAttempted=false and the authoritative Previous state.
 	if beforeState.Effective.Raw == requested.Raw {
-		return Outcome{Requested: requested, State: beforeState, Matched: true}, nil
+		outcome.Matched = true
+		return outcome, nil
 	}
 
 	before := renderConfig(cfg)
@@ -224,28 +288,34 @@ func (c *controller) Apply(identity domain.MonitorIdentity, requested Value) (Ou
 		*target.scaling = previous
 		wrapped := fmt.Errorf("%w: %v", ErrScalingPayloadDiverged, err)
 		c.disabled = wrapped
-		return Outcome{Requested: requested, State: beforeState}, wrapped
+		return outcome, wrapped
 	}
 
 	if err := checkFlags(flagValidateOnly); err != nil {
-		return Outcome{Requested: requested, State: beforeState}, err
+		return outcome, err
 	}
 	if callStatus := c.api.writeConfig(cfg, flagValidateOnly); callStatus != statusOK {
-		return Outcome{Requested: requested, State: beforeState}, c.callError("validate display config", callStatus)
+		return outcome, c.callError("validate display config", callStatus)
 	}
 	if err := checkFlags(0); err != nil {
-		return Outcome{Requested: requested, State: beforeState}, err
+		return outcome, err
 	}
+	outcome.SetAttempted = true
 	applyStatus := c.api.writeConfig(cfg, 0)
+	outcome.Applied = applyStatus == statusOK
 
 	// A set can partially take effect even when NVAPI reports failure, and it can
 	// invalidate every GDI name. Read back by the stable displayId without resolving
 	// or storing another DeviceName.
 	readBack, readErr := c.readStateByID(displayID)
-	outcome := Outcome{
-		Requested: requested,
-		State:     readBack,
-		Matched:   readErr == nil && readBack.Effective.Raw == requested.Raw,
+	if readErr == nil {
+		outcome.State = readBack
+		outcome.ReadBackKnown = true
+		outcome.Matched = readBack.Effective.Raw == requested.Raw
+	} else {
+		outcome.State = State{}
+		outcome.ReadBackKnown = false
+		outcome.Matched = false
 	}
 	if applyStatus != statusOK {
 		applyErr := c.callError("apply display config", applyStatus)
@@ -283,21 +353,25 @@ func (c *controller) ready() error {
 	if c.disabled != nil {
 		return c.disabled
 	}
-	if c.loadErr != nil {
-		c.disabled = fmt.Errorf("%w: %v", ErrNvapiUnavailable, c.loadErr)
-		return c.disabled
-	}
 	if c.api == nil {
-		c.disabled = fmt.Errorf("%w: no NVAPI implementation", ErrNvapiUnavailable)
-		return c.disabled
+		if c.load == nil {
+			return fmt.Errorf("%w: no NVAPI implementation", ErrNvapiUnavailable)
+		}
+		api, err := c.load()
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrNvapiUnavailable, err)
+		}
+		if api == nil {
+			return fmt.Errorf("%w: loader returned no NVAPI implementation", ErrNvapiUnavailable)
+		}
+		c.api = api
 	}
 	if c.initialized {
 		return nil
 	}
 	if callStatus := c.api.initialize(); callStatus != statusOK {
-		err := c.callError("initialize NVAPI", callStatus)
-		c.disabled = fmt.Errorf("%w: %v", ErrNvapiUnavailable, err)
-		return c.disabled
+		err := c.statusError("initialize NVAPI", callStatus)
+		return fmt.Errorf("%w: %v", ErrNvapiUnavailable, err)
 	}
 	c.initialized = true
 	return nil
@@ -324,19 +398,9 @@ func (c *controller) resolveTarget(
 		}
 		delete(c.displayIDs, identity)
 	}
-	if c.resolve == nil {
-		return 0, nil, fmt.Errorf("%w: no monitor identity resolver", ErrNotNvidiaDisplay)
-	}
-	target, err := c.resolve(identity)
+	displayID, err := c.resolveDisplayID(identity)
 	if err != nil {
 		return 0, nil, err
-	}
-	// DeviceName is intentionally local. It is consumed into displayId here and is
-	// never stored in controller state or returned from this package.
-	displayID, callStatus := c.api.displayIDByName(target.DeviceName)
-	if callStatus != statusOK {
-		return 0, nil, fmt.Errorf("%w: %v", ErrNotNvidiaDisplay,
-			c.callError("resolve NVIDIA display ID", callStatus))
 	}
 	c.displayIDs[identity] = displayID
 	selected, err := exactlyOneTarget(cfg, displayID)
@@ -344,6 +408,45 @@ func (c *controller) resolveTarget(
 		return 0, nil, err
 	}
 	return displayID, selected, nil
+}
+
+func (c *controller) resolveExpectedTarget(
+	cfg *config,
+	identity domain.MonitorIdentity,
+	expectedDisplayID uint32,
+) (uint32, *configTarget, error) {
+	displayID, err := c.resolveDisplayID(identity)
+	if err != nil {
+		return 0, nil, err
+	}
+	if displayID != expectedDisplayID {
+		return 0, nil, fmt.Errorf("%w: expected displayId %#x, current identity maps to %#x",
+			ErrScalingTargetChanged, expectedDisplayID, displayID)
+	}
+	selected, err := exactlyOneTarget(cfg, displayID)
+	if err != nil {
+		return 0, nil, err
+	}
+	c.displayIDs[identity] = displayID
+	return displayID, selected, nil
+}
+
+func (c *controller) resolveDisplayID(identity domain.MonitorIdentity) (uint32, error) {
+	if c.resolve == nil {
+		return 0, fmt.Errorf("%w: no monitor identity resolver", ErrNotNvidiaDisplay)
+	}
+	target, err := c.resolve(identity)
+	if err != nil {
+		return 0, err
+	}
+	// DeviceName is intentionally local. It is consumed into displayId here and is
+	// never stored in controller state or returned from this package.
+	displayID, callStatus := c.api.displayIDByName(target.DeviceName)
+	if callStatus != statusOK {
+		return 0, fmt.Errorf("%w: %v", ErrNotNvidiaDisplay,
+			c.callError("resolve NVIDIA display ID", callStatus))
+	}
+	return displayID, nil
 }
 
 func (c *controller) readStateByID(displayID uint32) (State, error) {
@@ -425,12 +528,16 @@ func beforeLine(change string) string {
 }
 
 func (c *controller) callError(operation string, callStatus status) error {
-	err := fmt.Errorf("%s: NVAPI status %d: %s", operation, callStatus, c.api.errorMessage(callStatus))
+	err := c.statusError(operation, callStatus)
 	if callStatus == statusIncompatibleStructVersion {
 		err = errors.Join(ErrIncompatibleStructVersion, err)
 		c.disabled = err
 	}
 	return err
+}
+
+func (c *controller) statusError(operation string, callStatus status) error {
+	return fmt.Errorf("%s: NVAPI status %d: %s", operation, callStatus, c.api.errorMessage(callStatus))
 }
 
 func decodeValue(raw uint32) Value {

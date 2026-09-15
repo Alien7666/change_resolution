@@ -198,6 +198,59 @@ func (n *nativeConfig) keepAlive() {
 	runtime.KeepAlive(n)
 }
 
+// validateBindings proves that every raw pointer the driver will receive still
+// points into the backing slices this object keeps alive. Pointer fields are in/out
+// data, so the proof is repeated after the final read and before every write.
+func (n *nativeConfig) validateBindings() error {
+	if n == nil {
+		return errors.New("nil native display config")
+	}
+	pathCount := len(n.paths)
+	if uint64(pathCount) > uint64(maxDisplayPaths) || n.count != uint32(pathCount) {
+		return fmt.Errorf("path count %d does not match %d owned paths", n.count, pathCount)
+	}
+	if len(n.targets) != pathCount || len(n.details) != pathCount || len(n.srcModes) != pathCount {
+		return fmt.Errorf("backing outer lengths do not match %d paths", pathCount)
+	}
+
+	for pathIndex := range n.paths {
+		path := &n.paths[pathIndex]
+		targets := n.targets[pathIndex]
+		details := n.details[pathIndex]
+		if len(targets) != len(details) || uint64(len(targets)) > uint64(maxTargetsPerPath) {
+			return fmt.Errorf("path %d has %d targets and %d detail records", pathIndex, len(targets), len(details))
+		}
+		if path.TargetInfoCount != uint32(len(targets)) {
+			return fmt.Errorf("path %d target count %d does not match %d owned targets",
+				pathIndex, path.TargetInfoCount, len(targets))
+		}
+		if path.TargetInfo != firstPointer(targets) {
+			return fmt.Errorf("path %d target pointer does not name its owned target slice", pathIndex)
+		}
+		if path.SourceModeInfo != uintptr(unsafe.Pointer(&n.srcModes[pathIndex])) {
+			return fmt.Errorf("path %d source-mode pointer does not name its owned source mode", pathIndex)
+		}
+		// This implementation has no backing allocation for the optional non-NVIDIA
+		// adapter LUID. Refuse a non-nil pointer rather than keep alive unrelated data.
+		if path.OSAdapterID != 0 {
+			return fmt.Errorf("path %d has an unowned OS-adapter pointer", pathIndex)
+		}
+		for targetIndex := range targets {
+			if targets[targetIndex].Details != uintptr(unsafe.Pointer(&details[targetIndex])) {
+				return fmt.Errorf("path %d target %d details pointer is not owned", pathIndex, targetIndex)
+			}
+		}
+	}
+	return nil
+}
+
+func firstPointer[T any](values []T) uintptr {
+	if len(values) == 0 {
+		return 0
+	}
+	return uintptr(unsafe.Pointer(&values[0]))
+}
+
 func numberField(name string, value *uint32) payloadField {
 	return payloadField{name: name, number: value}
 }
@@ -357,12 +410,14 @@ type windowsNVAPI struct {
 // because any \\.\DISPLAYn that survives an NvAPI_DISP_SetDisplayConfig may by then
 // name a different monitor.
 func NewWindowsController(resolve func(domain.MonitorIdentity) (domain.Target, error)) Controller {
-	api, err := loadNVAPI()
-	if err != nil {
-		// nil, not a typed nil pointer: the controller tests api == nil.
-		return newController(nil, resolve, err)
-	}
-	return newController(api, resolve, nil)
+	return newLoadableController(func() (nvapi, error) {
+		api, err := loadNVAPI()
+		if err != nil {
+			// nil, not a typed nil pointer: the controller tests api == nil.
+			return nil, err
+		}
+		return api, nil
+	}, resolve)
 }
 
 // loadNVAPI is the whole of the vendor detection's first layer. It is functional, not
@@ -495,6 +550,9 @@ func (a *windowsNVAPI) readNative(pathVersion, advVersion uint32) (*nativeConfig
 		if targetCount > maxTargetsPerPath {
 			return nil, statusInvalidArgument
 		}
+		if native.paths[index].OSAdapterID != 0 {
+			return nil, statusInvalidArgument
+		}
 		if targetCount > 0 {
 			native.targets[index] = make([]targetInfo, targetCount)
 			native.details[index] = make([]advTargetInfo, targetCount)
@@ -524,6 +582,9 @@ func (a *windowsNVAPI) readNative(pathVersion, advVersion uint32) (*nativeConfig
 	if pathCount != count {
 		return nil, statusInvalidArgument
 	}
+	if err := native.validateBindings(); err != nil {
+		return nil, statusInvalidArgument
+	}
 	return native, statusOK
 }
 
@@ -535,11 +596,8 @@ func (a *windowsNVAPI) readNative(pathVersion, advVersion uint32) (*nativeConfig
 // The payload is whatever readConfig produced and the decision layer changed exactly
 // one word of. Nothing is synthesised here.
 func (a *windowsNVAPI) writeConfig(cfg *config, flags uint32) status {
-	if cfg == nil {
-		return statusInvalidArgument
-	}
-	native, ok := cfg.native.(*nativeConfig)
-	if !ok || native == nil || native.count == 0 || len(native.paths) == 0 {
+	native, err := nativeForWrite(cfg)
+	if err != nil {
 		return statusInvalidArgument
 	}
 	result, _, _ := syscall.SyscallN(a.setDisplayConfig,
@@ -548,6 +606,23 @@ func (a *windowsNVAPI) writeConfig(cfg *config, flags uint32) status {
 		uintptr(flags))
 	native.keepAlive()
 	return toStatus(result)
+}
+
+func nativeForWrite(cfg *config) (*nativeConfig, error) {
+	if cfg == nil {
+		return nil, errors.New("nil display config")
+	}
+	native, ok := cfg.native.(*nativeConfig)
+	if !ok || native == nil {
+		return nil, errors.New("display config has no native backing")
+	}
+	if native.count == 0 || len(native.paths) == 0 {
+		return nil, errors.New("display config has no paths")
+	}
+	if err := native.validateBindings(); err != nil {
+		return nil, err
+	}
+	return native, nil
 }
 
 // displayIDByName is the ANSI boundary. NvAPI_DISP_GetDisplayIdByDisplayName takes a

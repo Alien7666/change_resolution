@@ -226,6 +226,84 @@ func TestPointerFieldsRenderOnlyAsNilOrNonNil(t *testing.T) {
 	runtime.KeepAlive(native)
 }
 
+func boundNativeConfig() *nativeConfig {
+	native := &nativeConfig{
+		count:    1,
+		paths:    make([]pathInfo, 1),
+		targets:  [][]targetInfo{make([]targetInfo, 1)},
+		details:  [][]advTargetInfo{make([]advTargetInfo, 1)},
+		srcModes: make([]sourceMode, 1),
+	}
+	native.paths[0].TargetInfoCount = 1
+	native.paths[0].TargetInfo = uintptr(unsafe.Pointer(&native.targets[0][0]))
+	native.paths[0].SourceModeInfo = uintptr(unsafe.Pointer(&native.srcModes[0]))
+	native.targets[0][0].Details = uintptr(unsafe.Pointer(&native.details[0][0]))
+	return native
+}
+
+func TestNativeBindingValidationAcceptsOnlyOwnedPointersAndExactCounts(t *testing.T) {
+	var nilNative *nativeConfig
+	if err := nilNative.validateBindings(); err == nil {
+		t.Fatal("nil native config passed binding validation")
+	}
+	if err := (&nativeConfig{}).validateBindings(); err != nil {
+		t.Fatalf("empty config: %v", err)
+	}
+	if err := boundNativeConfig().validateBindings(); err != nil {
+		t.Fatalf("valid config: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*nativeConfig)
+	}{
+		{name: "path count", mutate: func(n *nativeConfig) { n.count = 2 }},
+		{name: "target outer length", mutate: func(n *nativeConfig) { n.targets = nil }},
+		{name: "details outer length", mutate: func(n *nativeConfig) { n.details = nil }},
+		{name: "source mode length", mutate: func(n *nativeConfig) { n.srcModes = nil }},
+		{name: "target count", mutate: func(n *nativeConfig) { n.paths[0].TargetInfoCount = 2 }},
+		{name: "target pointer", mutate: func(n *nativeConfig) { n.paths[0].TargetInfo++ }},
+		{name: "source pointer", mutate: func(n *nativeConfig) { n.paths[0].SourceModeInfo++ }},
+		{name: "details length", mutate: func(n *nativeConfig) { n.details[0] = nil }},
+		{name: "details pointer", mutate: func(n *nativeConfig) { n.targets[0][0].Details++ }},
+		{name: "unowned OS adapter pointer", mutate: func(n *nativeConfig) { n.paths[0].OSAdapterID = 1 }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			native := boundNativeConfig()
+			tt.mutate(native)
+			if err := native.validateBindings(); err == nil {
+				t.Fatal("validateBindings accepted a mutated binding")
+			}
+		})
+	}
+}
+
+func TestEveryWriteRevalidatesBindingsMutatedAfterValidation(t *testing.T) {
+	native := boundNativeConfig()
+	cfg := native.publish()
+	if _, err := nativeForWrite(cfg); err != nil {
+		t.Fatalf("initial payload: %v", err)
+	}
+
+	// Models the validate-only driver call changing an in/out count before the
+	// controller asks for the formal flags=0 set.
+	native.paths[0].TargetInfoCount = 2
+	if _, err := nativeForWrite(cfg); err == nil {
+		t.Fatal("formal write accepted bindings changed after validation")
+	}
+}
+
+func TestNativeForWriteRejectsNilAndEmptyPayloads(t *testing.T) {
+	var nilNative *nativeConfig
+	for _, cfg := range []*config{nil, {}, {native: nilNative}, {native: &nativeConfig{}}, {native: "not native"}} {
+		if _, err := nativeForWrite(cfg); err == nil {
+			t.Fatalf("nativeForWrite(%#v) succeeded", cfg)
+		}
+	}
+}
+
 // NvAPI_DISP_GetDisplayIdByDisplayName is the only narrow-string boundary in this
 // repository. \\.\DISPLAYn is pure ASCII, where UTF-8 and every Windows ANSI code
 // page agree; a name that is not must be refused rather than silently transcoded into
