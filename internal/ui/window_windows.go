@@ -23,6 +23,7 @@ import (
 	"github.com/Alien7666/change_resolution/internal/app"
 	"github.com/Alien7666/change_resolution/internal/display"
 	"github.com/Alien7666/change_resolution/internal/domain"
+	processcheck "github.com/Alien7666/change_resolution/internal/process"
 	"github.com/lxn/walk"
 	dec "github.com/lxn/walk/declarative"
 	"github.com/lxn/win"
@@ -42,6 +43,8 @@ const (
 
 	openConfigFolderText = "開啟設定檔所在資料夾"
 	resetConfigText      = "重新設定"
+	settingsText         = "設定…"
+	settingsManagedText  = "請先恢復原始解析度再變更設定"
 
 	// restoreButtonText carries no numbers. The mode a restore applies depends on the
 	// profile and on what the monitor reports, so it is rendered into the button's
@@ -67,7 +70,7 @@ const (
 	// The window gained the 自動恢復 line, and 恢復原始解析度 is a wider button than the
 	// 恢復 2K it replaced.
 	windowWidth  = 520
-	windowHeight = 330
+	windowHeight = 360
 
 	// monitorLabelBudget is how much of a monitor's name the fixed-width 目標螢幕 line
 	// shows before it is elided. Nothing is lost: the whole name is the line's tooltip.
@@ -85,11 +88,16 @@ const (
 	unnamedMonitor = "設定的顯示器"
 )
 
+type settingsDialogOpener func(*settingsModel, func(domain.Profile) error) (bool, error)
+
 // window owns every Walk object. All of its fields are read and written on the
 // Walk UI thread only.
 type window struct {
-	provider    *app.Provider
-	configState windowConfigState
+	provider     *app.Provider
+	displays     display.Controller
+	processes    processcheck.Lister
+	openSettings settingsDialogOpener
+	configState  windowConfigState
 
 	mw   *walk.MainWindow
 	tray *walk.NotifyIcon
@@ -99,19 +107,22 @@ type window struct {
 	toggle           *walk.CheckBox
 	autoRestoreLabel *walk.Label
 	statusLabel      *walk.TextLabel
+	settingsReason   *walk.TextLabel
+	settingsButton   *walk.PushButton
 	refreshButton    *walk.PushButton
 	openFolderButton *walk.PushButton
 	resetButton      *walk.PushButton
 	hideButton       *walk.PushButton
 	restoreButton    *walk.PushButton
 
-	showAction    *walk.Action
-	enableAction  *walk.Action
-	restoreAction *walk.Action
-	refreshAction *walk.Action
-	openAction    *walk.Action
-	resetAction   *walk.Action
-	exitAction    *walk.Action
+	showAction     *walk.Action
+	enableAction   *walk.Action
+	restoreAction  *walk.Action
+	refreshAction  *walk.Action
+	openAction     *walk.Action
+	resetAction    *walk.Action
+	settingsAction *walk.Action
+	exitAction     *walk.Action
 
 	busy              bool
 	suppressToggle    bool
@@ -125,12 +136,21 @@ type window struct {
 
 // Run builds the main window plus the notification-area icon and blocks on the
 // Walk message loop until the tray exit action ends the application.
-func Run(provider *app.Provider) error {
+func Run(provider *app.Provider, displays display.Controller, processes processcheck.Lister) error {
 	if provider == nil {
 		return errors.New("ui: provider must not be nil")
 	}
+	if displays == nil {
+		return errors.New("ui: display controller must not be nil")
+	}
+	if processes == nil {
+		return errors.New("ui: process lister must not be nil")
+	}
 
-	w := &window{provider: provider}
+	w := &window{provider: provider, displays: displays, processes: processes}
+	w.openSettings = func(model *settingsModel, replace func(domain.Profile) error) (bool, error) {
+		return showSettingsDialog(w.mw, model, replace)
+	}
 	if err := w.buildMainWindow(); err != nil {
 		return err
 	}
@@ -145,6 +165,11 @@ func Run(provider *app.Provider) error {
 		// closure, so it reads the provider again on the UI thread instead of rendering
 		// the snapshot captured by an old session's callback.
 		w.mw.Synchronize(func() { w.render(snapshotForRender(provider, notified)) })
+	})
+	w.mw.Starting().Once(func() {
+		if shouldOpenFirstRun(provider) {
+			w.onSettings(true)
+		}
 	})
 
 	// Startup is read-only. Refresh talks to Win32, so it runs off the UI thread
@@ -196,6 +221,13 @@ func (w *window) buildMainWindow() error {
 				AssignTo: &w.statusLabel,
 				Text:     "狀態：啟動中",
 				MinSize:  dec.Size{Height: 48},
+			},
+			dec.Composite{
+				Layout: dec.HBox{MarginsZero: true, Spacing: 8},
+				Children: []dec.Widget{
+					dec.PushButton{AssignTo: &w.settingsButton, Text: settingsText, OnClicked: func() { w.onSettings(false) }},
+					dec.TextLabel{AssignTo: &w.settingsReason, Text: "", MinSize: dec.Size{Height: 24}},
+				},
 			},
 			dec.Composite{
 				Layout: dec.HBox{MarginsZero: true, Spacing: 8},
@@ -278,6 +310,9 @@ func (w *window) buildTray() error {
 	if w.resetAction, err = newAction(resetConfigText, w.onReset); err != nil {
 		return err
 	}
+	if w.settingsAction, err = newAction(settingsText, func() { w.onSettings(false) }); err != nil {
+		return err
+	}
 	if w.exitAction, err = newAction(trayExitText, w.onExit); err != nil {
 		return err
 	}
@@ -290,6 +325,7 @@ func (w *window) buildTray() error {
 		w.refreshAction,
 		w.openAction,
 		w.resetAction,
+		w.settingsAction,
 		walk.NewSeparatorAction(),
 		w.exitAction,
 	}
@@ -368,13 +404,110 @@ func (w *window) onOpenFolder() {
 	w.runOperation(openFolderOperation, w.provider.OpenConfigFolder)
 }
 func (w *window) onReset() {
-	w.runOperation(resetOperation, func() error {
-		_, err := w.provider.Reset()
-		return err
-	})
+	if w.busy {
+		return
+	}
+	snapshot := w.provider.Snapshot()
+	w.syncConfigState()
+	if !w.availableControls(snapshot).reset {
+		return
+	}
+	w.showMainWindow()
+	w.busy = true
+	w.render(snapshot)
+
+	accepted, _, err := resetAndOpenSettings(
+		func() bool {
+			return walk.MsgBox(
+				w.mw,
+				windowTitle,
+				"要先備份目前讀不懂的設定檔，再重新設定嗎？",
+				walk.MsgBoxYesNo|walk.MsgBoxIconQuestion|walk.MsgBoxSetForeground,
+			) == walk.DlgCmdYes
+		},
+		w.provider.Reset,
+		func(backupPath string) (bool, error) {
+			walk.MsgBox(
+				w.mw,
+				windowTitle,
+				"原設定檔已備份至：\n"+backupPath,
+				walk.MsgBoxOK|walk.MsgBoxIconInformation|walk.MsgBoxSetForeground,
+			)
+			return w.showSettings(true)
+		},
+	)
+	w.busy = false
+	snapshot = w.provider.Snapshot()
+	w.render(snapshot)
+	if err != nil {
+		w.reportError(resetOperation, err, snapshot)
+		return
+	}
+	if accepted {
+		w.runOperation(refreshOperation, w.refresh)
+	}
+}
+func (w *window) onSettings(firstRun bool) {
+	if w.busy {
+		return
+	}
+	snapshot := w.provider.Snapshot()
+	w.syncConfigState()
+	if !w.availableControls(snapshot).settings {
+		return
+	}
+	w.showMainWindow()
+	w.busy = true
+	w.render(snapshot)
+
+	accepted, err := w.showSettings(firstRun)
+	w.busy = false
+	snapshot = w.provider.Snapshot()
+	w.render(snapshot)
+	if err != nil {
+		w.reportError("開啟設定", err, snapshot)
+		return
+	}
+	if accepted {
+		// Saving and replacing have already succeeded. This read is a separate status
+		// refresh, so a display read failure can never turn into a second config.Save.
+		w.runOperation(refreshOperation, w.refresh)
+	}
 }
 func (w *window) onHide() { w.hideToTray() }
 func (w *window) onShow() { w.showMainWindow() }
+
+func (w *window) showSettings(firstRun bool) (bool, error) {
+	if w.provider == nil || w.displays == nil || w.processes == nil || w.openSettings == nil {
+		return false, errors.New("設定介面缺少必要的執行元件")
+	}
+	profile := w.provider.Snapshot().Profile
+	if firstRun {
+		profile = domain.Profile{}
+	}
+	model := newSettingsModel(w.displays, w.processes, profile, firstRun)
+	return w.openSettings(model, w.provider.Replace)
+}
+
+func shouldOpenFirstRun(provider *app.Provider) bool {
+	return provider != nil && provider.Unconfigured()
+}
+
+func resetAndOpenSettings(
+	confirm func() bool,
+	reset func() (string, error),
+	open func(backupPath string) (bool, error),
+) (accepted bool, backupPath string, err error) {
+	if !confirm() {
+		return false, "", nil
+	}
+	backupPath, err = reset()
+	if err != nil {
+		return false, "", err
+	}
+	accepted, err = open(backupPath)
+	return accepted, backupPath, err
+}
 
 // refresh re-reads the display state through the session. It is the way out of
 // the unavailable latch: a monitor that was asleep or on another input when the
@@ -504,9 +637,15 @@ func (w *window) render(snapshot app.Snapshot) {
 	_ = w.statusLabel.SetText(w.statusText(snapshot))
 	_ = w.restoreButton.SetToolTipText(restoreTooltip(snapshot))
 	_ = w.refreshButton.SetText(w.refreshCaption())
+	settingsReason := settingsDisabledReason(snapshot)
+	_ = w.settingsReason.SetText(settingsReason)
+	w.settingsReason.SetVisible(settingsReason != "")
+	_ = w.settingsButton.SetToolTipText(settingsReason)
 
 	_ = w.enableAction.SetText(trayEnableText(snapshot))
 	_ = w.refreshAction.SetText(w.refreshCaption())
+	_ = w.settingsAction.SetText(settingsActionText(snapshot))
+	_ = w.settingsAction.SetToolTip(settingsReason)
 	_ = w.tray.SetToolTip(trayTooltip(snapshot))
 
 	// While an operation runs the checkbox reflects the user intent, not the
@@ -620,6 +759,7 @@ type controls struct {
 	refresh    bool
 	openFolder bool
 	reset      bool
+	settings   bool
 	hide       bool
 	show       bool
 	exit       bool
@@ -646,6 +786,7 @@ func (w *window) availableControls(snapshot app.Snapshot) controls {
 		refresh:    !w.busy,
 		openFolder: !w.busy,
 		reset:      !w.busy && w.configState == configStateReadOnly,
+		settings:   !w.busy && !snapshot.Managed && w.configState != configStateReadOnly,
 		hide:       true,
 		show:       true,
 		exit:       !w.busy,
@@ -661,6 +802,7 @@ func (w *window) applyEnabled(snapshot app.Snapshot) {
 	w.openFolderButton.SetEnabled(available.openFolder)
 	w.resetButton.SetEnabled(available.reset)
 	w.resetButton.SetVisible(w.configState == configStateReadOnly)
+	w.settingsButton.SetEnabled(available.settings)
 	w.hideButton.SetEnabled(available.hide)
 
 	_ = w.showAction.SetEnabled(available.show)
@@ -670,7 +812,22 @@ func (w *window) applyEnabled(snapshot app.Snapshot) {
 	_ = w.openAction.SetEnabled(available.openFolder)
 	_ = w.resetAction.SetEnabled(available.reset)
 	_ = w.resetAction.SetVisible(w.configState == configStateReadOnly)
+	_ = w.settingsAction.SetEnabled(available.settings)
 	_ = w.exitAction.SetEnabled(available.exit)
+}
+
+func settingsDisabledReason(snapshot app.Snapshot) string {
+	if snapshot.Managed {
+		return settingsManagedText
+	}
+	return ""
+}
+
+func settingsActionText(snapshot app.Snapshot) string {
+	if reason := settingsDisabledReason(snapshot); reason != "" {
+		return settingsText + "（" + reason + "）"
+	}
+	return settingsText
 }
 
 func (w *window) setToggleChecked(checked bool) {

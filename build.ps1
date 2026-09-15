@@ -1,5 +1,5 @@
 <#
-    Reproducible build for the VALORANT 4:3 display tray tool.
+    Reproducible build for the ResolutionTray display tray tool.
 
     Runs, in order, and stops loudly at the first failure:
       1. go generate  ./cmd/resolution-tray   (embeds the Common Controls 6 / DPI manifest)

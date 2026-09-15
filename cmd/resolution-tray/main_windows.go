@@ -16,8 +16,10 @@ import (
 )
 
 func main() {
-	provider := app.NewProvider(display.NewWindowsController(), processcheck.NewToolhelpChecker())
-	if err := ui.Run(provider); err != nil {
+	displays := display.NewWindowsController()
+	processes := processcheck.NewToolhelpChecker()
+	provider := app.NewProvider(displays, processes)
+	if err := ui.Run(provider, displays, processes); err != nil {
 		_ = provider.Shutdown()
 		log.Fatal(err)
 	}

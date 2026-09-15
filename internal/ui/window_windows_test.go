@@ -233,6 +233,7 @@ func (d *stubDisplays) resolveCount() int {
 type stubProcesses struct{}
 
 func (stubProcesses) Running(string) (bool, error) { return false, nil }
+func (stubProcesses) Names() ([]string, error)     { return []string{"game.exe"}, nil }
 
 // A latched window must keep one command live. Enable, Disable and Refresh are the
 // only producers of a fresh snapshot, and the first two are disabled here, so
@@ -271,8 +272,108 @@ func TestRefreshStaysAvailableWhileTheTargetIsUnavailable(t *testing.T) {
 func TestBusyWindowAcceptsNoCommand(t *testing.T) {
 	w := &window{busy: true}
 	got := w.availableControls(resolvedSnapshot())
-	if got.refresh || got.toggle || got.restore || got.enable || got.exit {
+	if got.refresh || got.toggle || got.restore || got.enable || got.settings || got.exit {
 		t.Fatalf("controls = %+v", got)
+	}
+}
+
+func TestSettingsEntryIsDisabledOnlyWhileManagedBusyOrReadOnly(t *testing.T) {
+	snapshot := resolvedSnapshot()
+	w := &window{configState: configStateConfigured}
+	if got := w.availableControls(snapshot); !got.settings {
+		t.Fatalf("idle configured controls = %+v", got)
+	}
+
+	snapshot.Managed = true
+	if got := w.availableControls(snapshot); got.settings {
+		t.Fatalf("managed controls = %+v", got)
+	}
+	if got := settingsDisabledReason(snapshot); got != "請先恢復原始解析度再變更設定" {
+		t.Fatalf("managed reason = %q", got)
+	}
+
+	w.busy = true
+	snapshot.Managed = false
+	if got := w.availableControls(snapshot); got.settings {
+		t.Fatalf("busy controls = %+v", got)
+	}
+
+	w.busy = false
+	w.configState = configStateUnconfigured
+	if got := w.availableControls(snapshot); !got.settings {
+		t.Fatalf("first-run controls = %+v", got)
+	}
+	w.configState = configStateReadOnly
+	if got := w.availableControls(snapshot); got.settings {
+		t.Fatalf("read-only controls = %+v", got)
+	}
+}
+
+func TestFirstRunSettingsUsesABlankDraftInTheSharedDialog(t *testing.T) {
+	displays := &stubDisplays{}
+	t.Setenv(config.EnvPath, filepath.Join(t.TempDir(), "missing", "config.json"))
+	provider := app.NewProvider(displays, stubProcesses{})
+	t.Cleanup(func() { _ = provider.Shutdown() })
+
+	opened := 0
+	w := &window{
+		provider:  provider,
+		displays:  displays,
+		processes: stubProcesses{},
+		openSettings: func(model *settingsModel, replace func(domain.Profile) error) (bool, error) {
+			opened++
+			if !model.firstRun {
+				t.Fatal("absent configuration did not open first-run mode")
+			}
+			draft := model.Draft()
+			if draft.Monitor.InstancePath != "" || draft.Monitor.HardwareID != "" || draft.GameMode != (domain.Mode{}) || draft.ProcessName != "" {
+				t.Fatalf("first-run draft inherited a configured profile: %#v", draft)
+			}
+			if replace == nil {
+				t.Fatal("shared dialog was not given Provider.Replace")
+			}
+			return false, nil
+		},
+	}
+
+	if !shouldOpenFirstRun(provider) {
+		t.Fatal("missing configuration did not schedule first-run settings")
+	}
+	accepted, err := w.showSettings(true)
+	if err != nil || accepted || opened != 1 {
+		t.Fatalf("accepted=%v opened=%d err=%v", accepted, opened, err)
+	}
+}
+
+func TestResetCancellationDoesNotBackupOrOpenSettings(t *testing.T) {
+	backups, opened := 0, 0
+	accepted, backupPath, err := resetAndOpenSettings(
+		func() bool { return false },
+		func() (string, error) { backups++; return `C:\scratch\config.bad.json`, nil },
+		func(string) (bool, error) { opened++; return false, nil },
+	)
+	if err != nil || accepted || backupPath != "" || backups != 0 || opened != 0 {
+		t.Fatalf("accepted=%v path=%q backups=%d opened=%d err=%v", accepted, backupPath, backups, opened, err)
+	}
+}
+
+func TestConfirmedResetPassesTheBackupPathBeforeOpeningFirstRunSettings(t *testing.T) {
+	const wantPath = `C:\Users\owner\AppData\Roaming\ResolutionTray\config.bad-20260916.json`
+	order := []string{}
+	accepted, backupPath, err := resetAndOpenSettings(
+		func() bool { order = append(order, "confirm"); return true },
+		func() (string, error) { order = append(order, "backup"); return wantPath, nil },
+		func(path string) (bool, error) {
+			order = append(order, "settings:"+path)
+			return true, nil
+		},
+	)
+	if err != nil || !accepted || backupPath != wantPath {
+		t.Fatalf("accepted=%v path=%q err=%v", accepted, backupPath, err)
+	}
+	wantOrder := []string{"confirm", "backup", "settings:" + wantPath}
+	if strings.Join(order, "|") != strings.Join(wantOrder, "|") {
+		t.Fatalf("order = %v, want %v", order, wantOrder)
 	}
 }
 
