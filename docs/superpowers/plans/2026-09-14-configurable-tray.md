@@ -998,7 +998,7 @@ This step is what turns the ordering rules from advice into structure, so it com
 
 Renaming on *every* set is harsher than the hardware (the measurement was one renumber in three sets), and that is the point: a code path that carries a name across a set fails deterministically in the test suite instead of probabilistically on the user's desktop. Wire the existing session fixture to a no-op scaling controller so every current test keeps passing unchanged — this step compiles and is green on its own.
 
-- [ ] **Step 2: Write the failing ordering and isolation tests**
+- [x] **Step 2: Write the failing ordering and isolation tests**
 
 ```go
 func TestEnableResolvesTheTargetAfterAnyScalingSetNotBefore(t *testing.T)          // R1
@@ -1036,13 +1036,13 @@ These are the tests the Step 1 shared recorder earns its keep on, and they are t
 
 The three failure-point tests each assert the whole end state, not just the error: which of `managed`, `saved`, `scalingOwned` and `scalingSaved` changed, where the desktop ended up, how many display applies and NVAPI sets happened, whether the watcher was restored, and whether the toggle is usable afterwards. Failure point 1 additionally asserts the NVAPI fake was **never called at all**, and failure point 3 asserts the session ends in exactly the ordinary unmanaged state plus whatever that successful scaling write left behind — no half-ownership, no special recovery path, and no rollback of a write that really happened.
 
-- [ ] **Step 3: Run them and confirm they fail for the right reason**
+- [x] **Step 3: Run them and confirm they fail for the right reason**
 
 Run: `go test ./internal/app -run 'Scaling|Cycle'`
 
 Expected: FAIL. Read the failures — any that fail with "device does not exist" rather than an assertion mismatch is the recorder doing its job and pointing at a real stale-name path.
 
-- [ ] **Step 4: Implement the session side**
+- [x] **Step 4: Implement the session side**
 
 Three scaling fields, parallel to and independent of `managed` / `saved`, plus one watcher field that belongs to the display side:
 
@@ -1073,11 +1073,11 @@ Add `StateScalingCycle`, held for the whole cycle with the status line naming th
 
 At the tail of every workflow, re-read the target so `Snapshot.Target.DeviceName` is not a name that a set invalidated. The UI never calls anything with that name, but a stale one on screen destroys the user's trust in the rest of the window.
 
-- [ ] **Step 5: Wire the composition root**
+- [x] **Step 5: Wire the composition root**
 
 `main_windows.go` constructs `scaling.NewWindowsController()` and hands it to the provider, which hands it to each session it builds and `Close()`s it when the process ends. A machine with no NVIDIA driver produces a controller whose `Probe` reports unavailable with a reason; nothing fails and nothing changes.
 
-- [ ] **Step 6: Verify and commit the session integration**
+- [x] **Step 6: Verify and commit the session integration**
 
 ```powershell
 gofmt -l ./internal ./cmd
