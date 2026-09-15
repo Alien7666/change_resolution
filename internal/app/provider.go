@@ -13,6 +13,7 @@ import (
 	"github.com/Alien7666/change_resolution/internal/display"
 	"github.com/Alien7666/change_resolution/internal/domain"
 	"github.com/Alien7666/change_resolution/internal/process"
+	"github.com/Alien7666/change_resolution/internal/scaling"
 )
 
 var (
@@ -75,6 +76,11 @@ type Provider struct {
 	processes process.Checker
 	store     providerStore
 
+	// scalings is shared by every session this provider builds and outlives all of
+	// them: the NVAPI handle is a process-wide resource, so it is unloaded once, here,
+	// when the process ends rather than when a profile changes.
+	scalings scaling.Controller
+
 	session    *Session
 	state      providerConfigState
 	path       string
@@ -99,13 +105,39 @@ type Provider struct {
 // NewProvider loads the user's configuration without writing it and constructs the
 // corresponding startup state. A load rejection is data for the UI, not a process
 // startup failure, so this constructor always returns a usable provider.
+//
+// It builds sessions with no GPU-scaling support. That is the honest state for a
+// caller that has no controller to give -- the scaling row reports itself unavailable
+// and nothing else in the window changes.
 func NewProvider(displays display.Controller, processes process.Checker) *Provider {
 	return newProvider(displays, processes, diskProviderStore{})
 }
 
+// NewProviderWithScaling is the composition root's constructor. The provider hands the
+// controller to every session it builds and closes it when the process ends.
+func NewProviderWithScaling(
+	displays display.Controller,
+	processes process.Checker,
+	scalings scaling.Controller,
+) *Provider {
+	return newScalingProvider(displays, processes, scalings, diskProviderStore{})
+}
+
 func newProvider(displays display.Controller, processes process.Checker, store providerStore) *Provider {
+	return newScalingProvider(displays, processes, nil, store)
+}
+
+func newScalingProvider(
+	displays display.Controller,
+	processes process.Checker,
+	scalings scaling.Controller,
+	store providerStore,
+) *Provider {
+	if scalings == nil {
+		scalings = unavailableScaling{}
+	}
 	p := &Provider{
-		displays: displays, processes: processes, store: store,
+		displays: displays, processes: processes, scalings: scalings, store: store,
 		notify: make(chan struct{}, 1), notifyStop: make(chan struct{}),
 	}
 	go p.dispatchChanges()
@@ -316,6 +348,11 @@ func (p *Provider) Shutdown() error {
 	p.opMu.Unlock()
 	if err == nil {
 		p.stopNotifications()
+		// The NVAPI handle is unloaded once the last session has already put back what
+		// it owned. A failure to unload is deliberately not returned: it cannot leave
+		// the desktop wrong, and Shutdown's error is what decides whether the tool is
+		// allowed to exit.
+		_ = p.scalings.Close()
 	}
 	return err
 }
@@ -373,7 +410,7 @@ func (p *Provider) installLoaded(file config.File, loadErr error) {
 }
 
 func (p *Provider) installSession(profile domain.Profile, file config.File) {
-	session := NewSession(p.displays, p.processes, profile)
+	session := NewSession(p.displays, p.processes, p.scalings, profile)
 	p.writeMu.Lock()
 	p.mu.Lock()
 	p.generation++

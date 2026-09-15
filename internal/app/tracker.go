@@ -16,8 +16,14 @@ type gameTracker struct {
 	fired     bool
 }
 
-func newGameTracker(delay time.Duration) *gameTracker {
-	return &gameTracker{delay: delay}
+// newGameTracker starts a tracker whose countdown has not begun. seen carries "the
+// watched process has been seen running during this ownership" across a watcher
+// replacement; missing, missingAt and fired never carry, which is the whole reason a
+// replacement gets a new object rather than the old one. A half-elapsed countdown that
+// survived would restore at a moment nobody asked for, and a fired tracker would never
+// arm a second time.
+func newGameTracker(delay time.Duration, seen bool) *gameTracker {
+	return &gameTracker{delay: delay, seen: seen}
 }
 
 func (t *gameTracker) Observe(running bool, now time.Time) trackerResult {

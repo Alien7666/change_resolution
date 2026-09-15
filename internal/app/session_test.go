@@ -11,6 +11,7 @@ import (
 
 	"github.com/Alien7666/change_resolution/internal/display"
 	"github.com/Alien7666/change_resolution/internal/domain"
+	"github.com/Alien7666/change_resolution/internal/scaling"
 )
 
 type displayCall struct {
@@ -299,6 +300,18 @@ func newFixture(t *testing.T) *sessionFixture {
 // contiguous four does not model.
 func newFixtureWith(t *testing.T, profile domain.Profile, original domain.Mode, desktop domain.Layout) *sessionFixture {
 	t.Helper()
+	return newFixtureWrapped(t, profile, original, desktop, nil)
+}
+
+// newFixtureWrapped is newFixtureWith with one seam: build is handed the fake desktop
+// this function just assembled and returns the pair of controllers the session is
+// actually constructed with. That is how the Task 15 renaming fakes get between the
+// session and this file's fake without this file having to know what GPU scaling is.
+// A nil build, or a nil scaling controller from it, leaves the session with no scaling
+// support, which is the state every test written before Task 15 assumes.
+func newFixtureWrapped(t *testing.T, profile domain.Profile, original domain.Mode, desktop domain.Layout,
+	build func(*fakeDisplay) (display.Controller, scaling.Controller)) *sessionFixture {
+	t.Helper()
 	targets := make([]domain.Target, len(desktop.Displays))
 	for i, state := range desktop.Displays {
 		targets[i] = domain.Target{
@@ -320,22 +333,27 @@ func newFixtureWith(t *testing.T, profile domain.Profile, original domain.Mode, 
 			targets[i] = configuredTarget
 		}
 	}
-	displays := &fakeDisplay{
+	fake := &fakeDisplay{
 		target:  configuredTarget,
 		targets: targets,
 		current: original, layout: desktop, fail: make(map[string]error),
 	}
+	var displays display.Controller = fake
+	var scalings scaling.Controller
+	if build != nil {
+		displays, scalings = build(fake)
+	}
 	checker := &fakeChecker{called: make(chan string, 8), results: make(chan processResult), closed: make(chan struct{})}
 	clock := &fakeClock{now: time.Unix(100, 0)}
-	f := &sessionFixture{display: displays, checker: checker, clock: clock, profile: profile, original: original, changes: make(chan Snapshot, 128)}
-	f.s = newSession(displays, checker, profile, clock)
+	f := &sessionFixture{display: fake, checker: checker, clock: clock, profile: profile, original: original, changes: make(chan Snapshot, 128)}
+	f.s = newSession(displays, checker, scalings, profile, clock)
 	f.s.SetOnChange(func(snapshot Snapshot) { f.changes <- snapshot })
 	t.Cleanup(func() {
 		close(checker.closed)
-		displays.mu.Lock()
-		displays.fail = make(map[string]error)
-		displays.hook = nil
-		displays.mu.Unlock()
+		fake.mu.Lock()
+		fake.fail = make(map[string]error)
+		fake.hook = nil
+		fake.mu.Unlock()
 		if err := f.s.Shutdown(); err != nil {
 			t.Errorf("cleanup Shutdown: %v", err)
 		}
@@ -829,6 +847,47 @@ func TestFailedShutdownRestoreKeepsTheWatcherRunning(t *testing.T) {
 // Nothing prompts the user when the delayed restore fails, so the session records
 // the failure for the UI to announce. It must count one failure per restore, not
 // one per poll, and it must keep watching so a later game exit can try again.
+// TestTheKeepAliveWatcherRetriesByItselfAfterAFullDelay covers the one behaviour that
+// changed outside the scaling cycle. The replacement watcher now starts from a tracker
+// seeded with gameSeen, so a failed automatic restore is retried after one further full
+// delay instead of waiting for the game to be seen running a second time -- which is
+// what ensureWatcher's comment has always promised. fired is still not carried over, so
+// the two attempts are always a whole delay apart rather than one poll apart.
+func TestTheKeepAliveWatcherRetriesByItselfAfterAFullDelay(t *testing.T) {
+	f := newFixture(t)
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.poll(t, 0, 1, processResult{running: true})
+	f.poll(t, 0, 2, processResult{})
+
+	failure := errors.New("driver refused the mode change")
+	f.display.setFailure("apply", failure)
+	f.tick(t, 0, 5, processResult{})
+	f.waitSnapshot(t, func(snapshot Snapshot) bool { return snapshot.AutoRestoreFailures > 0 })
+	f.display.setFailure("apply", nil)
+	f.display.takeCalls()
+
+	// The game is never seen running again on this watcher.
+	if got := f.poll(t, 1, 6, processResult{}); got.State != StateRestorePending {
+		t.Fatalf("the replacement watcher did not arm itself: %+v", got)
+	}
+	if got := f.poll(t, 1, 8, processResult{}); got.State != StateRestorePending {
+		t.Fatalf("retried before the full delay elapsed: %+v", got)
+	}
+	if calls := f.display.takeCalls(); len(calls) != 0 {
+		t.Fatalf("retried before the full delay elapsed: %+v", calls)
+	}
+	got := f.poll(t, 1, 9, processResult{})
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "targets", "test", "apply")
+	if got.Managed || got.CurrentMode != f.original || got.State != StateNative {
+		t.Fatalf("the retry did not restore: %+v", got)
+	}
+	if got.AutoRestoreFailures != 1 {
+		t.Fatalf("failures = %d, want the one failed attempt", got.AutoRestoreFailures)
+	}
+}
+
 func TestFailedAutomaticRestoreIsCountedOnceAndKeepsTheWatcherRunning(t *testing.T) {
 	f := newFixture(t)
 	if err := f.s.Enable(); err != nil {
@@ -858,9 +917,11 @@ func TestFailedAutomaticRestoreIsCountedOnceAndKeepsTheWatcherRunning(t *testing
 	}
 
 	// The game is still gone. Polling it must not retry the restore, or the UI
-	// would raise one notification per second.
+	// would raise one notification per second. The replacement watcher inherits the
+	// seen flag and nothing else, so it counts down from this first absent poll rather
+	// than firing again immediately.
 	for _, second := range []int{6, 7, 8} {
-		if got := f.poll(t, 1, second, processResult{}); got.State != StateWaitingForGame {
+		if got := f.poll(t, 1, second, processResult{}); got.State != StateRestorePending {
 			t.Fatalf("at %ds: snapshot = %+v", second, got)
 		}
 	}

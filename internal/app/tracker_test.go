@@ -7,7 +7,7 @@ import (
 
 func TestTrackerRestoresOnlyAfterSeenGameHasBeenMissingForDelay(t *testing.T) {
 	now := time.Unix(100, 0)
-	tracker := newGameTracker(3 * time.Second)
+	tracker := newGameTracker(3*time.Second, false)
 	if got := tracker.Observe(false, now); got.SeenGame || got.ShouldRestore {
 		t.Fatalf("unseen observation = %+v", got)
 	}
@@ -30,7 +30,7 @@ func TestTrackerRestoresOnlyAfterSeenGameHasBeenMissingForDelay(t *testing.T) {
 
 func TestTrackerCancelsPendingRestoreWhenGameReturns(t *testing.T) {
 	now := time.Unix(100, 0)
-	tracker := newGameTracker(3 * time.Second)
+	tracker := newGameTracker(3*time.Second, false)
 	tracker.Observe(true, now)
 	tracker.Observe(false, now.Add(time.Second))
 	if got := tracker.Observe(true, now.Add(3*time.Second)); !got.RestoreAt.IsZero() || got.ShouldRestore {
@@ -46,7 +46,7 @@ func TestTrackerCancelsPendingRestoreWhenGameReturns(t *testing.T) {
 }
 
 func TestTrackerNeverRestoresWhenGameWasNeverSeen(t *testing.T) {
-	tracker := newGameTracker(3 * time.Second)
+	tracker := newGameTracker(3*time.Second, false)
 	for _, seconds := range []int64{0, 100, 1000000} {
 		got := tracker.Observe(false, time.Unix(seconds, 0))
 		if got.SeenGame || got.ShouldRestore || !got.RestoreAt.IsZero() {
@@ -56,7 +56,7 @@ func TestTrackerNeverRestoresWhenGameWasNeverSeen(t *testing.T) {
 }
 
 func TestTrackerHandlesZeroTimeAsFirstAbsence(t *testing.T) {
-	tracker := newGameTracker(3 * time.Second)
+	tracker := newGameTracker(3*time.Second, false)
 	tracker.Observe(true, time.Time{})
 	tracker.Observe(false, time.Time{})
 	if !tracker.Observe(false, time.Time{}.Add(3*time.Second)).ShouldRestore {

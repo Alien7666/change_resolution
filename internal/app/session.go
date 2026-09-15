@@ -11,6 +11,7 @@ import (
 	"github.com/Alien7666/change_resolution/internal/display"
 	"github.com/Alien7666/change_resolution/internal/domain"
 	"github.com/Alien7666/change_resolution/internal/process"
+	"github.com/Alien7666/change_resolution/internal/scaling"
 )
 
 type State string
@@ -30,6 +31,12 @@ const (
 	StateRestorePending State = "restore-pending"
 	StateRestoring      State = "restoring"
 	StateError          State = "error"
+
+	// StateScalingCycle is a scaling change made while this session owns an applied
+	// mode. It is one state for the whole of it rather than three, because the user
+	// pressed one button and can do nothing until all of it is over; the status line
+	// names the phase instead.
+	StateScalingCycle State = "scaling-cycle"
 )
 
 var ErrClosed = errors.New("display session is closed")
@@ -41,6 +48,35 @@ var ErrClosed = errors.New("display session is closed")
 // question genuinely unanswered. The session refuses rather than substituting a mode
 // nobody chose.
 var ErrFallbackUnknown = errors.New("無法決定要恢復的顯示模式")
+
+// ScalingSnapshot is everything the window renders about GPU scaling. It is a second,
+// wholly independent availability state: nothing in it may disable the display-mode
+// controls, because a missing NVIDIA driver says nothing about whether a display mode
+// can be set.
+type ScalingSnapshot struct {
+	// Available and Reason are this button's own enablement. Reason is actionable text
+	// -- which vendor, which driver, which monitor -- and belongs beside the button.
+	Available bool
+	Reason    string
+
+	// Known says Effective was reported by the driver rather than assumed. The tool
+	// never infers a scaling value it did not read.
+	Known     bool
+	Effective scaling.Value
+
+	// Requested is the value of this session's last attempted write. A driver that
+	// normalises that write leaves Matched false, which is not an error and not a
+	// failure to recover from: both values are shown and the button is not drawn as on.
+	Requested      scaling.Value
+	RequestedKnown bool
+	Matched        bool
+
+	// Owned is true only while this run has a successful change of its own to undo, and
+	// Saved is the effective value read immediately before that change. Together they
+	// are the restore button's label and the value Shutdown puts back.
+	Owned bool
+	Saved scaling.Value
+}
 
 type Snapshot struct {
 	State       State
@@ -83,6 +119,10 @@ type Snapshot struct {
 	// the counter to raise exactly one notification per failed automatic restore
 	// instead of one per poll.
 	AutoRestoreFailures uint64
+
+	// Scaling is the GPU-scaling row, kept whole and separate so that no scaling
+	// failure can reach the display half's availability.
+	Scaling ScalingSnapshot
 }
 
 type sessionTicker interface {
@@ -109,6 +149,13 @@ type sessionWatcher struct {
 	done   chan struct{}
 }
 
+// cyclePhase is the public face of a running scaling cycle. It masks the published
+// snapshot; it never replaces the stored one. See viewLocked.
+type cyclePhase struct {
+	active  bool
+	message string
+}
+
 // displayBinding is the part of a monitor identity that can prove a saved DISPLAYn
 // still names the same physical monitor. Labels are deliberately absent. The exact
 // interface path is preferred; when Windows cannot report one, an exact full hardware
@@ -126,13 +173,14 @@ const (
 // Session owns the saved desktop layout only after this instance successfully applies
 // GameMode.
 // opMu serializes complete workflows. mu protects snapshots and notifications only;
-// no external display, process, or callback code runs while mu is held.
+// no external display, process, scaling, or callback code runs while mu is held.
 type Session struct {
 	opMu sync.Mutex
 	mu   sync.Mutex
 
 	displays  display.Controller
 	processes process.Checker
+	scalings  scaling.Controller
 	profile   domain.Profile
 	clock     sessionClock
 
@@ -152,7 +200,27 @@ type Session struct {
 	watchers            sync.WaitGroup
 	shutdownDone        chan struct{}
 
-	snapshot            Snapshot
+	// The scaling trio is parallel to managed/saved and completely independent of it.
+	// scalingOwned is true only after this run successfully changed the value;
+	// scalingSaved is the effective value read immediately before that change, never
+	// inferred; scalingID is the displayId ownership was taken on, which is what a
+	// restore is checked against so it cannot land on another monitor.
+	scalingOwned bool
+	scalingSaved scaling.Value
+	scalingID    uint32
+
+	// gameSeen has exactly managed's lifetime: "the watched process has been seen
+	// running during this ownership". It is the only field a replacement watcher
+	// inherits. The countdown is never inherited -- missing, missingAt and fired always
+	// start at zero -- which is why the tracker object is replaced rather than reused.
+	gameSeen bool
+
+	snapshot Snapshot
+
+	// cycle is guarded by mu, not opMu, because viewLocked reads it on the notification
+	// and Snapshot paths.
+	cycle cyclePhase
+
 	onChange            func(Snapshot)
 	handlerVersion      uint64
 	notify              chan struct{}
@@ -162,18 +230,35 @@ type Session struct {
 }
 
 // NewSession creates an idle session. Refresh is the explicit read-only startup probe.
-func NewSession(displays display.Controller, processes process.Checker, profile domain.Profile) *Session {
-	return newSession(displays, processes, profile, realClock{})
+// A nil scaling controller is a session with no GPU-scaling support, which reports
+// itself as unavailable rather than panicking at the first press.
+func NewSession(
+	displays display.Controller,
+	processes process.Checker,
+	scalings scaling.Controller,
+	profile domain.Profile,
+) *Session {
+	return newSession(displays, processes, scalings, profile, realClock{})
 }
 
-func newSession(displays display.Controller, processes process.Checker, profile domain.Profile, clock sessionClock) *Session {
+func newSession(
+	displays display.Controller,
+	processes process.Checker,
+	scalings scaling.Controller,
+	profile domain.Profile,
+	clock sessionClock,
+) *Session {
 	// The session owns its configuration outright. A caller that kept the profile it
 	// passed in must not be able to reach through FallbackMode and change what a
 	// restore applies half a session later.
 	profile = profile.Copy()
 	derived := configuredFallback(profile)
+	if scalings == nil {
+		scalings = unavailableScaling{}
+	}
 	s := &Session{
-		displays: displays, processes: processes, profile: profile, clock: clock,
+		displays: displays, processes: processes, scalings: scalings,
+		profile: profile, clock: clock,
 		fallback: derived,
 		snapshot: Snapshot{
 			State:          StateNative,
@@ -209,7 +294,26 @@ func (s *Session) SetOnChange(fn func(Snapshot)) {
 func (s *Session) Snapshot() Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.snapshot
+	return s.viewLocked()
+}
+
+// viewLocked is what the outside world sees. During a scaling cycle s.managed
+// legitimately goes false between the display restore and the re-apply, and s.snapshot
+// records that honestly -- but Snapshot.Managed's only consumers are the window's
+// control enablement and its restore button, so letting it flip mid-cycle would draw
+// the toggle as "off" at the one moment pressing it would mean nothing. The stored
+// truth is masked, never overwritten, so every exit from the cycle publishes the fact
+// without anything having to be undone.
+func (s *Session) viewLocked() Snapshot {
+	snapshot := s.snapshot
+	if !s.cycle.active {
+		return snapshot
+	}
+	snapshot.State = StateScalingCycle
+	snapshot.Message = s.cycle.message
+	snapshot.Err = nil
+	snapshot.Managed = true
+	return snapshot
 }
 
 func (s *Session) updateSnapshot(change func(*Snapshot)) {
@@ -218,6 +322,26 @@ func (s *Session) updateSnapshot(change func(*Snapshot)) {
 	change(&s.snapshot)
 	s.snapshot.Revision++
 	s.signalChangeLocked()
+}
+
+// cyclePhase names the step a running cycle is on and publishes it. The revision is
+// bumped on the stored snapshot so the notification actually goes out, even though
+// nothing the steps themselves wrote has changed.
+func (s *Session) cyclePhase(message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cycle = cyclePhase{active: true, message: message}
+	s.snapshot.Revision++
+	s.signalChangeLocked()
+}
+
+// endCycle stops the masking. It deliberately publishes nothing: every caller states
+// the cycle's real end immediately afterwards, and a bare un-masking in between would
+// show one notification's worth of half-finished fact.
+func (s *Session) endCycle() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cycle = cyclePhase{}
 }
 
 func (s *Session) signalChangeLocked() {
@@ -239,7 +363,7 @@ func (s *Session) dispatchChanges() {
 			return
 		case <-s.notify:
 			s.mu.Lock()
-			fn, snapshot, version, stopped := s.onChange, s.snapshot, s.handlerVersion, s.notificationsClosed
+			fn, snapshot, version, stopped := s.onChange, s.viewLocked(), s.handlerVersion, s.notificationsClosed
 			s.mu.Unlock()
 			if stopped {
 				return
@@ -485,6 +609,10 @@ func (s *Session) Refresh() (Snapshot, error) {
 		return s.Snapshot(), ErrClosed
 	}
 	_, _, err := s.readCurrent()
+	// Re-probing is part of a refresh: the user may have just installed the driver.
+	// Its outcome is deliberately dropped rather than merged into err -- a GPU-scaling
+	// failure is never allowed to make the display half look broken.
+	_ = s.refreshScalingView()
 	if err == nil && !s.managed {
 		s.state(StateNative, "已讀取目前顯示模式")
 	}
@@ -501,27 +629,42 @@ func (s *Session) Enable() error {
 		return nil
 	}
 	s.state(StateApplying, "正在驗證並套用 "+s.gameModeLabel())
+	_, _, err := s.applyGameMode()
+	return err
+}
+
+// applyGameMode is R1's display half and the only place display ownership is taken.
+// Everything it needs is read here and now: a fresh target, a fresh layout, a fresh
+// plan. It reuses nothing from before it was called, which is exactly what lets the
+// scaling cycle call it immediately after an NVAPI set without carrying a device name
+// across that set.
+//
+// The caller owns the opening status line, because Enable and the cycle describe the
+// same work to the user differently. The state and message this settles on are
+// returned so a caller whose publication was masked can restate them.
+func (s *Session) applyGameMode() (State, string, error) {
 	target, layout, current, err := s.readLayout()
 	if err != nil {
-		return err
+		return StateError, "", err
 	}
 	if current.Mode == s.profile.GameMode {
-		s.state(StateNative, "目前已是 "+s.gameModeLabel()+"；可手動恢復原始顯示模式")
-		return nil
+		message := "目前已是 " + s.gameModeLabel() + "；可手動恢復原始顯示模式"
+		s.state(StateNative, message)
+		return StateNative, message, nil
 	}
 	plan, err := display.PlanModeChange(layout, target.DeviceName, s.profile.GameMode)
 	if err != nil {
-		return s.fail("plan display layout", err)
+		return StateError, "", s.fail("plan display layout", err)
 	}
 	bindings, err := s.readDisplayBindings(layout)
 	if err != nil {
-		return s.fail("read display identities", err)
+		return StateError, "", s.fail("read display identities", err)
 	}
 	if err := verifyResolvedBinding(target, bindings); err != nil {
-		return s.fail("bind target display", err)
+		return StateError, "", s.fail("bind target display", err)
 	}
 	if err := s.apply(target, s.profile.GameMode, plan); err != nil {
-		return err
+		return StateError, "", err
 	}
 	s.saved, s.savedBindings = layout, bindings
 	s.managedTargetDevice, s.managed = target.DeviceName, true
@@ -534,7 +677,7 @@ func (s *Session) Enable() error {
 		snapshot.State, snapshot.Message, snapshot.Err = state, message, nil
 	})
 	s.startWatcher()
-	return nil
+	return state, message, nil
 }
 
 // apply pre-flights the target's mode and only then applies the whole arrangement.
@@ -542,6 +685,11 @@ func (s *Session) Enable() error {
 // between it and the desktop is the driver; the display layer applies the displays
 // in an order that never overlaps them, rolls back what it already changed if a
 // call fails, and reports a desktop that did not end up matching the plan.
+//
+// No NVAPI set ever happens inside this call or the ApplyLayout beneath it: that
+// rollback state is keyed by device name, and a set in the middle of it would
+// invalidate the whole undo set halfway through. opMu serializes workflows, but "sets
+// only at the boundary" is not something a lock can express, so it is stated here.
 func (s *Session) apply(target domain.Target, mode domain.Mode, plan domain.LayoutPlan) error {
 	if err := s.displays.TestMode(target, mode); err != nil {
 		return s.fail("test display mode", err)
@@ -574,8 +722,10 @@ func joinWatcher(watcher *sessionWatcher) {
 // still owns the applied mode: the automatic restore is then the only thing left
 // that can return the display without another click. Callers hold opMu, and the
 // replacement starts from a fresh tracker on purpose — a tracker that already
-// fired its restore would never arm another one. A watcher goroutine may call
-// this: it replaces itself and must not join the watcher it stopped.
+// fired its restore would never arm another one. Only gameSeen is carried over, so
+// the replacement re-arms after one further full delay instead of waiting for the
+// game to be seen running a second time. A watcher goroutine may call this: it
+// replaces itself and must not join the watcher it stopped.
 func (s *Session) ensureWatcher() {
 	if s.closed || !s.managed || s.watcher != nil {
 		return
@@ -708,6 +858,10 @@ func (s *Session) finishRestore(target domain.Target, mode domain.Mode, plan dom
 	s.saved = domain.Layout{}
 	s.savedBindings = nil
 	s.managedTargetDevice = ""
+	// gameSeen has managed's lifetime, so releasing ownership ends it. The scaling
+	// cycle carries the flag across this point by hand, because there the ownership
+	// really does continue -- it is only being put down and picked straight back up.
+	s.gameSeen = false
 	s.updateSnapshot(func(snapshot *Snapshot) {
 		snapshot.Target, snapshot.CurrentMode = target, mode
 		snapshot.MatchedBy = target.MatchedBy
@@ -734,6 +888,10 @@ func (s *Session) Shutdown() error {
 		joinWatcher(watcher)
 		return err
 	}
+	// R2 at exit: the display goes back first, and only then does the scaling value.
+	// This is leave-only -- it puts back scalingSaved and applies nothing -- which is
+	// what makes it a different shape from the cycle rather than a lesser version of it.
+	s.restoreScalingAtExit()
 	s.closed = true
 	s.mu.Lock()
 	s.notificationsClosed = true
@@ -745,6 +903,28 @@ func (s *Session) Shutdown() error {
 	<-s.notifyDone
 	close(s.shutdownDone)
 	return nil
+}
+
+// restoreScalingAtExit puts back the value this run changed and then gets out of the
+// way. A failure here never stops the exit: the value is runtime-only and a reboot or
+// a driver reload undoes it, while a tool that cannot be closed is a worse outcome
+// than a scaling setting left changed. A display restore failure, by contrast, does
+// hold the tool open, because a desktop in the wrong mode really is broken.
+//
+// The failure is left visible in the snapshot instead of returned: Scaling.Owned stays
+// true, which is the structural signal that the value was not put back.
+func (s *Session) restoreScalingAtExit() {
+	if !s.scalingOwned {
+		return
+	}
+	outcome, err := s.setScaling(true)
+	s.bookScaling(true, outcome, err)
+	if err != nil {
+		failure := fmt.Errorf("退出時還原 GPU 縮放設定失敗：%w", err)
+		s.finishScaling(outcome, StateError, failure.Error(), failure)
+		return
+	}
+	s.publishScalingView(outcome)
 }
 
 // waitingMessage is what the session says while it owns the mode and the watched
@@ -763,6 +943,9 @@ func (s *Session) startWatcher() {
 	}
 	s.generation++
 	generation := s.generation
+	// Only the seen flag is inherited, and it is read here, under opMu, rather than
+	// from inside the goroutine.
+	seen := s.gameSeen
 	ctx, cancel := context.WithCancel(context.Background())
 	watcher := &sessionWatcher{cancel: cancel, done: make(chan struct{})}
 	s.watcher = watcher
@@ -772,7 +955,7 @@ func (s *Session) startWatcher() {
 		defer s.watchers.Done()
 		defer close(watcher.done)
 		defer ticker.Stop()
-		tracker := newGameTracker(s.profile.RestoreDelay)
+		tracker := newGameTracker(s.profile.RestoreDelay, seen)
 		for {
 			select {
 			case <-ctx.Done():
@@ -793,6 +976,11 @@ func (s *Session) startWatcher() {
 func (s *Session) observeGame(generation uint64, tracker *gameTracker, running bool, err error) bool {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
+	// The generation check is what stops a poll that came due during a scaling cycle:
+	// stopWatcher bumps it before cancelling, so a poll already waiting at this gate
+	// returns here without its tracker ever being consulted. The managed check stops
+	// it a second, independent time -- s.managed legitimately goes false in the middle
+	// of a cycle, and that false must never be read as "the game ended, restore now".
 	if s.closed || !s.managed || generation != s.generation {
 		return false
 	}
@@ -801,6 +989,9 @@ func (s *Session) observeGame(generation uint64, tracker *gameTracker, running b
 		return true
 	}
 	result := tracker.Observe(running, s.clock.Now())
+	if result.SeenGame {
+		s.gameSeen = true
+	}
 	if result.ShouldRestore {
 		s.stopWatcher()
 		// This goroutine must not join itself; it exits immediately after restoration.
@@ -824,3 +1015,383 @@ func (s *Session) observeGame(generation uint64, tracker *gameTracker, running b
 	}
 	return true
 }
+
+// ScalingFullScreenByGPU is the one value the apply button writes: full-screen scaling
+// performed by the GPU. It is a function rather than a package variable so that no
+// caller can change what this product means by "設為全螢幕縮放（GPU）".
+func ScalingFullScreenByGPU() scaling.Value {
+	return scaling.Value{Raw: 2, Mode: scaling.ModeFullScreen, By: scaling.ByGPU}
+}
+
+// ApplyGPUScaling asks the driver for full-screen scaling performed by the GPU. While
+// this session owns an applied mode the press runs the whole cycle rather than being
+// refused: the moment a user notices black bars is precisely the moment the game mode
+// is on, so a button disabled exactly then is a button that does not exist.
+func (s *Session) ApplyGPUScaling() error { return s.changeScaling(false) }
+
+// RestoreGPUScaling puts back the effective value this run read immediately before it
+// changed the setting. It is a quiet no-op when this run changed nothing: the tool
+// never writes a scaling value it did not first read as the user's own. The two
+// buttons are otherwise identical, including running the cycle while managed.
+func (s *Session) RestoreGPUScaling() error { return s.changeScaling(true) }
+
+// RefreshScaling re-probes the driver and re-reads the effective value. Both are
+// reads, so it is safe on the startup path that must not change anything, and
+// re-probing is what lets a user who just installed the driver get the button back.
+func (s *Session) RefreshScaling() (Snapshot, error) {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if s.closed {
+		return s.Snapshot(), ErrClosed
+	}
+	err := s.refreshScalingView()
+	return s.Snapshot(), err
+}
+
+func (s *Session) changeScaling(restore bool) error {
+	s.opMu.Lock()
+	if s.closed {
+		s.opMu.Unlock()
+		return ErrClosed
+	}
+	if restore && !s.scalingOwned {
+		s.opMu.Unlock()
+		return nil
+	}
+	if !s.managed {
+		err := s.writeScaling(restore)
+		s.opMu.Unlock()
+		return err
+	}
+	// R5. The watcher is stopped inside opMu and joined outside it, for the same reason
+	// Disable does: that goroutine may already be blocked on this very lock.
+	watcher := s.stopWatcher()
+	err := s.runScalingCycle(restore)
+	s.opMu.Unlock()
+	joinWatcher(watcher)
+	return err
+}
+
+// writeScaling is a scaling change made while this session owns no display mode: one
+// NVAPI set, then a fresh read of the target. There is no saved arrangement in flight,
+// so R1 and R2 have nothing to order here -- only the tail read matters, because the
+// set may have renumbered the name the window is showing.
+func (s *Session) writeScaling(restore bool) error {
+	s.state(StateApplying, scalingWriteMessage(restore))
+	outcome, err := s.setScaling(restore)
+	s.bookScaling(restore, outcome, err)
+	s.refreshTargetView()
+	if err != nil {
+		failure := fmt.Errorf("%s失敗：%w", scalingActionLabel(restore), err)
+		return s.finishScaling(outcome, StateError, failure.Error(), failure)
+	}
+	return s.finishScaling(outcome, StateNative, s.scalingResultMessage(outcome), nil)
+}
+
+// runScalingCycle is R5: R2's exit joined to R1's entry as one operation under one
+// acquisition of opMu. saved is consumed and cleared before the NVAPI set and rebuilt
+// from an entirely fresh read after it, so R2's promise -- no set between saved being
+// built and being cleared -- still holds verbatim, in two stretches instead of one. No
+// device name crosses the set: step 2's names are finished with before it, and step 4's
+// do not exist until after it. The screens changing mode twice more is the known,
+// accepted price of keeping that true.
+//
+// The caller has already stopped the watcher and joins it only after releasing opMu.
+// opMu is never released between these steps, so no poll can interleave.
+func (s *Session) runScalingCycle(restore bool) error {
+	// gameSeen dies with managed, and step 2 legitimately ends ownership. Carrying it
+	// by hand is what keeps the shipped promise intact across the cycle: a game that
+	// ends while the screens are changing is still a game that was seen, so the
+	// automatic restore it deserves is re-armed rather than swallowed. The countdown is
+	// deliberately not carried -- step 4's tracker is a new object with missing,
+	// missingAt and fired at zero, so the delay that follows is a full-length one.
+	carriedSeen := s.gameSeen
+	s.cyclePhase("正在變更 GPU 縮放：恢復原始排列…")
+
+	// Step 2 -- the whole of R2. A failure keeps managed and saved so the user can
+	// retry, puts the watcher back exactly as Disable's failure path does, and aborts
+	// before any NVAPI call at all: saved is still live, and a set here is precisely
+	// what R2 forbids. It would also renumber the device names the retry depends on.
+	if err := s.restoreSaved(); err != nil {
+		s.ensureWatcher()
+		s.endCycle()
+		failure := fmt.Errorf("恢復原始顯示排列失敗，GPU 縮放未變更：%w", err)
+		s.updateSnapshot(func(snapshot *Snapshot) {
+			snapshot.State, snapshot.Message, snapshot.Err = StateError, failure.Error(), failure
+		})
+		return failure
+	}
+
+	// Step 3 -- the one NVAPI set, with no saved layout and no device name alive across it.
+	s.cyclePhase("正在變更 GPU 縮放：寫入縮放設定…")
+	outcome, err := s.setScaling(restore)
+	s.bookScaling(restore, outcome, err)
+	if err != nil {
+		// The game mode is deliberately not re-applied. The desktop is on the
+		// arrangement the user had before they ever enabled it -- a known-good state
+		// that needs no rescuing -- and a failed set may already have taken effect in
+		// part, so planning a four-display change the user did not ask for would be a
+		// second write stacked on an unknown one.
+		s.refreshTargetView()
+		s.endCycle()
+		failure := fmt.Errorf("%s失敗，桌面已恢復為原始排列，工具不再管理顯示模式：%w",
+			scalingActionLabel(restore), err)
+		return s.finishScaling(outcome, StateError, failure.Error(), failure)
+	}
+
+	// Step 4 -- the whole of R1, redone rather than reused: fresh identity resolution,
+	// fresh CurrentLayout, fresh PlanModeChange, and saved rebuilt from that fresh
+	// layout. Nothing from step 2, and nothing from before the cycle, may appear here.
+	s.cyclePhase("正在變更 GPU 縮放：重新套用 " + s.gameModeLabel() + "…")
+	s.gameSeen = carriedSeen
+	state, message, applyErr := s.applyGameMode()
+	if !s.managed {
+		s.gameSeen = false
+	}
+	if applyErr != nil {
+		// The write really happened, so it stays booked -- rolling it back here would
+		// mean exit could no longer undo it. The mode did not, so no display ownership
+		// is taken: the desktop is on an arrangement this tool did not cause and has
+		// nothing to restore. The end state is the ordinary unmanaged one plus whatever
+		// that write left behind, and the retry is one press of the mode toggle.
+		s.endCycle()
+		failure := fmt.Errorf("GPU 縮放已變更為「%s」，但重新套用 %s 失敗，桌面維持在原始排列：%w",
+			ScalingLabel(effectiveValue(outcome)), s.gameModeLabel(), applyErr)
+		return s.finishScaling(outcome, StateError, failure.Error(), failure)
+	}
+	s.endCycle()
+	return s.finishScaling(outcome, state, message+"；"+s.scalingResultMessage(outcome), nil)
+}
+
+// setScaling issues this workflow's one NVAPI set, and is the only place in the session
+// that writes scaling at all. R3 lives in its signature: it neither accepts nor returns
+// a domain.Target or a domain.Layout, so the GDI name NVAPI needs is created and
+// consumed inside internal/scaling and never becomes something this file could reuse.
+//
+// Restore goes through the controller's atomic entry point, which re-resolves the
+// identity and compares it against scalingID inside its own critical section. A
+// read-compare-apply written here instead would reopen exactly the target-swap race
+// that entry point exists to close.
+func (s *Session) setScaling(restore bool) (scaling.Outcome, error) {
+	if restore {
+		return s.scalings.Restore(s.profile.Monitor, s.scalingID, s.scalingSaved)
+	}
+	return s.scalings.Apply(s.profile.Monitor, ScalingFullScreenByGPU())
+}
+
+// bookScaling records only writes that really happened, and never rolls one back
+// because something after it failed: a write the tool has forgotten is a write it can
+// no longer undo at exit. A formal set the driver accepted counts even when the
+// mandatory read-back afterwards did not come through.
+func (s *Session) bookScaling(restore bool, outcome scaling.Outcome, err error) {
+	if restore {
+		// A restore whose value is already effective is a successful no-op: nothing was
+		// written because nothing needed to be, and there is nothing left to undo.
+		if outcome.Applied || (err == nil && !outcome.SetAttempted) {
+			s.scalingOwned = false
+		}
+		return
+	}
+	if !outcome.Applied {
+		return
+	}
+	s.scalingOwned = true
+	s.scalingSaved = outcome.Previous.Effective
+	s.scalingID = outcome.Previous.DisplayID
+}
+
+// finishScaling publishes the whole result of a scaling workflow in one snapshot: what
+// the driver now reports, what this session owns, and the state the session really
+// ended in. One publication, because two would show the user a half-updated row.
+//
+// Probe runs again first. That is how a controller which latched itself off after a
+// struct-version mismatch or a diverged payload disables its own button for the rest of
+// the run without this file having to know either rule.
+func (s *Session) finishScaling(outcome scaling.Outcome, state State, message string, failure error) error {
+	probe := s.scalings.Probe()
+	s.updateSnapshot(func(snapshot *Snapshot) {
+		snapshot.Scaling = s.scalingViewOf(probe, outcome, snapshot.Scaling)
+		snapshot.State, snapshot.Message, snapshot.Err = state, message, failure
+	})
+	return failure
+}
+
+// publishScalingView records a scaling result without claiming the session's state,
+// which is what the exit path needs: it must not overwrite a message the display half
+// is still entitled to.
+func (s *Session) publishScalingView(outcome scaling.Outcome) {
+	probe := s.scalings.Probe()
+	s.updateSnapshot(func(snapshot *Snapshot) {
+		snapshot.Scaling = s.scalingViewOf(probe, outcome, snapshot.Scaling)
+	})
+}
+
+func (s *Session) scalingViewOf(
+	probe scaling.Availability,
+	outcome scaling.Outcome,
+	previous ScalingSnapshot,
+) ScalingSnapshot {
+	view := ScalingSnapshot{
+		Available:      probe.Available,
+		Reason:         probe.Reason,
+		Known:          previous.Known,
+		Effective:      previous.Effective,
+		Requested:      outcome.Requested,
+		RequestedKnown: outcome.SetAttempted,
+		Matched:        outcome.Matched,
+		Owned:          s.scalingOwned,
+		Saved:          s.scalingSaved,
+	}
+	// A set that failed may still have taken effect in part, so the controller reads
+	// back regardless and says whether that read is authoritative. Only then is the
+	// value on screen a fact rather than an assumption.
+	if outcome.ReadBackKnown {
+		view.Known, view.Effective = true, outcome.State.Effective
+	}
+	return view
+}
+
+// refreshScalingView is the read-only half: probe, and when the driver is there, read
+// the effective value. A monitor the driver refuses to map is this button's own
+// unavailability -- it names this screen and that vendor's control panel, and touches
+// nothing else in the window.
+func (s *Session) refreshScalingView() error {
+	probe := s.scalings.Probe()
+	var state scaling.State
+	var readErr error
+	if probe.Available {
+		state, readErr = s.scalings.Read(s.profile.Monitor)
+	}
+	s.updateSnapshot(func(snapshot *Snapshot) {
+		view := ScalingSnapshot{
+			Requested:      snapshot.Scaling.Requested,
+			RequestedKnown: snapshot.Scaling.RequestedKnown,
+			Owned:          s.scalingOwned,
+			Saved:          s.scalingSaved,
+		}
+		switch {
+		case !probe.Available:
+			view.Reason = probe.Reason
+		case readErr != nil:
+			view.Reason = readErr.Error()
+		default:
+			view.Available, view.Known, view.Effective = true, true, state.Effective
+			view.Matched = view.RequestedKnown && state.Effective.Raw == view.Requested.Raw
+		}
+		snapshot.Scaling = view
+	})
+	if !probe.Available {
+		return probe.Err
+	}
+	return readErr
+}
+
+// refreshTargetView re-reads the target at the tail of a workflow so the window never
+// shows a \\.\DISPLAYn that an NVAPI set has already invalidated. Nothing is ever
+// called with the name the window prints, but a stale one on screen costs the user
+// their trust in everything else in it. A read failure here is not this workflow's
+// result and must not replace the message that is.
+func (s *Session) refreshTargetView() {
+	target, err := s.displays.ResolveTarget(s.profile.Monitor)
+	if err != nil {
+		return
+	}
+	mode, err := s.displays.CurrentMode(target)
+	if err != nil {
+		return
+	}
+	s.observed(target, mode)
+}
+
+// scalingResultMessage reports what the driver says, never what the user hoped. A
+// value the driver normalised is stated as both values and is not an error: nothing
+// broke and nothing needs undoing. The tool never claims the black bars are gone --
+// it cannot read that at all, so it says only what the scaling setting now is.
+func (s *Session) scalingResultMessage(outcome scaling.Outcome) string {
+	if !outcome.ReadBackKnown {
+		return "GPU 縮放已寫入，但讀不回生效值"
+	}
+	effective := ScalingLabel(outcome.State.Effective)
+	if outcome.SetAttempted && !outcome.Matched {
+		return "已要求「" + ScalingLabel(outcome.Requested) + "」，驅動實際套用的是「" + effective + "」"
+	}
+	return "GPU 縮放：" + effective
+}
+
+func effectiveValue(outcome scaling.Outcome) scaling.Value {
+	if outcome.ReadBackKnown {
+		return outcome.State.Effective
+	}
+	return outcome.Requested
+}
+
+func scalingActionLabel(restore bool) string {
+	if restore {
+		return "還原 GPU 縮放設定"
+	}
+	return "變更 GPU 縮放"
+}
+
+func scalingWriteMessage(restore bool) string {
+	return "正在" + scalingActionLabel(restore) + "…"
+}
+
+// ScalingLabel names a scaling value in the words the window prints. It lives here
+// rather than in internal/scaling because the driver's raw number is a fact while its
+// Traditional Chinese name is this product's presentation of it.
+func ScalingLabel(value scaling.Value) string {
+	var mode string
+	switch value.Mode {
+	case scaling.ModeDefault:
+		mode = "預設"
+	case scaling.ModeFullScreen:
+		mode = "全螢幕"
+	case scaling.ModeAspectRatio:
+		mode = "長寬比"
+	case scaling.ModeNoScaling:
+		mode = "不縮放"
+	case scaling.ModeIntegerScaling:
+		mode = "整數倍縮放"
+	case scaling.ModeCustomized:
+		mode = "自訂"
+	default:
+		return fmt.Sprintf("未知的縮放設定（Raw=%d）", value.Raw)
+	}
+	switch value.By {
+	case scaling.ByGPU:
+		return mode + "（由 GPU 執行）"
+	case scaling.ByDisplay:
+		return mode + "（由顯示器執行）"
+	default:
+		return mode
+	}
+}
+
+// errNoScalingController is what a session built without a GPU-scaling controller
+// reports. It is not a driver problem to explain in NVIDIA's terms: this session
+// simply has no scaling support wired into it, and the button says exactly that.
+var errNoScalingController = fmt.Errorf("%w：未提供 GPU 縮放控制器", scaling.ErrNvapiUnavailable)
+
+// unavailableScaling keeps a nil controller from being a panic waiting for the first
+// press. Every method refuses in the same way Probe already describes.
+type unavailableScaling struct{}
+
+var _ scaling.Controller = unavailableScaling{}
+
+func (unavailableScaling) Probe() scaling.Availability {
+	return scaling.Availability{Reason: errNoScalingController.Error(), Err: errNoScalingController}
+}
+
+func (unavailableScaling) Read(domain.MonitorIdentity) (scaling.State, error) {
+	return scaling.State{}, errNoScalingController
+}
+
+func (unavailableScaling) Apply(_ domain.MonitorIdentity, value scaling.Value) (scaling.Outcome, error) {
+	return scaling.Outcome{Requested: value}, errNoScalingController
+}
+
+func (unavailableScaling) Restore(_ domain.MonitorIdentity, _ uint32, value scaling.Value) (scaling.Outcome, error) {
+	return scaling.Outcome{Requested: value}, errNoScalingController
+}
+
+func (unavailableScaling) Close() error { return nil }
