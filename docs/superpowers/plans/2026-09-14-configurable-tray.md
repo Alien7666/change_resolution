@@ -510,7 +510,7 @@ git commit -m "feat: enumerate the modes a monitor actually reports"
 
 The shipped tool only ever narrowed the target: `2560 → 1920`. `orderForApply`'s `growsMode` branch and the outward-shift half of `PlanModeChange` have unit tests but **have never run on real hardware**, because no user-reachable code path could produce them. Task 12 hands the user a list of every mode the monitor reports, most of which are larger than the current one. This task closes that gap before the list exists rather than after.
 
-- [ ] **Step 1: Write the failing (or newly-load-bearing) growth tests**
+- [x] **Step 1: Write the failing (or newly-load-bearing) growth tests**
 
 `internal/display/layout_test.go`:
 
@@ -535,17 +535,17 @@ func TestDisableReturnsTheDesktopFromALargerGameMode(t *testing.T)
 
 Parameterise `fixtureLayout` so the fixture can be built around a game mode wider than the native one, rather than assuming the target only ever narrows.
 
-- [ ] **Step 2: Run them and record what actually fails**
+- [x] **Step 2: Run them and record what actually fails**
 
 Run: `go test ./internal/display ./internal/app`
 
 Some of these will pass immediately — that is a legitimate outcome and means the branch was already correct. Do not weaken a test to make it fail. Record in the commit message which ones failed and which were confirmations.
 
-- [ ] **Step 3: Fix only what a failing test proves**
+- [x] **Step 3: Fix only what a failing test proves**
 
 Change `layout.go` only where a test demonstrates a defect. The most likely candidates are the overlap message (currently correct but terse) and the anchoring translation's sign when a non-primary target grows.
 
-- [ ] **Step 4: Verify and commit the growth coverage**
+- [x] **Step 4: Verify and commit the growth coverage**
 
 ```powershell
 gofmt -l ./internal ./cmd
