@@ -74,3 +74,22 @@ The arrows below are hard dependencies. Items on one line may overlap only while
 3. Review and commit Task 5 before anyone opens Task 4, 6 or 7 files.
 4. Run the display lane `4 → 6 → 7`; run `13 → 14` in the scaling lane and Task 9 in the process lane beside it.
 5. Join the lanes at Task 8, then execute `10 → 11 → 12 → 15 → 16 → 17` serially wherever their UI/app/main ownership overlaps.
+
+
+## Resume checkpoint — 2026-09-15
+
+Claude continued the same branch after the Codex quota interruption. Its transcript and commits were reconciled at `ccb8ab9`; the working tree was clean. The original plan now has 60/87 steps and 12/17 tasks checked. The completed set is Tasks 1–10, 13 and 14. Do not re-dispatch the earlier Task 4 or Task 13 workers against their obsolete scope.
+
+| Remaining order | Deliverable | Execution |
+|---|---|---|
+| Task 11, active | Config-driven startup and replaceable session provider | Sol high; app/provider, UI and composition root |
+| Task 12 | Settings dialog and first-run wizard | Sol high; consumes the reviewed provider |
+| Task 15 | Scaling/session ordering, ownership and watcher lifecycle | Sol xhigh; integrate only after provider/settings interfaces settle |
+| Task 16 | Scaling availability, controls and final UI layout | Sol high; consumes reviewed scaling snapshot |
+| Task 17 | Documentation, final review and verification | Delegated documentation/fixes; coordinator verifies and records hardware gates |
+
+Only one application implementer runs through this remaining shared app/UI/main sequence. Independent read-only interface and native-safety audits may run alongside implementation. No Astra subagents. All future code fixes remain delegated; the coordinator owns validation, Git and progress records.
+
+Inherited rulings to preserve: ResolutionTray is the settled product name; fallback is derived for the snapshot and restore applies the displayed value; managed restore remains enabled even when fallback is unknown because it uses the saved layout; the seed retains its original fallback; schema v1 does not serialize Profile.Name. Growth tests confirm the final arrangement, but the fixed mixed-axis apply order can transiently overlap, so documentation must not promise every intermediate arrangement is non-overlapping. Neighbour-only layout errors still expose DISPLAYn names; Task 17 assesses presentation without weakening diagnostics.
+
+The coordinator's fresh baseline verification at this checkpoint passed: `go test -count=1 ./...`, `go test -count=20 ./internal/app ./internal/scaling`, `go build ./...`, `go vet ./...`, `gofmt -l ./internal ./cmd` (empty), and `git diff --check`, with both hardware integration gates disabled. Actual display/scaling writes remain manual release verification, not automatic tests.
