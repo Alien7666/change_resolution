@@ -5,12 +5,14 @@ package ui
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Alien7666/change_resolution/internal/app"
+	"github.com/Alien7666/change_resolution/internal/config"
 	"github.com/Alien7666/change_resolution/internal/display"
 	"github.com/Alien7666/change_resolution/internal/domain"
 )
@@ -280,13 +282,18 @@ func TestRefreshCommandReReadsTheDisplayAndClearsTheLatch(t *testing.T) {
 	displays := &stubDisplays{
 		resolveErr: fmt.Errorf("%w: %s", display.ErrTargetNotFound, `MONITOR\XMI27B2`),
 	}
-	session := app.NewSession(displays, stubProcesses{}, domain.LegacySeedProfile())
+	t.Setenv(config.EnvPath, filepath.Join(t.TempDir(), "config.json"))
+	provider := app.NewProvider(displays, stubProcesses{})
+	if err := provider.Replace(domain.LegacySeedProfile()); err != nil {
+		t.Fatalf("configure provider: %v", err)
+	}
+	session := provider.Session()
 	t.Cleanup(func() {
-		if err := session.Shutdown(); err != nil {
+		if err := provider.Shutdown(); err != nil {
 			t.Errorf("cleanup Shutdown: %v", err)
 		}
 	})
-	w := &window{session: session}
+	w := &window{provider: provider}
 
 	startup, err := session.Refresh()
 	if !errors.Is(err, display.ErrTargetNotFound) {
@@ -312,6 +319,113 @@ func TestRefreshCommandReReadsTheDisplayAndClearsTheLatch(t *testing.T) {
 	}
 	if got := w.availableControls(session.Snapshot()); !got.toggle {
 		t.Fatal("a monitor that came back left the mode toggle disabled")
+	}
+}
+
+func TestUnconfiguredWindowKeepsOnlyConfigurationRecoveryActionsLive(t *testing.T) {
+	w := &window{configState: configStateUnconfigured}
+	got := w.availableControls(app.Snapshot{Message: "尚未設定"})
+	if got.toggle || got.restore || got.enable || got.reset {
+		t.Fatalf("unconfigured state exposed a mutation: %+v", got)
+	}
+	if !got.refresh || !got.openFolder || !got.exit || !got.show || !got.hide {
+		t.Fatalf("unconfigured state hid a recovery action: %+v", got)
+	}
+}
+
+func TestReadOnlyWindowOffersExplicitResetWithoutEnablingDisplayChanges(t *testing.T) {
+	w := &window{configState: configStateReadOnly}
+	got := w.availableControls(app.Snapshot{State: app.StateError, Err: errors.New("bad config")})
+	if got.toggle || got.restore || got.enable {
+		t.Fatalf("read-only state exposed a display mutation: %+v", got)
+	}
+	if !got.refresh || !got.openFolder || !got.reset {
+		t.Fatalf("read-only state hid a recovery action: %+v", got)
+	}
+}
+
+func TestProviderStateTextKeepsTheExactConfigurationErrorAndPath(t *testing.T) {
+	const exact = `C:\Users\owner\AppData\Roaming\ResolutionTray\config.json：設定檔格式錯誤：第 4 行第 7 欄`
+	w := &window{configState: configStateReadOnly}
+	got := w.statusText(app.Snapshot{State: app.StateError, Message: exact, Err: errors.New(exact)})
+	if !strings.Contains(got, exact) {
+		t.Fatalf("status %q lost the exact configuration error", got)
+	}
+}
+
+func TestReloadCommandLoadsAConfigWhenNoSessionExists(t *testing.T) {
+	profile := domain.LegacySeedProfile()
+	displays := &stubDisplays{}
+	path := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv(config.EnvPath, path)
+	provider := app.NewProvider(displays, stubProcesses{})
+	t.Cleanup(func() {
+		if err := provider.Shutdown(); err != nil {
+			t.Errorf("cleanup Shutdown: %v", err)
+		}
+	})
+	if provider.Session() != nil {
+		t.Fatal("precondition: missing configuration constructed a session")
+	}
+	if err := config.Save(config.FromProfile(profile)); err != nil {
+		t.Fatalf("write scratch config: %v", err)
+	}
+
+	w := &window{provider: provider, configState: configStateUnconfigured}
+	if err := w.refresh(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if provider.Session() == nil || !provider.Configured() {
+		t.Fatal("reload did not construct a session from the new config")
+	}
+	if displays.resolveCount() == 0 {
+		t.Fatal("newly loaded session was not given its read-only display probe")
+	}
+}
+
+func TestQueuedProviderNotificationRendersTheCurrentSession(t *testing.T) {
+	t.Setenv(config.EnvPath, filepath.Join(t.TempDir(), "config.json"))
+	provider := app.NewProvider(&stubDisplays{}, stubProcesses{})
+	t.Cleanup(func() { _ = provider.Shutdown() })
+	first := domain.LegacySeedProfile()
+	first.Monitor.Label = "first"
+	if err := provider.Replace(first); err != nil {
+		t.Fatalf("first Replace: %v", err)
+	}
+	stale := provider.Snapshot()
+	second := first.Copy()
+	second.Monitor.Label = "second"
+	if err := provider.Replace(second); err != nil {
+		t.Fatalf("second Replace: %v", err)
+	}
+
+	if got := snapshotForRender(provider, stale).Profile.Monitor.Label; got != "second" {
+		t.Fatalf("queued old notification rendered %q", got)
+	}
+}
+
+func TestReplacingTheSessionResetsAutomaticFailureDeduplication(t *testing.T) {
+	t.Setenv(config.EnvPath, filepath.Join(t.TempDir(), "config.json"))
+	provider := app.NewProvider(&stubDisplays{}, stubProcesses{})
+	t.Cleanup(func() { _ = provider.Shutdown() })
+	first := domain.LegacySeedProfile()
+	if err := provider.Replace(first); err != nil {
+		t.Fatalf("first Replace: %v", err)
+	}
+	w := &window{
+		provider:                    provider,
+		observedSession:             provider.Session(),
+		reportedAutoRestoreFailures: 7,
+	}
+	second := first.Copy()
+	second.Monitor.Label = "second"
+	if err := provider.Replace(second); err != nil {
+		t.Fatalf("second Replace: %v", err)
+	}
+
+	w.syncConfigState()
+	if w.reportedAutoRestoreFailures != 0 {
+		t.Fatalf("new session inherited automatic failure count %d", w.reportedAutoRestoreFailures)
 	}
 }
 

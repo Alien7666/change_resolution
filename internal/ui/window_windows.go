@@ -1,6 +1,6 @@
 //go:build windows
 
-// Package ui renders an app.Session through a native Walk window and a
+// Package ui renders an app.Provider through a native Walk window and a
 // notification-area icon. Every Walk object is touched only on the UI thread;
 // blocking session work runs in goroutines and is marshalled back with
 // (*walk.MainWindow).Synchronize.
@@ -38,6 +38,10 @@ const (
 
 	hideText    = "隱藏至系統匣"
 	refreshText = "重新整理"
+	reloadText  = "重新讀取"
+
+	openConfigFolderText = "開啟設定檔所在資料夾"
+	resetConfigText      = "重新設定"
 
 	// restoreButtonText carries no numbers. The mode a restore applies depends on the
 	// profile and on what the monitor reports, so it is rendered into the button's
@@ -54,13 +58,16 @@ const (
 	enableOperation      = "套用顯示模式"
 	restoreOperation     = "恢復顯示模式"
 	refreshOperation     = "重新整理顯示狀態"
+	reloadOperation      = "重新讀取設定檔"
+	openFolderOperation  = "開啟設定檔所在資料夾"
+	resetOperation       = "重新設定"
 	autoRestoreOperation = "自動恢復顯示模式"
 	shutdownOperation    = "結束前恢復顯示模式"
 
 	// The window gained the 自動恢復 line, and 恢復原始解析度 is a wider button than the
 	// 恢復 2K it replaced.
-	windowWidth  = 460
-	windowHeight = 280
+	windowWidth  = 520
+	windowHeight = 330
 
 	// monitorLabelBudget is how much of a monitor's name the fixed-width 目標螢幕 line
 	// shows before it is elided. Nothing is lost: the whole name is the line's tooltip.
@@ -81,7 +88,8 @@ const (
 // window owns every Walk object. All of its fields are read and written on the
 // Walk UI thread only.
 type window struct {
-	session *app.Session
+	provider    *app.Provider
+	configState windowConfigState
 
 	mw   *walk.MainWindow
 	tray *walk.NotifyIcon
@@ -92,6 +100,8 @@ type window struct {
 	autoRestoreLabel *walk.Label
 	statusLabel      *walk.TextLabel
 	refreshButton    *walk.PushButton
+	openFolderButton *walk.PushButton
+	resetButton      *walk.PushButton
 	hideButton       *walk.PushButton
 	restoreButton    *walk.PushButton
 
@@ -99,6 +109,8 @@ type window struct {
 	enableAction  *walk.Action
 	restoreAction *walk.Action
 	refreshAction *walk.Action
+	openAction    *walk.Action
+	resetAction   *walk.Action
 	exitAction    *walk.Action
 
 	busy              bool
@@ -108,16 +120,17 @@ type window struct {
 	// reportedAutoRestoreFailures is the highest Snapshot.AutoRestoreFailures this
 	// window has already announced.
 	reportedAutoRestoreFailures uint64
+	observedSession             *app.Session
 }
 
 // Run builds the main window plus the notification-area icon and blocks on the
 // Walk message loop until the tray exit action ends the application.
-func Run(session *app.Session) error {
-	if session == nil {
-		return errors.New("ui: session must not be nil")
+func Run(provider *app.Provider) error {
+	if provider == nil {
+		return errors.New("ui: provider must not be nil")
 	}
 
-	w := &window{session: session}
+	w := &window{provider: provider}
 	if err := w.buildMainWindow(); err != nil {
 		return err
 	}
@@ -126,19 +139,23 @@ func Run(session *app.Session) error {
 	}
 	defer func() { _ = w.tray.Dispose() }()
 
-	session.SetOnChange(func(snapshot app.Snapshot) {
-		w.mw.Synchronize(func() { w.render(snapshot) })
+	w.render(provider.Snapshot())
+	provider.SetOnChange(func(notified app.Snapshot) {
+		// The notification is only a wake-up. A replacement may overtake the queued UI
+		// closure, so it reads the provider again on the UI thread instead of rendering
+		// the snapshot captured by an old session's callback.
+		w.mw.Synchronize(func() { w.render(snapshotForRender(provider, notified)) })
 	})
-
-	w.render(session.Snapshot())
 
 	// Startup is read-only. Refresh talks to Win32, so it runs off the UI thread
 	// and only reports what it found; it never changes a display mode.
 	go func() {
 		// A failed startup probe needs no dialog: it is rendered into the status
 		// label, and the refresh command stays live so the user can read again.
-		snapshot, _ := session.Refresh()
-		w.mw.Synchronize(func() { w.render(snapshot) })
+		if session := provider.Session(); session != nil {
+			_, _ = session.Refresh()
+			w.mw.Synchronize(func() { w.render(provider.Snapshot()) })
+		}
 	}()
 
 	// walk creates the form hidden (WS_OVERLAPPEDWINDOW has no WS_VISIBLE), so the
@@ -146,6 +163,10 @@ func Run(session *app.Session) error {
 	w.mw.Show()
 	w.mw.Run()
 	return nil
+}
+
+func snapshotForRender(provider *app.Provider, _ app.Snapshot) app.Snapshot {
+	return provider.Snapshot()
 }
 
 func (w *window) buildMainWindow() error {
@@ -175,6 +196,14 @@ func (w *window) buildMainWindow() error {
 				AssignTo: &w.statusLabel,
 				Text:     "狀態：啟動中",
 				MinSize:  dec.Size{Height: 48},
+			},
+			dec.Composite{
+				Layout: dec.HBox{MarginsZero: true, Spacing: 8},
+				Children: []dec.Widget{
+					dec.PushButton{AssignTo: &w.openFolderButton, Text: openConfigFolderText, OnClicked: w.onOpenFolder},
+					dec.PushButton{AssignTo: &w.resetButton, Text: resetConfigText, OnClicked: w.onReset},
+					dec.HSpacer{},
+				},
 			},
 			dec.VSpacer{},
 			dec.Composite{
@@ -243,6 +272,12 @@ func (w *window) buildTray() error {
 	if w.refreshAction, err = newAction(trayRefreshText, w.onRefresh); err != nil {
 		return err
 	}
+	if w.openAction, err = newAction(openConfigFolderText, w.onOpenFolder); err != nil {
+		return err
+	}
+	if w.resetAction, err = newAction(resetConfigText, w.onReset); err != nil {
+		return err
+	}
 	if w.exitAction, err = newAction(trayExitText, w.onExit); err != nil {
 		return err
 	}
@@ -253,6 +288,8 @@ func (w *window) buildTray() error {
 		w.enableAction,
 		w.restoreAction,
 		w.refreshAction,
+		w.openAction,
+		w.resetAction,
 		walk.NewSeparatorAction(),
 		w.exitAction,
 	}
@@ -288,25 +325,84 @@ func (w *window) onToggled() {
 		return
 	}
 	if w.toggle.Checked() {
-		w.runOperation(enableOperation, w.session.Enable)
+		w.runOperation(enableOperation, func() error {
+			session, err := w.currentSession()
+			if err != nil {
+				return err
+			}
+			return session.Enable()
+		})
 		return
 	}
-	w.runOperation(restoreOperation, w.session.Disable)
+	w.onRestore()
 }
 
-func (w *window) onEnable()  { w.runOperation(enableOperation, w.session.Enable) }
-func (w *window) onRestore() { w.runOperation(restoreOperation, w.session.Disable) }
-func (w *window) onRefresh() { w.runOperation(refreshOperation, w.refresh) }
-func (w *window) onHide()    { w.hideToTray() }
-func (w *window) onShow()    { w.showMainWindow() }
+func (w *window) onEnable() {
+	w.runOperation(enableOperation, func() error {
+		session, err := w.currentSession()
+		if err != nil {
+			return err
+		}
+		return session.Enable()
+	})
+}
+
+func (w *window) onRestore() {
+	w.runOperation(restoreOperation, func() error {
+		session, err := w.currentSession()
+		if err != nil {
+			return err
+		}
+		return session.Disable()
+	})
+}
+
+func (w *window) onRefresh() {
+	operation := refreshOperation
+	if !w.provider.Configured() {
+		operation = reloadOperation
+	}
+	w.runOperation(operation, w.refresh)
+}
+func (w *window) onOpenFolder() {
+	w.runOperation(openFolderOperation, w.provider.OpenConfigFolder)
+}
+func (w *window) onReset() {
+	w.runOperation(resetOperation, func() error {
+		_, err := w.provider.Reset()
+		return err
+	})
+}
+func (w *window) onHide() { w.hideToTray() }
+func (w *window) onShow() { w.showMainWindow() }
 
 // refresh re-reads the display state through the session. It is the way out of
 // the unavailable latch: a monitor that was asleep or on another input when the
 // tool started leaves every mutating control disabled, and only a fresh read can
 // tell the window that the monitor came back.
 func (w *window) refresh() error {
-	_, err := w.session.Refresh()
+	if !w.provider.Configured() {
+		if err := w.provider.Reload(); err != nil {
+			return err
+		}
+	}
+	session := w.provider.Session()
+	if session == nil {
+		return nil
+	}
+	_, err := session.Refresh()
 	return err
+}
+
+func (w *window) currentSession() (*app.Session, error) {
+	if w.provider == nil {
+		return nil, errors.New("尚未設定")
+	}
+	session := w.provider.Session()
+	if session == nil {
+		return nil, errors.New("尚未設定")
+	}
+	return session, nil
 }
 
 // onExit restores any mode this run applied before the process ends. A failed
@@ -317,11 +413,11 @@ func (w *window) onExit() {
 		return
 	}
 	w.busy = true
-	w.render(w.session.Snapshot())
+	w.render(w.provider.Snapshot())
 
 	go func() {
-		err := w.session.Shutdown()
-		snapshot := w.session.Snapshot()
+		err := w.provider.Shutdown()
+		snapshot := w.provider.Snapshot()
 		w.mw.Synchronize(func() {
 			w.busy = false
 			w.render(snapshot)
@@ -342,11 +438,11 @@ func (w *window) runOperation(operation string, action func() error) {
 		return
 	}
 	w.busy = true
-	w.render(w.session.Snapshot())
+	w.render(w.provider.Snapshot())
 
 	go func() {
 		err := action()
-		snapshot := w.session.Snapshot()
+		snapshot := w.provider.Snapshot()
 		w.mw.Synchronize(func() {
 			w.busy = false
 			w.render(snapshot)
@@ -394,6 +490,10 @@ func (w *window) onSizeChanged() {
 }
 
 func (w *window) render(snapshot app.Snapshot) {
+	w.syncConfigState()
+	if w.configState != configStateConfigured {
+		w.unavailableReason = ""
+	}
 	w.updateAvailability(snapshot)
 
 	_ = w.targetLabel.SetText(targetText(snapshot))
@@ -403,8 +503,10 @@ func (w *window) render(snapshot app.Snapshot) {
 	_ = w.autoRestoreLabel.SetText(autoRestoreText(snapshot))
 	_ = w.statusLabel.SetText(w.statusText(snapshot))
 	_ = w.restoreButton.SetToolTipText(restoreTooltip(snapshot))
+	_ = w.refreshButton.SetText(w.refreshCaption())
 
 	_ = w.enableAction.SetText(trayEnableText(snapshot))
+	_ = w.refreshAction.SetText(w.refreshCaption())
 	_ = w.tray.SetToolTip(trayTooltip(snapshot))
 
 	// While an operation runs the checkbox reflects the user intent, not the
@@ -417,6 +519,43 @@ func (w *window) render(snapshot app.Snapshot) {
 	if err := w.takeAutoRestoreFailure(snapshot); err != nil {
 		w.reportError(autoRestoreOperation, err, snapshot)
 	}
+}
+
+type windowConfigState uint8
+
+const (
+	// Configured is deliberately the zero value so the existing pure rendering tests,
+	// which construct a window without a live Provider, continue to describe a loaded
+	// profile. Tests for the other two states opt into them explicitly.
+	configStateConfigured windowConfigState = iota
+	configStateUnconfigured
+	configStateReadOnly
+)
+
+func (w *window) syncConfigState() {
+	if w.provider == nil {
+		return
+	}
+	current := w.provider.Session()
+	if current != w.observedSession {
+		w.observedSession = current
+		w.reportedAutoRestoreFailures = 0
+	}
+	switch {
+	case w.provider.Configured():
+		w.configState = configStateConfigured
+	case w.provider.ReadOnly():
+		w.configState = configStateReadOnly
+	default:
+		w.configState = configStateUnconfigured
+	}
+}
+
+func (w *window) refreshCaption() string {
+	if w.configState == configStateConfigured {
+		return refreshText
+	}
+	return reloadText
 }
 
 // takeAutoRestoreFailure returns the error of an automatic restore this window has
@@ -475,13 +614,15 @@ func (w *window) updateAvailability(snapshot app.Snapshot) {
 // controls says which commands accept input. It is one value so the policy can be
 // decided without touching Walk and asserted in a test.
 type controls struct {
-	toggle  bool
-	restore bool
-	enable  bool
-	refresh bool
-	hide    bool
-	show    bool
-	exit    bool
+	toggle     bool
+	restore    bool
+	enable     bool
+	refresh    bool
+	openFolder bool
+	reset      bool
+	hide       bool
+	show       bool
+	exit       bool
 }
 
 // availableControls keeps the read-only command live while the target monitor is
@@ -496,15 +637,18 @@ type controls struct {
 // before it applied anything and never consults the fallback, so taking that button
 // away would leave the user holding the applied mode with no way out but exiting.
 func (w *window) availableControls(snapshot app.Snapshot) controls {
-	interactive := w.unavailableReason == "" && !w.busy
+	configured := w.configState == configStateConfigured
+	interactive := configured && w.unavailableReason == "" && !w.busy
 	return controls{
-		toggle:  interactive,
-		restore: interactive && (snapshot.Managed || snapshot.FallbackKnown),
-		enable:  interactive && !snapshot.AtGameMode,
-		refresh: !w.busy,
-		hide:    true,
-		show:    true,
-		exit:    !w.busy,
+		toggle:     interactive,
+		restore:    interactive && (snapshot.Managed || snapshot.FallbackKnown),
+		enable:     interactive && !snapshot.AtGameMode,
+		refresh:    !w.busy,
+		openFolder: !w.busy,
+		reset:      !w.busy && w.configState == configStateReadOnly,
+		hide:       true,
+		show:       true,
+		exit:       !w.busy,
 	}
 }
 
@@ -514,12 +658,18 @@ func (w *window) applyEnabled(snapshot app.Snapshot) {
 	w.toggle.SetEnabled(available.toggle)
 	w.restoreButton.SetEnabled(available.restore)
 	w.refreshButton.SetEnabled(available.refresh)
+	w.openFolderButton.SetEnabled(available.openFolder)
+	w.resetButton.SetEnabled(available.reset)
+	w.resetButton.SetVisible(w.configState == configStateReadOnly)
 	w.hideButton.SetEnabled(available.hide)
 
 	_ = w.showAction.SetEnabled(available.show)
 	_ = w.enableAction.SetEnabled(available.enable)
 	_ = w.restoreAction.SetEnabled(available.restore)
 	_ = w.refreshAction.SetEnabled(available.refresh)
+	_ = w.openAction.SetEnabled(available.openFolder)
+	_ = w.resetAction.SetEnabled(available.reset)
+	_ = w.resetAction.SetVisible(w.configState == configStateReadOnly)
 	_ = w.exitAction.SetEnabled(available.exit)
 }
 
