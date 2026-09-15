@@ -29,11 +29,12 @@ import (
 )
 
 const (
-	// windowTitle is the product's name rather than a description of the configured
-	// mode, which is why it survived the constant cull. It is also the README's
-	// heading and the tray icon's first line, so renaming it is a documentation
-	// change as much as a UI one; see the note in the task report.
-	windowTitle = "VALORANT 4:3 顯示工具"
+	// windowTitle is the product's name, which is why it survived the cull of
+	// hardware constants. It names neither a game nor an aspect ratio: the tool
+	// switches whatever mode its owner configured, and a title claiming otherwise
+	// would be wrong for everyone but its first user. It matches the executable,
+	// the repository and the release assets, so the three cannot drift apart.
+	windowTitle = "ResolutionTray"
 
 	hideText    = "隱藏至系統匣"
 	refreshText = "重新整理"
