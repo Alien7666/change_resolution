@@ -731,7 +731,7 @@ Expected: `grep -n '1920\|2560\|XMI27B2\|Mi Monitor' internal/ui/*.go` returns o
 
 The profile spec's open question 9 settles this: a profile change rebuilds the session rather than mutating it, because the saved layout, the ownership flag and the watcher goroutine all belong to one profile. That requires the UI to hold an indirection instead of a `*app.Session`, and this task installs the indirection before there is anything that replaces it.
 
-- [ ] **Step 1: Write the failing provider tests**
+- [x] **Step 1: Write the failing provider tests**
 
 ```go
 func TestProviderStartsUnconfiguredWhenNoConfigFileExists(t *testing.T)
@@ -744,15 +744,15 @@ func TestProviderWritesBackTheInstancePathAfterASecondaryKeyRebind(t *testing.T)
 
 The last one is the profile spec's decided open question 4: when the primary key misses and the hardware-ID rung matched unambiguously, persist the new `instancePath` and say so in the status line (`已以硬體 ID 重新對應到 \\.\DISPLAY3`). This does not contradict "never rewrite a file you could not understand" — that rule is about parse failures, and this is a successful parse plus one unambiguous rebind. Assert it writes exactly once, not once per refresh.
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `go test ./internal/app`
 
-- [ ] **Step 3: Implement the provider**
+- [x] **Step 3: Implement the provider**
 
 `Replace` refuses with a clear error while `managed` is true, otherwise shuts the current session down (which restores nothing, because nothing is owned), builds a new one from the new profile, and re-registers the observer so the UI's `SetOnChange` survives a replacement and `ui.Run` never has to re-subscribe.
 
-- [ ] **Step 4: Make startup configuration-driven, with an honest unconfigured state**
+- [x] **Step 4: Make startup configuration-driven, with an honest unconfigured state**
 
 `main_windows.go` becomes: resolve the config path → `Load` → build a provider. Three outcomes:
 
@@ -762,7 +762,7 @@ Run: `go test ./internal/app`
 
 Nothing writes on the second or third path. There is no 設定… menu item yet, because the dialog does not exist — an unconfigured tool that explains itself is coherent; a menu item that opens nothing is not.
 
-- [ ] **Step 5: Verify and commit the provider**
+- [x] **Step 5: Verify and commit the provider**
 
 ```powershell
 gofmt -l ./internal ./cmd

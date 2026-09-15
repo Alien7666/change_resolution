@@ -93,3 +93,13 @@ Only one application implementer runs through this remaining shared app/UI/main 
 Inherited rulings to preserve: ResolutionTray is the settled product name; fallback is derived for the snapshot and restore applies the displayed value; managed restore remains enabled even when fallback is unknown because it uses the saved layout; the seed retains its original fallback; schema v1 does not serialize Profile.Name. Growth tests confirm the final arrangement, but the fixed mixed-axis apply order can transiently overlap, so documentation must not promise every intermediate arrangement is non-overlapping. Neighbour-only layout errors still expose DISPLAYn names; Task 17 assesses presentation without weakening diagnostics.
 
 The coordinator's fresh baseline verification at this checkpoint passed: `go test -count=1 ./...`, `go test -count=20 ./internal/app ./internal/scaling`, `go build ./...`, `go vet ./...`, `gofmt -l ./internal ./cmd` (empty), and `git diff --check`, with both hardware integration gates disabled. Actual display/scaling writes remain manual release verification, not automatic tests.
+
+### 2026-09-15 integration audit decisions
+
+Task 12 pure settings model may run beside Task 11, with exclusive new model/test files; Walk and main-window wiring remain serial after Task 11 acceptance.
+
+Before Task 15 integration, scaling reports atomic write facts (previous value, attempted/successful set and readback validity), validates native count/pointer ownership, and provides Restore with an expected display ID checked in the same critical section. Transient driver load/initialize failures can be reprobed; incompatible ABI/payload safety failures remain disabled until restart. These close concrete audit gaps without allowing automatic hardware writes.
+
+### 2026-09-16 accepted integration checkpoint
+
+Task 11 completed in f880035 after independent review and root verification. Settings model/dialog are accepted in 281ca52/8172e58; Task 12 entry wiring is in progress. Scaling prerequisite safety fixes are accepted in 3eb477d, with root read-only NVAPI integration passing. Display restore identity/topology fixes are accepted in 1910241; they capture stable bindings for every saved display and refuse changed mappings before any test/apply. Config truncated-JSON location fixed in 8344e11. Original plan now has 13 of 17 tasks complete; Tasks 12, 15, 16 and final Task 17 verification remain.
