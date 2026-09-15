@@ -671,7 +671,7 @@ Expected: tests pass; `grep -n OpenProcess internal/process` returns nothing.
 - Consumes: `app.Snapshot` (now carrying the profile, the derived fallback and the match level).
 - Produces: a window with no hard-coded hardware or mode strings.
 
-- [ ] **Step 1: Write the failing text-generation tests**
+- [x] **Step 1: Write the failing text-generation tests**
 
 The rendering helpers are pure functions of a snapshot and are already testable without Walk (`targetText`, `modeText`, `statusText` exist today). Add:
 
@@ -686,11 +686,11 @@ func TestUnavailableReasonNamesTheConfiguredMonitorAndMode(t *testing.T)
 
 The last one closes the spec's complaint that `updateAvailability` hard-codes `1920×1440 @ 180 Hz` in the "mode not supported" latch message.
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `go test ./internal/ui`
 
-- [ ] **Step 3: Delete the constants and generate the strings**
+- [x] **Step 3: Delete the constants and generate the strings**
 
 Remove `monitorName`, `toggleText` and `restoreText` as constants. Every one of them becomes a function of the snapshot:
 
@@ -702,7 +702,7 @@ Remove `monitorName`, `toggleText` and `restoreText` as constants. Every one of 
 
 Grow the window to roughly `460×280` for the extra line, per the profile spec. Do not add the settings button yet — Task 12 adds it together with the dialog it opens. If the four buttons do not fit at the fixed width, move 隱藏至系統匣 into the tray menu, which the spec already authorises (closing and minimising already hide).
 
-- [ ] **Step 4: Verify and commit the generated rendering**
+- [x] **Step 4: Verify and commit the generated rendering**
 
 ```powershell
 gofmt -l ./internal ./cmd
@@ -1166,6 +1166,10 @@ git commit -m "feat: show and set GPU scaling without disabling the 4:3 controls
 ```
 
 ---
+
+### Task 17 note: the product is named ResolutionTray
+
+The window, its dialog captions and the tray icon were renamed from 「VALORANT 4:3 顯示工具」 in `191cfe5`, because a title naming one game and one aspect ratio is wrong for every user but the first. `README.md` still opens with the old heading and is Task 17's to correct, along with any other document that repeats it. The name matches the executable, the repository and the release assets.
 
 ### Task 17: Documentation, guidance and the release verification pass
 
