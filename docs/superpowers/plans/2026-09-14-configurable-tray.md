@@ -572,7 +572,7 @@ Expected: the grow path is covered end to end from `Session.Enable` down to the 
 **Interfaces:**
 - Produces: `Snapshot.AtGameMode`, `Snapshot.Profile`, `Snapshot.FallbackMode` / `FallbackKnown` / `FallbackReason`, `Snapshot.MatchedBy`; an optional `Profile.FallbackMode *domain.Mode`; a session that watches no process when none is configured.
 
-- [ ] **Step 1: Write the failing generalization tests**
+- [x] **Step 1: Write the failing generalization tests**
 
 ```go
 func TestSnapshotReportsTheConfiguredModeNotAFourByThreeAssumption(t *testing.T)
@@ -588,19 +588,19 @@ The fallback-derivation test needs `EnumModes` on the fake display controller (T
 
 `TestRestoreNamesTheNeighbour...` is the scaling spec's tension #2, fixed early while the restore path is being edited anyway: `restoreSaved` only checks that the *target* is in the saved layout, so a renamed *neighbour* passes that check and then fails deep inside `stageChanges` with a message nobody can act on. Check every device in the saved layout up front and name the missing one.
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `go test ./internal/app`
 
-- [ ] **Step 3: Make the fallback optional and derived**
+- [x] **Step 3: Make the fallback optional and derived**
 
 `Profile.FallbackNativeMode Mode` becomes `Profile.FallbackMode *Mode`. When it is nil, `restoreFallback` calls `EnumModes` and `domain.DeriveFallback`; when derivation fails (enumeration error, or a catalogue that filtered down to nothing) the restore is refused with a message saying why, and `Snapshot.FallbackKnown` is false so the UI disables the button instead of offering a guess. Never fall back to a hard-coded `2560×1440`.
 
-- [ ] **Step 4: Rename the 4:3 concept and publish the profile**
+- [x] **Step 4: Rename the 4:3 concept and publish the profile**
 
 `Snapshot.FourByThree` → `Snapshot.AtGameMode`; `Session.observed` compares against `s.profile.GameMode` as it already does, but nothing downstream may assume a ratio. Add `Snapshot.Profile domain.Profile` (a value copy, taken under `mu`) so the UI can render every string from the snapshot in Task 10 without reaching into the session. Add `Snapshot.MatchedBy` from the resolved target so Task 11 can tell the user a rebind happened. Replace the session's own Chinese messages that name `4:3` or `2K` with wording generated from the profile's mode.
 
-- [ ] **Step 5: Verify and commit the generalized session**
+- [x] **Step 5: Verify and commit the generalized session**
 
 ```powershell
 gofmt -l ./internal ./cmd
