@@ -280,7 +280,13 @@ func newFixture(t *testing.T) *sessionFixture {
 func newFixtureWith(t *testing.T, profile domain.Profile, original domain.Mode, desktop domain.Layout) *sessionFixture {
 	t.Helper()
 	displays := &fakeDisplay{
-		target:  domain.Target{DeviceName: targetDevice, Identity: domain.MonitorIdentity{HardwareID: profile.Monitor.HardwareID}},
+		target: domain.Target{
+			DeviceName: targetDevice,
+			Identity:   domain.MonitorIdentity{HardwareID: profile.Monitor.HardwareID},
+			// The seed profile carries no instance path, so the rung that matches it
+			// is the hardware ID -- the same rung Snapshot.MatchedBy exists to report.
+			MatchedBy: domain.MatchHardwareID,
+		},
 		current: original, layout: desktop, fail: make(map[string]error),
 	}
 	checker := &fakeChecker{called: make(chan string, 8), results: make(chan processResult), closed: make(chan struct{})}
@@ -384,7 +390,7 @@ func TestEnableCapturesCurrentModeTestsThenApplies(t *testing.T) {
 	if calls[0].target.Identity != f.profile.Monitor || calls[2].mode != f.profile.GameMode || calls[3].mode != f.profile.GameMode {
 		t.Fatalf("wrong target or mode: %+v", calls)
 	}
-	if got := f.s.Snapshot(); !got.Managed || !got.FourByThree || got.State != StateWaitingForGame {
+	if got := f.s.Snapshot(); !got.Managed || !got.AtGameMode || got.State != StateWaitingForGame {
 		t.Fatalf("snapshot = %+v", got)
 	}
 	if f.clock.count() != 1 || f.clock.intervals[0] != time.Second {
@@ -413,14 +419,14 @@ func TestDisableRestoresTheCapturedModeAndArrangement(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := f.display.takeCalls()
-	assertOperations(t, calls, "resolve", "test", "apply")
-	if calls[1].mode != f.original || calls[2].mode != f.original {
+	assertOperations(t, calls, "resolve", "layout", "test", "apply")
+	if calls[2].mode != f.original || calls[3].mode != f.original {
 		t.Fatalf("restore = %+v", calls)
 	}
 	if got := f.desktop(); !reflect.DeepEqual(got, before) {
 		t.Fatalf("restored desktop = %+v, want %+v", got, before)
 	}
-	if got := f.s.Snapshot(); got.Managed || got.FourByThree || got.CurrentMode != f.original || got.State != StateNative {
+	if got := f.s.Snapshot(); got.Managed || got.AtGameMode || got.CurrentMode != f.original || got.State != StateNative {
 		t.Fatalf("snapshot = %+v", got)
 	}
 }
@@ -434,7 +440,7 @@ func TestEnableFailureDoesNotStartActiveSession(t *testing.T) {
 			if err := f.s.Enable(); !errors.Is(err, failure) {
 				t.Fatalf("error = %v", err)
 			}
-			if got := f.s.Snapshot(); got.Managed || got.FourByThree || got.State != StateError || !errors.Is(got.Err, failure) {
+			if got := f.s.Snapshot(); got.Managed || got.AtGameMode || got.State != StateError || !errors.Is(got.Err, failure) {
 				t.Fatalf("snapshot = %+v", got)
 			}
 			if f.clock.count() != 0 {
@@ -465,7 +471,7 @@ func TestShutdownRestoresOnlyWhenSessionAppliedMode(t *testing.T) {
 			}
 			calls := f.display.takeCalls()
 			if managed {
-				assertOperations(t, calls, "resolve", "test", "apply")
+				assertOperations(t, calls, "resolve", "layout", "test", "apply")
 			} else if len(calls) != 0 {
 				t.Fatalf("startup Shutdown touched display: %+v", calls)
 			}
@@ -490,7 +496,7 @@ func TestManualDisableWinsOverPendingAutomaticRestore(t *testing.T) {
 	if err := f.s.Disable(); err != nil {
 		t.Fatal(err)
 	}
-	assertOperations(t, f.display.takeCalls(), "resolve", "test", "apply")
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "test", "apply")
 	if !f.clock.tickers[0].isStopped() {
 		t.Fatal("Disable returned before watcher stopped")
 	}
@@ -500,14 +506,14 @@ func TestManualDisableWinsOverPendingAutomaticRestore(t *testing.T) {
 	}
 }
 
-func TestDisableUsesFallbackWhenAppStartsInUnmanagedFourByThreeMode(t *testing.T) {
+func TestDisableUsesFallbackWhenAppStartsInAnUnmanagedGameMode(t *testing.T) {
 	f := newFixture(t)
 	f.setDesktop(f.profile.GameMode)
 	got, err := f.s.Refresh()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.FourByThree || got.Managed || f.clock.count() != 0 {
+	if !got.AtGameMode || got.Managed || f.clock.count() != 0 {
 		t.Fatalf("startup = %+v", got)
 	}
 	assertOperations(t, f.display.takeCalls(), "resolve", "current")
@@ -523,12 +529,12 @@ func TestDisableUsesFallbackWhenAppStartsInUnmanagedFourByThreeMode(t *testing.T
 	}
 	calls := f.display.takeCalls()
 	assertOperations(t, calls, "resolve", "layout", "test", "apply")
-	if calls[2].mode != f.profile.FallbackNativeMode || calls[3].mode != f.profile.FallbackNativeMode {
+	if calls[2].mode != *f.profile.FallbackMode || calls[3].mode != *f.profile.FallbackMode {
 		t.Fatalf("fallback = %+v", calls)
 	}
 	// Widening the target again would land on its neighbour, so the fallback has to
 	// plan the desktop as much as the managed path does.
-	if got := f.desktop(); !reflect.DeepEqual(got, fixtureLayout(f.profile.FallbackNativeMode)) {
+	if got := f.desktop(); !reflect.DeepEqual(got, fixtureLayout(*f.profile.FallbackMode)) {
 		t.Fatalf("fallback desktop = %+v", got)
 	}
 }
@@ -536,7 +542,7 @@ func TestDisableUsesFallbackWhenAppStartsInUnmanagedFourByThreeMode(t *testing.T
 func TestRefreshAndShutdownLeaveUnmanagedGameModeUntouched(t *testing.T) {
 	f := newFixture(t)
 	f.setDesktop(f.profile.GameMode)
-	if got, err := f.s.Refresh(); err != nil || !got.FourByThree || got.Managed {
+	if got, err := f.s.Refresh(); err != nil || !got.AtGameMode || got.Managed {
 		t.Fatalf("snapshot = %+v, err = %v", got, err)
 	}
 	assertOperations(t, f.display.takeCalls(), "resolve", "current")
@@ -563,12 +569,12 @@ func TestManualDisableFreshReadsInsteadOfTrustingStaleSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertOperations(t, f.display.takeCalls(), "resolve", "layout")
-	if f.s.Snapshot().FourByThree {
+	if f.s.Snapshot().AtGameMode {
 		t.Fatal("stale observed mode retained")
 	}
 }
 
-// The UI disables the 4:3 control by testing Snapshot.Err with errors.Is, so every
+// The UI disables the mode toggle by testing Snapshot.Err with errors.Is, so every
 // wrapper between display.Controller and Snapshot.Err must preserve the sentinel.
 func TestEnableKeepsUnsupportedModeSentinelInSnapshotErr(t *testing.T) {
 	f := newFixture(t)
@@ -584,7 +590,7 @@ func TestEnableKeepsUnsupportedModeSentinelInSnapshotErr(t *testing.T) {
 	if got.State != StateError || !errors.Is(got.Err, display.ErrModeNotSupported) {
 		t.Fatalf("snapshot = %+v, Err lost display.ErrModeNotSupported", got)
 	}
-	if got.Managed || got.FourByThree {
+	if got.Managed || got.AtGameMode {
 		t.Fatalf("snapshot = %+v", got)
 	}
 }
@@ -626,11 +632,11 @@ func TestGameExitRestoresSavedModeAfterDelay(t *testing.T) {
 
 	got := f.poll(t, 0, 5, processResult{})
 	calls := f.display.takeCalls()
-	assertOperations(t, calls, "resolve", "test", "apply")
-	if calls[1].mode != f.original || calls[2].mode != f.original {
+	assertOperations(t, calls, "resolve", "layout", "test", "apply")
+	if calls[2].mode != f.original || calls[3].mode != f.original {
 		t.Fatalf("automatic restore used the wrong mode: %+v", calls)
 	}
-	if got.Managed || got.FourByThree || got.CurrentMode != f.original || got.State != StateNative {
+	if got.Managed || got.AtGameMode || got.CurrentMode != f.original || got.State != StateNative {
 		t.Fatalf("restored snapshot = %+v", got)
 	}
 	if !f.clock.tickers[0].isStopped() {
@@ -663,14 +669,14 @@ func TestGameReturningDuringRestoreWindowCancelsRestore(t *testing.T) {
 	}
 
 	got := f.poll(t, 0, 7, processResult{})
-	assertOperations(t, f.display.takeCalls(), "resolve", "test", "apply")
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "test", "apply")
 	if got.Managed || got.CurrentMode != f.original || got.State != StateNative {
 		t.Fatalf("restored snapshot = %+v", got)
 	}
 }
 
-// 4:3 stays applied for as long as the game never shows up: the watcher only ever
-// arms a restore after it has seen the process at least once.
+// The configured mode stays applied for as long as the game never shows up: the
+// watcher only ever arms a restore after it has seen the process at least once.
 func TestGameNeverAppearingLeavesModeUnchanged(t *testing.T) {
 	f := newFixture(t)
 	if err := f.s.Enable(); err != nil {
@@ -686,7 +692,7 @@ func TestGameNeverAppearingLeavesModeUnchanged(t *testing.T) {
 	if calls := f.display.takeCalls(); len(calls) != 0 {
 		t.Fatalf("unseen game triggered a display change: %+v", calls)
 	}
-	if got := f.s.Snapshot(); !got.Managed || !got.FourByThree {
+	if got := f.s.Snapshot(); !got.Managed || !got.AtGameMode {
 		t.Fatalf("snapshot = %+v", got)
 	}
 }
@@ -731,11 +737,11 @@ func TestFailedManualRestoreKeepsTheWatcherRunning(t *testing.T) {
 
 	got = f.poll(t, 1, 6, processResult{})
 	calls := f.display.takeCalls()
-	assertOperations(t, calls, "resolve", "test", "apply")
-	if calls[2].mode != f.original {
+	assertOperations(t, calls, "resolve", "layout", "test", "apply")
+	if calls[3].mode != f.original {
 		t.Fatalf("automatic restore used the wrong mode: %+v", calls)
 	}
-	if got.Managed || got.FourByThree || got.CurrentMode != f.original || got.State != StateNative {
+	if got.Managed || got.AtGameMode || got.CurrentMode != f.original || got.State != StateNative {
 		t.Fatalf("restored snapshot = %+v", got)
 	}
 }
@@ -772,7 +778,7 @@ func TestFailedShutdownRestoreKeepsTheWatcherRunning(t *testing.T) {
 	if err := f.s.Shutdown(); err != nil {
 		t.Fatal(err)
 	}
-	assertOperations(t, f.display.takeCalls(), "resolve", "test", "apply")
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "test", "apply")
 }
 
 // Nothing prompts the user when the delayed restore fails, so the session records
@@ -801,7 +807,7 @@ func TestFailedAutomaticRestoreIsCountedOnceAndKeepsTheWatcherRunning(t *testing
 	if !got.Managed {
 		t.Fatalf("failed automatic restore dropped ownership: %+v", got)
 	}
-	assertOperations(t, f.display.takeCalls(), "resolve", "test", "apply")
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "test", "apply")
 	if f.clock.count() != 2 {
 		t.Fatalf("watchers started = %d, want a replacement after the failed restore", f.clock.count())
 	}
@@ -825,7 +831,7 @@ func TestFailedAutomaticRestoreIsCountedOnceAndKeepsTheWatcherRunning(t *testing
 	f.poll(t, 1, 9, processResult{running: true})
 	f.poll(t, 1, 10, processResult{})
 	got = f.poll(t, 1, 13, processResult{})
-	assertOperations(t, f.display.takeCalls(), "resolve", "test", "apply")
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "test", "apply")
 	if got.Managed || got.CurrentMode != f.original || got.State != StateNative {
 		t.Fatalf("restored snapshot = %+v", got)
 	}
@@ -928,7 +934,7 @@ func TestEnableAbortsWithoutTouchingAnUnsafeDesktop(t *testing.T) {
 			if got.State != StateError || !errors.Is(got.Err, display.ErrLayoutUnsafe) {
 				t.Fatalf("snapshot = %+v", got)
 			}
-			if got.Managed || got.FourByThree || f.clock.count() != 0 {
+			if got.Managed || got.AtGameMode || f.clock.count() != 0 {
 				t.Fatalf("an aborted Enable took ownership: %+v", got)
 			}
 			if !reflect.DeepEqual(f.desktop(), desktop) {
@@ -1033,7 +1039,7 @@ func TestEnableAppliesALargerGameModeWithoutOverlappingTheNeighbours(t *testing.
 		t.Fatalf("%s sits at %+v, want x=%d", rightDevice, right.Position, fixtureLarger.Width)
 	}
 	assertNoOverlappingDisplays(t, desktop)
-	if got := f.s.Snapshot(); !got.Managed || !got.FourByThree ||
+	if got := f.s.Snapshot(); !got.Managed || !got.AtGameMode ||
 		got.CurrentMode != fixtureLarger || got.State != StateWaitingForGame {
 		t.Fatalf("snapshot = %+v", got)
 	}
@@ -1096,16 +1102,328 @@ func TestDisableReturnsTheDesktopFromALargerGameMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := f.display.takeCalls()
-	assertOperations(t, calls, "resolve", "test", "apply")
-	if calls[1].mode != f.original || calls[2].mode != f.original {
+	assertOperations(t, calls, "resolve", "layout", "test", "apply")
+	if calls[2].mode != f.original || calls[3].mode != f.original {
 		t.Fatalf("restore = %+v", calls)
 	}
 	if got := f.desktop(); !reflect.DeepEqual(got, before) {
 		t.Fatalf("restored desktop = %+v, want %+v", got, before)
 	}
 	assertNoOverlappingDisplays(t, f.desktop())
-	if got := f.s.Snapshot(); got.Managed || got.FourByThree ||
+	if got := f.s.Snapshot(); got.Managed || got.AtGameMode ||
 		got.CurrentMode != f.original || got.State != StateNative {
 		t.Fatalf("snapshot = %+v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The session runs on the profile the user configured, not on the one the tool
+// shipped with. Everything below this line is about a configuration the shipped
+// build could not express: a mode that is not 4:3, no fallback mode at all, and
+// no watched process.
+// ---------------------------------------------------------------------------
+
+// fourByThreeMode and wideGameMode are deliberately the wrong way round. The session
+// used to call its applied state "FourByThree", and the only way to show that name
+// was an assumption rather than a description is to configure a game mode with a
+// different shape and start from a desktop that has the old one.
+var (
+	fourByThreeMode = domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
+	wideGameMode    = domain.Mode{Width: 2560, Height: 1080, RefreshHz: 120, BitsPerPixel: 32}
+)
+
+// profileWithoutFallback records no fallback mode, which is what the settings dialog
+// writes unless the user overrides it: the mode a restore goes back to is derived
+// from what the monitor reports at the moment it is needed, never frozen into a file
+// written on another machine.
+func profileWithoutFallback(gameMode domain.Mode) domain.Profile {
+	profile := profileWithGameMode(gameMode)
+	profile.FallbackMode = nil
+	return profile
+}
+
+// profileWithoutProcess watches nothing. It is a legitimate configuration -- the user
+// toggles by hand -- and not a half-finished one.
+func profileWithoutProcess() domain.Profile {
+	profile := domain.LegacySeedProfile()
+	profile.ProcessName = ""
+	return profile
+}
+
+// setModes replaces what the fake monitor reports it can run.
+func (f *sessionFixture) setModes(modes ...domain.Mode) {
+	f.display.mu.Lock()
+	defer f.display.mu.Unlock()
+	f.display.modes = modes
+}
+
+// renameDisplay models a Windows renumbering: the same screen is still attached and
+// still where it was, under a name the session has never seen.
+func (f *sessionFixture) renameDisplay(from, to string) {
+	f.display.mu.Lock()
+	defer f.display.mu.Unlock()
+	displays := append([]domain.DisplayState(nil), f.display.layout.Displays...)
+	for i := range displays {
+		if displays[i].DeviceName == from {
+			displays[i].DeviceName = to
+		}
+	}
+	f.display.layout = domain.Layout{Displays: displays}
+}
+
+// The snapshot reports whether the desktop is at the configured mode. It is not a
+// statement about the shape of that mode: a 4:3 desktop that is not what the profile
+// asked for is not the applied state, and the mode the profile did ask for is, at
+// whatever ratio the user picked.
+func TestSnapshotReportsTheConfiguredModeNotAFourByThreeAssumption(t *testing.T) {
+	f := newFixtureWith(t, profileWithGameMode(wideGameMode), fourByThreeMode, fixtureLayout(fourByThreeMode))
+
+	got, err := f.s.Refresh()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AtGameMode || got.CurrentMode != fourByThreeMode {
+		t.Fatalf("a 4:3 desktop that is not the configured mode reported AtGameMode: %+v", got)
+	}
+
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	got = f.s.Snapshot()
+	if !got.AtGameMode || got.CurrentMode != wideGameMode || !got.Managed {
+		t.Fatalf("snapshot = %+v", got)
+	}
+	if !strings.Contains(got.Message, domain.ModeLabel(wideGameMode)) {
+		t.Fatalf("message = %q, which never names the configured mode", got.Message)
+	}
+	for _, shipped := range []string{"4:3", "2K", "1920", "1440"} {
+		if strings.Contains(got.Message, shipped) {
+			t.Fatalf("message = %q, which still describes the profile the tool shipped with", got.Message)
+		}
+	}
+	assertNoOverlappingDisplays(t, f.desktop())
+}
+
+// A profile with no fallback mode restores to the monitor's own native mode, worked
+// out from the modes it reports rather than remembered from the machine this tool was
+// written for.
+func TestDisableDerivesTheFallbackFromTheEnumeratedModesWhenNoneIsConfigured(t *testing.T) {
+	profile := profileWithoutFallback(domain.LegacySeedProfile().GameMode)
+	f := newFixtureWith(t, profile, fixtureNative, fixtureLayout(fixtureNative))
+	// What the monitor reports, deliberately unordered and with smaller modes in it.
+	f.setModes(fixtureSide, fixtureTop, fixtureNative, profile.GameMode)
+	f.setDesktop(profile.GameMode)
+
+	got, err := f.s.Refresh()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertOperations(t, f.display.takeCalls(), "resolve", "current", "modes")
+	if !got.FallbackKnown || got.FallbackMode != fixtureNative || got.FallbackReason != "" {
+		t.Fatalf("snapshot = %+v, want the derived %+v", got, fixtureNative)
+	}
+
+	if err := f.s.Disable(); err != nil {
+		t.Fatal(err)
+	}
+	calls := f.display.takeCalls()
+	assertOperations(t, calls, "resolve", "layout", "modes", "test", "apply")
+	if calls[3].mode != fixtureNative || calls[4].mode != fixtureNative {
+		t.Fatalf("restore = %+v, want the derived fallback %+v", calls, fixtureNative)
+	}
+	if desktop := f.desktop(); !reflect.DeepEqual(desktop, fixtureLayout(fixtureNative)) {
+		t.Fatalf("restored desktop = %+v, want %+v", desktop, fixtureLayout(fixtureNative))
+	}
+}
+
+// The two ways deriving a fallback can fail are different events and have to read
+// differently: a monitor that could not be asked at all, and a monitor that answered
+// with nothing this tool can apply. Neither is allowed to become a guess.
+func TestDisableRefusesAndExplainsWhenTheFallbackCannotBeDerived(t *testing.T) {
+	enumerationFailed := errors.New("EnumDisplaySettingsW: the monitor stopped answering")
+	cases := map[string]struct {
+		arrange func(*sessionFixture)
+		says    string
+		omits   string
+	}{
+		// The enumeration itself failed. The monitor resolved a moment ago and has
+		// gone since, so the message carries the driver's own words.
+		"the monitor could not be asked": {
+			arrange: func(f *sessionFixture) { f.display.setFailure("modes", enumerationFailed) },
+			says:    enumerationFailed.Error(),
+			omits:   "沒有回報",
+		},
+		// The enumeration worked and everything in it was filtered out. Nothing is
+		// broken; this monitor simply reports no mode this tool could apply.
+		"the monitor reports no usable mode": {
+			arrange: func(f *sessionFixture) { f.setModes() },
+			says:    "沒有回報",
+			omits:   enumerationFailed.Error(),
+		},
+	}
+	for name, testCase := range cases {
+		t.Run(name, func(t *testing.T) {
+			profile := profileWithoutFallback(domain.LegacySeedProfile().GameMode)
+			f := newFixtureWith(t, profile, fixtureNative, fixtureLayout(fixtureNative))
+			f.setDesktop(profile.GameMode)
+			testCase.arrange(f)
+			untouched := f.desktop()
+
+			err := f.s.Disable()
+			if !errors.Is(err, ErrFallbackUnknown) {
+				t.Fatalf("Disable error = %v, want ErrFallbackUnknown", err)
+			}
+			assertOperations(t, f.display.takeCalls(), "resolve", "layout", "modes")
+
+			got := f.s.Snapshot()
+			if got.FallbackKnown || got.FallbackMode != (domain.Mode{}) {
+				t.Fatalf("snapshot = %+v, want no fallback the UI could offer", got)
+			}
+			if !strings.Contains(got.FallbackReason, testCase.says) {
+				t.Fatalf("reason = %q, which never says %q", got.FallbackReason, testCase.says)
+			}
+			if strings.Contains(got.FallbackReason, testCase.omits) {
+				t.Fatalf("reason = %q, which reads like the other failure", got.FallbackReason)
+			}
+			if !reflect.DeepEqual(f.desktop(), untouched) {
+				t.Fatal("a refused restore changed the desktop")
+			}
+		})
+	}
+	// The enumeration failure keeps the driver's error reachable, so a caller that
+	// knows the sentinel can still tell a missing monitor from an empty catalogue.
+	profile := profileWithoutFallback(domain.LegacySeedProfile().GameMode)
+	f := newFixtureWith(t, profile, fixtureNative, fixtureLayout(fixtureNative))
+	f.setDesktop(profile.GameMode)
+	f.display.setFailure("modes", enumerationFailed)
+	if err := f.s.Disable(); !errors.Is(err, enumerationFailed) {
+		t.Fatalf("Disable error = %v, which lost the enumeration failure", err)
+	}
+}
+
+// A profile that watches nothing must not start a poll loop. The process list is
+// never read, and the state says the session is manual so nobody waits for a restore
+// that was never armed.
+func TestEnableStartsNoWatcherWhenNoProcessIsConfigured(t *testing.T) {
+	f := newFixtureWith(t, profileWithoutProcess(), fixtureNative, fixtureLayout(fixtureNative))
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	if f.clock.count() != 0 {
+		t.Fatalf("watchers started = %d, want none when nothing is watched", f.clock.count())
+	}
+	select {
+	case name := <-f.checker.called:
+		t.Fatalf("the process list was read for %q", name)
+	default:
+	}
+	got := f.s.Snapshot()
+	if !got.Managed || !got.AtGameMode {
+		t.Fatalf("snapshot = %+v", got)
+	}
+	if got.State != StateManualOnly {
+		t.Fatalf("state = %q, want %q", got.State, StateManualOnly)
+	}
+	if got.Profile.ProcessName != "" {
+		t.Fatalf("snapshot profile = %+v, want the empty process the user configured", got.Profile)
+	}
+}
+
+// Manual is the whole point of that configuration, so the manual path has to be
+// whole: the mode goes on, comes back off, and the desktop is the one it started as.
+func TestManualDisableStillWorksWithNoProcessConfigured(t *testing.T) {
+	f := newFixtureWith(t, profileWithoutProcess(), fixtureNative, fixtureLayout(fixtureNative))
+	before := f.desktop()
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.display.takeCalls()
+
+	if err := f.s.Disable(); err != nil {
+		t.Fatal(err)
+	}
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "test", "apply")
+	if got := f.desktop(); !reflect.DeepEqual(got, before) {
+		t.Fatalf("restored desktop = %+v, want %+v", got, before)
+	}
+	if got := f.s.Snapshot(); got.Managed || got.AtGameMode || got.State != StateNative {
+		t.Fatalf("snapshot = %+v", got)
+	}
+	if f.clock.count() != 0 {
+		t.Fatal("a manual-only session started a watcher")
+	}
+}
+
+// A restore moves every display in the saved arrangement, not only the target, so
+// every one of them has to still be attached. The target-only check let a renumbered
+// neighbour through and the failure surfaced from inside the apply, naming nothing
+// the user could act on.
+func TestRestoreNamesTheNeighbourThatIsNoLongerInTheSavedLayout(t *testing.T) {
+	f := newFixture(t)
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.display.takeCalls()
+	f.renameDisplay(rightDevice, `\.\DISPLAY9`)
+	applied := f.desktop()
+
+	err := f.s.Disable()
+	if !errors.Is(err, display.ErrLayoutUnsafe) {
+		t.Fatalf("Disable error = %v, want display.ErrLayoutUnsafe", err)
+	}
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout")
+	got := f.s.Snapshot()
+	if !strings.Contains(got.Message, rightDevice) {
+		t.Fatalf("message = %q, which never names the display that is no longer attached", got.Message)
+	}
+	if !got.Managed || got.State != StateError {
+		t.Fatalf("an aborted restore dropped ownership: %+v", got)
+	}
+	if !reflect.DeepEqual(f.desktop(), applied) {
+		t.Fatal("an aborted restore changed the desktop")
+	}
+
+	// The numbering comes back and so does the restore the session still owes.
+	f.renameDisplay(`\.\DISPLAY9`, rightDevice)
+	if err := f.s.Disable(); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.desktop(); !reflect.DeepEqual(got, fixtureLayout(f.original)) {
+		t.Fatalf("restored desktop = %+v", got)
+	}
+}
+
+// Every string the window shows is generated from the profile, so the profile has to
+// reach the window -- and it travels in the snapshot rather than through a reference
+// to the session, which the window is not allowed to hold.
+func TestSnapshotCarriesTheProfileSoTheUINeverInventsAString(t *testing.T) {
+	profile := profileWithGameMode(wideGameMode)
+	f := newFixtureWith(t, profile, fixtureNative, fixtureLayout(fixtureNative))
+
+	got := f.s.Snapshot()
+	if !reflect.DeepEqual(got.Profile, profile) {
+		t.Fatalf("profile = %+v, want %+v", got.Profile, profile)
+	}
+	if got.MatchedBy != domain.MatchNone {
+		t.Fatalf("MatchedBy = %v before anything was resolved", got.MatchedBy)
+	}
+	// The fallback is a pointer now. A snapshot that handed out the session's own
+	// pointer would let a renderer reach through it and change what a restore applies.
+	if got.Profile.FallbackMode == profile.FallbackMode {
+		t.Fatal("the snapshot shares the session's fallback mode pointer")
+	}
+
+	if _, err := f.s.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	got = f.s.Snapshot()
+	if !reflect.DeepEqual(got.Profile, profile) {
+		t.Fatalf("profile = %+v, want %+v", got.Profile, profile)
+	}
+	if got.MatchedBy != domain.MatchHardwareID || got.MatchedBy != got.Target.MatchedBy {
+		t.Fatalf("MatchedBy = %v, want the rung the resolved target reported (%v)", got.MatchedBy, got.Target.MatchedBy)
+	}
+	if !got.FallbackKnown || got.FallbackMode != *profile.FallbackMode {
+		t.Fatalf("snapshot = %+v, want the configured fallback %+v", got, *profile.FallbackMode)
 	}
 }

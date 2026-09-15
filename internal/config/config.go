@@ -196,11 +196,14 @@ func Marshal(file File) ([]byte, error) {
 // Profile converts an understood configuration into the domain profile the session
 // runs on.
 //
-// Two fields do not survive the trip and both are deliberate: domain.Profile.Name is
+// One field does not survive the trip and it is deliberate: domain.Profile.Name is
 // not part of the configuration model (the schema has no name key — the monitor's
-// Label is the human-facing string), and an absent fallbackMode becomes the zero
-// Mode because domain.Profile still stores that field by value. Task 8 of the plan
-// turns it into a *Mode, at which point nil travels end to end.
+// Label is the human-facing string), so a loaded profile carries an empty Name.
+//
+// An absent fallbackMode stays absent: nil here becomes nil there, and the session
+// derives the mode from what the monitor reports instead. The pointer that comes out
+// is the profile's own, never one into this document, because a profile is passed
+// around by value and a shared pointer would make one holder's edit another's.
 func (f File) Profile() domain.Profile {
 	profile := domain.Profile{
 		Monitor: domain.MonitorIdentity{
@@ -214,7 +217,8 @@ func (f File) Profile() domain.Profile {
 		RestoreDelay: time.Duration(f.Watch.RestoreDelaySeconds) * time.Second,
 	}
 	if f.Fallback != nil {
-		profile.FallbackNativeMode = domainMode(*f.Fallback)
+		fallback := domainMode(*f.Fallback)
+		profile.FallbackMode = &fallback
 	}
 	return profile
 }
@@ -225,6 +229,9 @@ func (f File) Profile() domain.Profile {
 // The schema's unit is whole seconds, so a sub-second RestoreDelay is truncated. The
 // settings dialog offers whole seconds, and anything the truncation turns into an
 // unacceptable value is caught by validate before Save writes a byte.
+//
+// A profile with no fallback mode writes fallbackMode: null rather than a mode of the
+// tool's choosing, which is what makes "derive it from the monitor" survive a save.
 func FromProfile(profile domain.Profile) File {
 	file := File{
 		Version: Version,
@@ -240,8 +247,8 @@ func FromProfile(profile domain.Profile) File {
 			RestoreDelaySeconds: uint32(profile.RestoreDelay / time.Second),
 		},
 	}
-	if profile.FallbackNativeMode != (domain.Mode{}) {
-		fallback := fileMode(profile.FallbackNativeMode)
+	if profile.FallbackMode != nil {
+		fallback := fileMode(*profile.FallbackMode)
 		file.Fallback = &fallback
 	}
 	return file

@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -78,7 +79,7 @@ func TestParseAcceptsTheSpecSampleAndConvertsItToAProfile(t *testing.T) {
 		ProcessName:  "VALORANT-Win64-Shipping.exe",
 		RestoreDelay: 3 * time.Second,
 	}
-	if got := file.Profile(); got != want {
+	if got := file.Profile(); !reflect.DeepEqual(got, want) {
 		t.Errorf("Profile() = %+v, want %+v", got, want)
 	}
 }
@@ -552,10 +553,10 @@ func roundTripProfile() domain.Profile {
 			ModelWasUnique: true,
 			Label:          "Mi Monitor 27",
 		},
-		GameMode:           domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32},
-		FallbackNativeMode: domain.Mode{Width: 2560, Height: 1440, RefreshHz: 180, BitsPerPixel: 32},
-		ProcessName:        "VALORANT-Win64-Shipping.exe",
-		RestoreDelay:       3 * time.Second,
+		GameMode:     domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32},
+		FallbackMode: &domain.Mode{Width: 2560, Height: 1440, RefreshHz: 180, BitsPerPixel: 32},
+		ProcessName:  "VALORANT-Win64-Shipping.exe",
+		RestoreDelay: 3 * time.Second,
 	}
 }
 
@@ -569,14 +570,14 @@ func TestFromProfileRoundTripsThroughParse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse(Marshal(FromProfile(p))) = %v, want nil\n%s", err, data)
 	}
-	if got := file.Profile(); got != profile {
+	if got := file.Profile(); !reflect.DeepEqual(got, profile) {
 		t.Errorf("round trip = %+v, want %+v\n%s", got, profile, data)
 	}
 }
 
 func TestFromProfileWritesANullFallbackWhenTheProfileHasNone(t *testing.T) {
 	profile := roundTripProfile()
-	profile.FallbackNativeMode = domain.Mode{}
+	profile.FallbackMode = nil
 	file := FromProfile(profile)
 	if file.Fallback != nil {
 		t.Fatalf("Fallback = %+v, want nil", *file.Fallback)
@@ -614,5 +615,56 @@ func TestMarshalWritesTheDocumentedFormat(t *testing.T) {
 	// encoding/json would turn into \u003c-style noise in a file people edit.
 	if strings.Contains(text, `\u00`) {
 		t.Errorf("document contains HTML escaping:\n%s", text)
+	}
+}
+
+// Ruling 3 of the continuation plan, both directions: an absent fallback is nil on
+// the document side and nil on the profile side, and nothing between them quietly
+// substitutes a mode of its own.
+func TestAnAbsentFallbackIsNilInBothDirections(t *testing.T) {
+	file, err := Parse(validParts().render())
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	if file.Fallback != nil {
+		t.Fatalf("Fallback = %+v, want nil", *file.Fallback)
+	}
+	if profile := file.Profile(); profile.FallbackMode != nil {
+		t.Fatalf("Profile().FallbackMode = %+v, want nil", *profile.FallbackMode)
+	}
+	profile := roundTripProfile()
+	profile.FallbackMode = nil
+	if back := FromProfile(profile); back.Fallback != nil {
+		t.Fatalf("FromProfile().Fallback = %+v, want nil", *back.Fallback)
+	}
+}
+
+// A configured fallback survives the conversion and is not shared with the document
+// it came from: the profile is handed around by value, and a pointer into the parsed
+// file would make one holder's edit another holder's surprise.
+func TestAConfiguredFallbackIsCopiedRatherThanShared(t *testing.T) {
+	parts := validParts()
+	parts.fallback = `{"width": 2560, "height": 1440, "refreshHz": 180, "bitsPerPixel": 32}`
+	file, err := Parse(parts.render())
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	want := domain.Mode{Width: 2560, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
+	profile := file.Profile()
+	if profile.FallbackMode == nil || *profile.FallbackMode != want {
+		t.Fatalf("Profile().FallbackMode = %+v, want %+v", profile.FallbackMode, want)
+	}
+	*profile.FallbackMode = domain.Mode{Width: 640, Height: 480, RefreshHz: 60, BitsPerPixel: 32}
+	if file.Fallback.Width != want.Width {
+		t.Fatalf("changing the profile changed the file it was read from: %+v", *file.Fallback)
+	}
+
+	back := FromProfile(profile)
+	if back.Fallback == nil || back.Fallback.Width != 640 {
+		t.Fatalf("FromProfile().Fallback = %+v, want the profile's own mode", back.Fallback)
+	}
+	*profile.FallbackMode = want
+	if back.Fallback.Width != 640 {
+		t.Fatalf("changing the profile changed the file built from it: %+v", *back.Fallback)
 	}
 }

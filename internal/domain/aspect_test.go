@@ -167,3 +167,21 @@ func TestDeriveFallbackRefusesToGuessFromAnEmptyCatalogue(t *testing.T) {
 		t.Fatalf("DeriveFallback(nil)=%#v, want ok=false", mode)
 	}
 }
+
+// ModeLabel is the one spelling of a mode the whole tool uses, so it is pinned here
+// rather than left to whichever caller writes the next status line.
+func TestModeLabelWritesAModeTheSameWayEverywhere(t *testing.T) {
+	cases := map[Mode]string{
+		{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}: "1920 × 1440 @ 180 Hz",
+		{Width: 2560, Height: 1440, RefreshHz: 60, BitsPerPixel: 32}:  "2560 × 1440 @ 60 Hz",
+		// A mode the tool could not read is said out loud rather than printed as
+		// "0 × 0 @ 0 Hz", which reads like a mode the monitor offered.
+		{}:                              unknownMode,
+		{Width: 1920, BitsPerPixel: 32}: unknownMode,
+	}
+	for mode, want := range cases {
+		if got := ModeLabel(mode); got != want {
+			t.Errorf("ModeLabel(%+v) = %q, want %q", mode, got, want)
+		}
+	}
+}

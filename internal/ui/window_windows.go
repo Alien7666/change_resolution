@@ -360,7 +360,7 @@ func (w *window) render(snapshot app.Snapshot) {
 	// While an operation runs the checkbox reflects the user intent, not the
 	// transient session state.
 	if !w.busy {
-		w.setToggleChecked(snapshot.FourByThree)
+		w.setToggleChecked(snapshot.AtGameMode)
 	}
 	w.applyEnabled(snapshot)
 
@@ -436,7 +436,7 @@ func (w *window) availableControls(snapshot app.Snapshot) controls {
 	return controls{
 		toggle:  interactive,
 		restore: interactive,
-		enable:  interactive && !snapshot.FourByThree,
+		enable:  interactive && !snapshot.AtGameMode,
 		refresh: !w.busy,
 		hide:    true,
 		show:    true,

@@ -66,6 +66,24 @@ func AspectLabel(width, height uint32) string {
 	return fmt.Sprintf("%.2f:1", float64(width)/float64(height))
 }
 
+// unknownMode is what a mode the tool could not read is called. Like unknownAspect it
+// is a guard rather than an expected case: a zero-sized mode never reaches a picker.
+const unknownMode = "未知的顯示模式"
+
+// ModeLabel is how a display mode is written for a person: the one spelling the whole
+// tool uses, so the mode named in a status line, in a button and in an error message
+// is recognisably the same mode.
+//
+// Bit depth is deliberately absent. It is always 32 and saying so in every sentence
+// would bury the numbers that differ; a caller with room for it -- the window's
+// "current mode" line -- appends it.
+func ModeLabel(mode Mode) string {
+	if mode.Width == 0 || mode.Height == 0 {
+		return unknownMode
+	}
+	return fmt.Sprintf("%d × %d @ %d Hz", mode.Width, mode.Height, mode.RefreshHz)
+}
+
 func greatestCommonDivisor(a, b uint32) uint32 {
 	for b != 0 {
 		a, b = b, a%b

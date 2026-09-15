@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -154,7 +155,7 @@ func TestSavedFileRoundTripsThroughLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load = %v", err)
 	}
-	if got := file.Profile(); got != profile {
+	if got := file.Profile(); !reflect.DeepEqual(got, profile) {
 		t.Errorf("Load().Profile() = %+v, want %+v", got, profile)
 	}
 }
@@ -233,7 +234,7 @@ func TestConcurrentSavesNeverLeaveATornFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load after concurrent saves = %v", err)
 	}
-	if got := file.Profile(); got != wide && got != narrow {
+	if got := file.Profile(); !reflect.DeepEqual(got, wide) && !reflect.DeepEqual(got, narrow) {
 		t.Errorf("Load().Profile() = %+v, want either %+v or %+v", got, wide, narrow)
 	}
 	if names := entries(t, dir); len(names) != 1 || names[0] != "config.json" {

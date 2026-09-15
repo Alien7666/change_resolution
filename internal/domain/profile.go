@@ -71,13 +71,38 @@ type Target struct {
 	MatchedBy  MatchLevel
 }
 
+// Profile is the configuration a session runs on. Every field comes from the user.
+//
+// FallbackMode is optional, and nil is a normal value rather than a missing one: it
+// means "work out what to restore to from the modes the monitor reports, at the
+// moment the restore is asked for". That is the better answer for a profile written
+// on one machine and read on another, and it is why the field is a pointer -- a zero
+// Mode would be indistinguishable from a monitor whose mode could not be read. A
+// non-nil value is the user overriding that derivation with a mode of their own.
+//
+// Name is not part of the v1 configuration schema; a profile read from disk carries
+// an empty one, and the string a person reads is Monitor.Label.
+//
+// ProcessName may be empty. That is also a configuration rather than a gap: nothing
+// is watched, nothing is polled, and the mode comes back off by hand.
 type Profile struct {
-	Name               string
-	Monitor            MonitorIdentity
-	GameMode           Mode
-	FallbackNativeMode Mode
-	ProcessName        string
-	RestoreDelay       time.Duration
+	Name         string
+	Monitor      MonitorIdentity
+	GameMode     Mode
+	FallbackMode *Mode
+	ProcessName  string
+	RestoreDelay time.Duration
+}
+
+// Copy returns a Profile that shares nothing with the receiver, so a copy handed to
+// another goroutine -- a session snapshot on its way to the window, say -- cannot be
+// used to reach back through FallbackMode and change what a restore will apply.
+func (p Profile) Copy() Profile {
+	if p.FallbackMode != nil {
+		mode := *p.FallbackMode
+		p.FallbackMode = &mode
+	}
+	return p
 }
 
 // LegacySeedProfile is the configuration the tool shipped with, demoted to a seed:
@@ -97,9 +122,13 @@ func LegacySeedProfile() Profile {
 			ModelWasUnique: true,
 			Label:          "Mi Monitor (XMI27B2)",
 		},
-		GameMode:           Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32},
-		FallbackNativeMode: Mode{Width: 2560, Height: 1440, RefreshHz: 180, BitsPerPixel: 32},
-		ProcessName:        "VALORANT-Win64-Shipping.exe",
-		RestoreDelay:       3 * time.Second,
+		GameMode: Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32},
+		// The seed is the one profile that does not have to derive its fallback: the
+		// machine it describes is the machine it was written on, and 2560x1440 @ 180 Hz
+		// is what that monitor ran before the tool ever touched it. Every other profile
+		// leaves this nil and lets the monitor answer for itself.
+		FallbackMode: &Mode{Width: 2560, Height: 1440, RefreshHz: 180, BitsPerPixel: 32},
+		ProcessName:  "VALORANT-Win64-Shipping.exe",
+		RestoreDelay: 3 * time.Second,
 	}
 }

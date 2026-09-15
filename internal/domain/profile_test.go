@@ -20,8 +20,12 @@ func TestLegacySeedProfileCarriesTheOriginalHardware(t *testing.T) {
 	if p.GameMode != (Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}) {
 		t.Fatalf("GameMode = %#v", p.GameMode)
 	}
-	if p.FallbackNativeMode != (Mode{Width: 2560, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}) {
-		t.Fatalf("FallbackNativeMode = %#v", p.FallbackNativeMode)
+	// The seed keeps the fallback the shipped tool restored to. It is a pointer
+	// because a profile may legitimately record none -- the fallback is then derived
+	// from what the monitor reports -- and the seed is the one profile that never has
+	// to derive anything, because the machine it describes is the one it came from.
+	if p.FallbackMode == nil || *p.FallbackMode != (Mode{Width: 2560, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}) {
+		t.Fatalf("FallbackMode = %#v", p.FallbackMode)
 	}
 	if p.ProcessName != "VALORANT-Win64-Shipping.exe" || p.RestoreDelay != 3*time.Second {
 		t.Fatalf("process/delay = %q/%s", p.ProcessName, p.RestoreDelay)
@@ -90,5 +94,31 @@ func TestMaxDimensionBoundsAModeTheToolWouldRefuse(t *testing.T) {
 	// coordinates Win32 uses — which is the reason it is a bound and not a comment.
 	if int64(MaxDimension)*8 > math.MaxInt32 {
 		t.Fatalf("MaxDimension = %d leaves no room for a multi-display desktop in int32", MaxDimension)
+	}
+}
+
+// A Profile is handed around by value, and the optional fallback is the one field a
+// value copy does not separate. Copy is what a caller that publishes a profile to
+// another goroutine uses so that neither of them can change the other's restore.
+func TestProfileCopyDoesNotShareTheOptionalFallback(t *testing.T) {
+	original := LegacySeedProfile()
+	copied := original.Copy()
+	if copied.FallbackMode == original.FallbackMode {
+		t.Fatal("Copy shared the fallback mode pointer")
+	}
+	if *copied.FallbackMode != *original.FallbackMode {
+		t.Fatalf("Copy changed the fallback: %+v", *copied.FallbackMode)
+	}
+	*copied.FallbackMode = Mode{Width: 640, Height: 480, RefreshHz: 60, BitsPerPixel: 32}
+	if original.FallbackMode.Width != 2560 {
+		t.Fatalf("changing the copy changed the original: %+v", *original.FallbackMode)
+	}
+
+	// A profile that derives its fallback copies just as cleanly; nil is a value, not
+	// an absence to be filled in.
+	derived := original
+	derived.FallbackMode = nil
+	if derived.Copy().FallbackMode != nil {
+		t.Fatal("Copy invented a fallback for a profile that records none")
 	}
 }
