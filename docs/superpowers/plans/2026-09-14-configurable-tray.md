@@ -793,7 +793,7 @@ Expected: with `RESOLUTION_TRAY_CONFIG` pointed at a hand-written valid file, th
 
 One dialog, one validation path, one save path. The first-run wizard differs from the settings dialog only in its title and step hints.
 
-- [ ] **Step 1: Write the failing dialog-logic tests**
+- [x] **Step 1: Write the failing dialog-logic tests**
 
 Everything decidable without Walk gets a test; the Walk plumbing does not:
 
@@ -811,11 +811,11 @@ func TestAbandoningFirstRunLeavesNoFileBehind(t *testing.T)
 
 `TestSaveWrites...` must assert the dialog validates by calling `internal/config`, not by re-implementing the rules — two validation paths that disagree is the failure mode this test exists to prevent.
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `go test ./internal/ui`
 
-- [ ] **Step 3: Build the three sections**
+- [x] **Step 3: Build the three sections**
 
 Modal, resizable (it contains a table), about `560×460`:
 
@@ -825,13 +825,13 @@ Modal, resizable (it contains a table), about `560×460`:
 
 Each section unlocks the next. Nothing in the dialog applies a mode, and there is no preview. Re-enumerate on open and on 重新整理; cache for the dialog's lifetime; invalidate after the tool itself applies or restores a mode.
 
-- [ ] **Step 4: Wire the entry points and the save**
+- [x] **Step 4: Wire the entry points and the save**
 
 Add 設定… to the main window and to the tray menu above the separator. **Both are disabled whenever the session owns an applied mode**, with the reason beside them (請先恢復原始解析度再變更設定) — changing the target monitor or mode mid-session would strand the saved arrangement. This rule is **not** relaxed by the GPU-scaling cycle in Task 15, and the asymmetry is deliberate: a profile change voids what `saved` *means* (it was recorded around one target monitor and one target mode, and no ordering repairs that), while a scaling change only threatens the device *names* inside it, which the cycle re-derives by consuming `saved` before the NVAPI set and rebuilding it from a fresh layout after. Save runs `config.Save` (atomic) and then `Provider.Replace`; a failed write keeps the dialog open with the user's input intact and shows the error, and the previous config file is necessarily untouched because the write is temp-then-rename.
 
 Startup: absent config → open the dialog as 初次設定, pre-filled from `LegacySeedProfile()` when `MONITOR\XMI27B2` is attached and reports `1920×1440 @ 180 Hz`, with a line reading 偵測到既有設定，確認後儲存. 稍後再設定 leaves no file and the next start is a first run again. Also complete the 重新設定 exit from Task 11: back the unreadable file up as `config.bad-<timestamp>.json` and open the same dialog, only after the user confirms.
 
-- [ ] **Step 5: Verify and commit the dialog**
+- [x] **Step 5: Verify and commit the dialog**
 
 ```powershell
 gofmt -l ./internal ./cmd
@@ -988,7 +988,7 @@ Expected: layout assertions pass with no GPU; the opt-in read reports the real s
 
 `Session.opMu` is already the one place that serializes display workflows, which is the whole reason the scaling controller belongs here and not beside the UI: a second lock would make "which one first" a question with no structural answer.
 
-- [ ] **Step 1: Build the shared-recorder fakes — before any code has to satisfy them**
+- [x] **Step 1: Build the shared-recorder fakes — before any code has to satisfy them**
 
 This step is what turns the ordering rules from advice into structure, so it comes first and stands alone. In `internal/app/scaling_test.go`:
 
