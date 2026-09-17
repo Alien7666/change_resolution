@@ -872,6 +872,51 @@ func TestScalingFailuresNeverChangeManagedSavedOrToggleAvailability(t *testing.T
 	}
 }
 
+func TestScalingUnavailableReasonNamesKnownAdapterAndVendorControlPanel(t *testing.T) {
+	target := domain.Target{
+		Identity:            domain.MonitorIdentity{Label: "Dell U4924DW"},
+		AdapterDeviceString: "AMD Radeon RX 7800 XT",
+	}
+	reason := scalingUnavailableReason(target, scaling.Availability{
+		Reason: "NVAPI unavailable: load nvapi64.dll",
+		Err:    errors.Join(scaling.ErrNvapiUnavailable, scaling.ErrNvapiDLLUnavailable),
+	}, nil)
+	for _, want := range []string{"AMD Radeon RX 7800 XT", "AMD Software"} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("reason = %q, want %q", reason, want)
+		}
+	}
+}
+
+func TestScalingUnavailableReasonNamesMonitorOutsideNVIDIAPath(t *testing.T) {
+	target := domain.Target{Identity: domain.MonitorIdentity{Label: "Dell U4924DW"}}
+	reason := scalingUnavailableReason(target, scaling.Availability{Available: true}, scaling.ErrScalingTargetNotFound)
+	if !strings.Contains(reason, "Dell U4924DW") || !strings.Contains(reason, "NVIDIA") {
+		t.Fatalf("reason = %q, want monitor and NVIDIA path", reason)
+	}
+}
+
+func TestScalingUnavailableReasonExplainsMissingDriverInterface(t *testing.T) {
+	reason := scalingUnavailableReason(domain.Target{}, scaling.Availability{
+		Err: scaling.ErrNvapiInterfaceUnavailable,
+	}, nil)
+	if reason != "這個 NVIDIA 驅動版本不提供需要的介面。" {
+		t.Fatalf("reason = %q", reason)
+	}
+}
+
+func TestScalingUnavailableReasonPreservesInitializeDiagnostic(t *testing.T) {
+	target := domain.Target{AdapterDeviceString: "NVIDIA GeForce RTX 3070"}
+	const diagnostic = "NVAPI unavailable: initialize NVAPI: NVAPI status -6: NVAPI API not initialized"
+	reason := scalingUnavailableReason(target, scaling.Availability{
+		Reason: diagnostic,
+		Err:    scaling.ErrNvapiUnavailable,
+	}, nil)
+	if reason != diagnostic {
+		t.Fatalf("reason = %q, want initialize diagnostic preserved", reason)
+	}
+}
+
 func TestDisplayFailuresNeverChangeScalingOwnershipOrSavedValue(t *testing.T) {
 	f := newScalingFixture(t)
 	f.queueApplied(ScalingFullScreenByGPU())

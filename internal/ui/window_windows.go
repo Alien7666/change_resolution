@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Alien7666/change_resolution/internal/app"
 	"github.com/Alien7666/change_resolution/internal/display"
@@ -46,6 +47,33 @@ const (
 	settingsText         = "設定…"
 	settingsManagedText  = "請先恢復原始解析度再變更設定"
 
+	// The GPU-scaling row. Every literal here names an operation or a decision this
+	// product made; none of them names a monitor, a mode or an aspect, because all
+	// three arrive in the snapshot.
+	scalingApplyText      = "設為全螢幕縮放（GPU）"
+	scalingRestoreText    = "還原 GPU 縮放設定"
+	scalingPrefix         = "GPU 縮放："
+	scalingUnreadText     = "尚未讀取"
+	scalingUnreadablePre  = "無法讀取——"
+	scalingCyclingText    = "正在變更 GPU 縮放…"
+	scalingStaticReminder = "，與恢復後的比例不同，請確認已啟用全螢幕縮放。"
+
+	// scalingOverrideNote is permanent, and it is not a note to be replaced by a
+	// feature later. The NVIDIA control panel's 「覆寫遊戲和程式所設定的縮放模式」 has no
+	// NVAPI interface at all: this tool can neither read it nor set it, and a game is
+	// free to override the value that was just written. A button that cannot promise
+	// what the user actually wants has to say so where the button is.
+	scalingOverrideNote = "若遊戲內仍有黑邊，請到 NVIDIA 控制台勾選" +
+		"「覆寫遊戲和程式所設定的縮放模式」——這一項工具無法代為設定。"
+
+	scalingUnconfiguredReason = "尚未設定顯示器，無法讀取或變更 GPU 縮放。"
+	scalingUnprobedReason     = "尚未讀取 GPU 縮放設定，請按「重新整理」。"
+	scalingCycleReason        = "正在變更 GPU 縮放，請稍候。"
+
+	scalingApplyOperation   = "變更 GPU 縮放"
+	scalingRestoreOperation = "還原 GPU 縮放設定"
+	exitScalingOperation    = "結束前還原 GPU 縮放設定"
+
 	// restoreButtonText carries no numbers. The mode a restore applies depends on the
 	// profile and on what the monitor reports, so it is rendered into the button's
 	// tooltip from each snapshot instead of frozen into its caption.
@@ -67,10 +95,30 @@ const (
 	autoRestoreOperation = "自動恢復顯示模式"
 	shutdownOperation    = "結束前恢復顯示模式"
 
-	// The window gained the 自動恢復 line, and 恢復原始解析度 is a wider button than the
-	// 恢復 2K it replaced.
-	windowWidth  = 520
-	windowHeight = 360
+	// Two designs each added to this form -- the profile work brought the 自動恢復 line
+	// and a fourth button, the scaling work a value line, a button with its reason
+	// beside it and the measured reminder. They were laid out together once rather
+	// than a line at a time, which is why these numbers jumped instead of creeping.
+	windowWidth  = 560
+	windowHeight = 600
+
+	// reasonLineBudget and reasonLineLimit are what keep a fixed-size window fixed.
+	// NVAPI rejections are long sentences this tool does not author, and a smoke test
+	// has already caught one widening the form; folding them to a known rune count
+	// before they reach Walk makes that structurally impossible. Nothing is lost --
+	// the untouched text is the label's tooltip.
+	reasonLineBudget = 34
+	reasonLineLimit  = 3
+
+	// statusLineLimit and adviceLineLimit are the same bound for the two taller labels.
+	statusLineLimit   = 5
+	adviceLineLimit   = 4
+	detailLineLimit   = 5
+	overrideLineLimit = 3
+
+	// Shell balloons are asynchronous. Keep the notification icon alive long enough
+	// for Windows to present a failed scaling-restore warning before process exit.
+	exitWarningLifetime = 5 * time.Second
 
 	// monitorLabelBudget is how much of a monitor's name the fixed-width 目標螢幕 line
 	// shows before it is elided. Nothing is lost: the whole name is the line's tooltip.
@@ -107,6 +155,11 @@ type window struct {
 	toggle           *walk.CheckBox
 	autoRestoreLabel *walk.Label
 	statusLabel      *walk.TextLabel
+	scalingLabel     *walk.Label
+	scalingButton    *walk.PushButton
+	scalingAdvice    *walk.TextLabel
+	scalingDetails   *walk.TextLabel
+	scalingOverride  *walk.TextLabel
 	settingsReason   *walk.TextLabel
 	settingsButton   *walk.PushButton
 	refreshButton    *walk.PushButton
@@ -124,9 +177,16 @@ type window struct {
 	settingsAction *walk.Action
 	exitAction     *walk.Action
 
-	busy              bool
-	suppressToggle    bool
-	unavailableReason string
+	busy           bool
+	suppressToggle bool
+
+	// The two availability groups are two fields on purpose. One latched string used
+	// to feed one interactive flag, so a driver that could not answer about GPU
+	// scaling disabled the display-mode toggle with it -- a control that has nothing
+	// to do with the GPU scaling API. Neither field is ever written from the other
+	// half's failure.
+	unavailableReason        string
+	scalingUnavailableReason string
 
 	// reportedAutoRestoreFailures is the highest Snapshot.AutoRestoreFailures this
 	// window has already announced.
@@ -217,6 +277,23 @@ func (w *window) buildMainWindow() error {
 				OnCheckedChanged: w.onToggled,
 			},
 			dec.Label{AssignTo: &w.autoRestoreLabel, Text: "自動恢復：讀取中"},
+			dec.Label{AssignTo: &w.scalingLabel, Text: scalingPrefix + scalingUnreadText},
+			dec.Composite{
+				Layout: dec.HBox{MarginsZero: true, Spacing: 8},
+				Children: []dec.Widget{
+					dec.PushButton{AssignTo: &w.scalingButton, Text: scalingApplyText, OnClicked: w.onScaling},
+					dec.HSpacer{},
+				},
+			},
+			// The reason a disabled button is disabled, and the measured reminder, share
+			// one full-width label directly under the button. They are beside the button
+			// in the sense the spec means -- on screen next to it, never only in a
+			// tooltip -- and putting them in the button's own row instead would not fit:
+			// the restore caption already carries a scaling value, and an NVAPI rejection
+			// is a whole sentence. This is also the layout the spec's own sketch shows.
+			dec.TextLabel{AssignTo: &w.scalingAdvice, Text: "", MinSize: dec.Size{Height: 64}},
+			dec.TextLabel{AssignTo: &w.scalingDetails, Text: "", MinSize: dec.Size{Height: 80}},
+			dec.TextLabel{AssignTo: &w.scalingOverride, Text: scalingOverrideNote, MinSize: dec.Size{Height: 48}},
 			dec.TextLabel{
 				AssignTo: &w.statusLabel,
 				Text:     "狀態：啟動中",
@@ -267,8 +344,8 @@ func (w *window) buildMainWindow() error {
 	return nil
 }
 
-// freezeSize drops the resize and maximise affordances so the window keeps the
-// fixed 460x280 layout.
+// freezeSize drops the resize and maximise affordances so the window keeps the one
+// fixed layout windowWidth x windowHeight describes.
 func (w *window) freezeSize() {
 	hwnd := w.mw.Handle()
 	style := win.GetWindowLong(hwnd, win.GWL_STYLE)
@@ -393,6 +470,44 @@ func (w *window) onRestore() {
 	})
 }
 
+// onScaling presses whichever of the two scaling commands the current ownership makes
+// available. The window checks its own policy first for the same reason every other
+// command does: the session would refuse anyway, and a refusal the user cannot see is
+// worse than a button that was never offered.
+func (w *window) onScaling() {
+	if w.busy {
+		return
+	}
+	snapshot := w.provider.Snapshot()
+	w.syncConfigState()
+	w.updateScalingAvailability(snapshot)
+	available := w.availableControls(snapshot)
+
+	if snapshot.Scaling.Owned {
+		if !available.scalingRestore {
+			return
+		}
+		w.runOperation(scalingRestoreOperation, func() error {
+			session, err := w.currentSession()
+			if err != nil {
+				return err
+			}
+			return session.RestoreGPUScaling()
+		})
+		return
+	}
+	if !available.scalingApply {
+		return
+	}
+	w.runOperation(scalingApplyOperation, func() error {
+		session, err := w.currentSession()
+		if err != nil {
+			return err
+		}
+		return session.ApplyGPUScaling()
+	})
+}
+
 func (w *window) onRefresh() {
 	operation := refreshOperation
 	if !w.provider.Configured() {
@@ -481,11 +596,13 @@ func (w *window) showSettings(firstRun bool) (bool, error) {
 	if w.provider == nil || w.displays == nil || w.processes == nil || w.openSettings == nil {
 		return false, errors.New("設定介面缺少必要的執行元件")
 	}
-	profile := w.provider.Snapshot().Profile
+	snapshot := w.provider.Snapshot()
+	profile := snapshot.Profile
 	if firstRun {
 		profile = domain.Profile{}
 	}
-	model := newSettingsModel(w.displays, w.processes, profile, firstRun)
+	model := newSettingsModel(w.displays, w.processes, profile, snapshot.Scaling, firstRun)
+	model.readScaling = w.provider.ReadScaling
 	return w.openSettings(model, w.provider.Replace)
 }
 
@@ -547,10 +664,12 @@ func (w *window) onExit() {
 	}
 	w.busy = true
 	w.render(w.provider.Snapshot())
+	retiring := w.provider.Session()
 
 	go func() {
 		err := w.provider.Shutdown()
 		snapshot := w.provider.Snapshot()
+		snapshot.Scaling = shutdownScaling(w.provider, retiring)
 		w.mw.Synchronize(func() {
 			w.busy = false
 			w.render(snapshot)
@@ -558,10 +677,62 @@ func (w *window) onExit() {
 				w.reportError(shutdownOperation, err, snapshot)
 				return
 			}
-			_ = w.tray.Dispose()
-			walk.App().Exit(0)
+			warning := exitScalingWarning(snapshot.Scaling)
+			visible := w.mw.Visible()
+			if warning != "" {
+				w.reportNotice(exitScalingOperation, warning)
+			}
+			if lifetime := exitNoticeLifetime(warning, visible); lifetime > 0 {
+				time.AfterFunc(lifetime, func() { w.mw.Synchronize(w.finishExit) })
+				return
+			}
+			w.finishExit()
 		})
 	}()
+}
+
+func (w *window) finishExit() {
+	_ = w.tray.Dispose()
+	walk.App().Exit(0)
+}
+
+func exitNoticeLifetime(warning string, windowVisible bool) time.Duration {
+	if warning != "" && !windowVisible {
+		return exitWarningLifetime
+	}
+	return 0
+}
+
+// shutdownScaling is the scaling row as it stands after a shutdown, which is not the
+// same thing as the row the Provider is holding.
+//
+// A scaling restore that fails at exit deliberately does not fail Shutdown: the value
+// is runtime-only and a reboot undoes it, while a tool that cannot be closed is a
+// worse outcome. The signal is structural instead -- this run still owns a change it
+// did not put back -- and it has to be read from the session that was retired, because
+// Provider clears its session pointer before shutting that session down and therefore
+// stops recording anything the exit path publishes. Reading Provider alone would warn
+// about every successful restore.
+func shutdownScaling(provider *app.Provider, retired *app.Session) app.ScalingSnapshot {
+	if retired != nil {
+		return retired.Snapshot().Scaling
+	}
+	if provider != nil {
+		return provider.Snapshot().Scaling
+	}
+	return app.ScalingSnapshot{}
+}
+
+// exitScalingWarning is what the user is told about a scaling value the tool changed
+// and could not put back. It never claims anything is broken: the value is not
+// persisted, so it says what will undo it without the user doing anything.
+func exitScalingWarning(view app.ScalingSnapshot) string {
+	if !view.Owned {
+		return ""
+	}
+	return "結束前還原 GPU 縮放設定失敗，目前仍是本工具寫入的值。\n" +
+		"這個值不會被保存：重新開機或重新載入顯示卡驅動就會回到「" + app.ScalingLabel(view.Saved) + "」，" +
+		"也可以到 NVIDIA 控制台手動改回。"
 }
 
 // runOperation disables the mutating controls, performs one session operation off
@@ -599,6 +770,17 @@ func (w *window) reportError(operation string, err error, snapshot app.Snapshot)
 	_ = w.tray.ShowError(windowTitle, message)
 }
 
+// reportNotice is reportError's non-error twin: something the user has to be told
+// once, through whichever surface they are actually looking at.
+func (w *window) reportNotice(operation, message string) {
+	text := operation + "：\n" + message
+	if w.mw.Visible() {
+		walk.MsgBox(w.mw, windowTitle, text, walk.MsgBoxIconWarning|walk.MsgBoxSetForeground)
+		return
+	}
+	_ = w.tray.ShowWarning(windowTitle, text)
+}
+
 func (w *window) hideToTray() { w.mw.Hide() }
 
 func (w *window) showMainWindow() {
@@ -628,13 +810,20 @@ func (w *window) render(snapshot app.Snapshot) {
 		w.unavailableReason = ""
 	}
 	w.updateAvailability(snapshot)
+	w.updateScalingAvailability(snapshot)
 
 	_ = w.targetLabel.SetText(targetText(snapshot))
 	_ = w.targetLabel.SetToolTipText(targetTooltip(snapshot))
 	_ = w.modeLabel.SetText(modeText(snapshot))
 	_ = w.toggle.SetText(toggleText(snapshot))
 	_ = w.autoRestoreLabel.SetText(autoRestoreText(snapshot))
-	_ = w.statusLabel.SetText(w.statusText(snapshot))
+	status := w.statusText(snapshot)
+	// Folded here rather than in statusText: the sentence a person reads is the one the
+	// session wrote, and every test that asserts a message survived the window intact
+	// asserts it against the unfolded string.
+	_ = w.statusLabel.SetText(fitText(status, reasonLineBudget, statusLineLimit))
+	_ = w.statusLabel.SetToolTipText(status)
+	w.renderScaling(snapshot)
 	_ = w.restoreButton.SetToolTipText(restoreTooltip(snapshot))
 	_ = w.refreshButton.SetText(w.refreshCaption())
 	settingsReason := settingsDisabledReason(snapshot)
@@ -750,19 +939,92 @@ func (w *window) updateAvailability(snapshot app.Snapshot) {
 	}
 }
 
+// updateScalingAvailability is the second availability group, and it is derived rather
+// than latched: the session re-probes on every refresh and on every scaling workflow,
+// so snapshot.Scaling is already the current answer and a latch would only hold a
+// stale one. It reads snapshot.Scaling and the target, and nothing else -- no display
+// failure that is about a display mode may appear here, and nothing here may ever be
+// written into unavailableReason.
+//
+// The target is consulted for one reason the scaling spec spells out: NVAPI is asked
+// about a monitor, so a monitor the tool cannot resolve at all is this button's own
+// unavailability too. It gets its own sentence rather than borrowing the mode toggle's,
+// because the two commands that are off are different commands. A mode the monitor does
+// not report, by contrast, is purely a display-side refusal and never reaches here.
+func (w *window) updateScalingAvailability(snapshot app.Snapshot) {
+	view := snapshot.Scaling
+	switch {
+	case w.configState != configStateConfigured:
+		w.scalingUnavailableReason = scalingUnconfiguredReason
+	case unresolvedTarget(snapshot):
+		w.scalingUnavailableReason = "目前無法對應到 " + monitorLabelShort(snapshot) +
+			"，無法讀取或變更它的 GPU 縮放。"
+	case view.Available:
+		w.scalingUnavailableReason = ""
+	case strings.TrimSpace(view.Reason) != "":
+		// The provider/session has already combined functional availability with the
+		// selected monitor's diagnostic metadata. Appending generic text here could
+		// duplicate or contradict its vendor-specific advice.
+		w.scalingUnavailableReason = strings.TrimSpace(view.Reason)
+	default:
+		w.scalingUnavailableReason = scalingUnprobedReason
+	}
+}
+
+// unresolvedTarget reports the three ways the configured monitor cannot be pointed at.
+// ErrModeNotSupported is deliberately absent: it says the monitor is there and refuses
+// one mode, which is no reason to stop reading its scaling setting.
+func unresolvedTarget(snapshot app.Snapshot) bool {
+	return errors.Is(snapshot.Err, display.ErrTargetNotFound) ||
+		errors.Is(snapshot.Err, display.ErrTargetAmbiguous) ||
+		errors.Is(snapshot.Err, display.ErrTargetMirrored)
+}
+
+func (w *window) renderScaling(snapshot app.Snapshot) {
+	line := scalingText(snapshot)
+	_ = w.scalingLabel.SetText(fitText(line, reasonLineBudget, 1))
+	_ = w.scalingLabel.SetToolTipText(line)
+
+	_ = w.scalingButton.SetText(scalingButtonText(snapshot))
+	_ = w.scalingButton.SetToolTipText(w.scalingButtonNote(snapshot))
+
+	advice := w.scalingAdviceText(snapshot)
+	_ = w.scalingAdvice.SetText(fitText(advice, reasonLineBudget, adviceLineLimit))
+	_ = w.scalingAdvice.SetToolTipText(advice)
+	w.scalingAdvice.SetVisible(advice != "")
+
+	details := scalingDetailsText(snapshot)
+	_ = w.scalingDetails.SetText(fitText(details, reasonLineBudget, detailLineLimit))
+	_ = w.scalingDetails.SetToolTipText(details)
+	w.scalingDetails.SetVisible(details != "")
+
+	override := scalingOverrideText()
+	_ = w.scalingOverride.SetText(fitText(override, reasonLineBudget, overrideLineLimit))
+	_ = w.scalingOverride.SetToolTipText(override)
+}
+
+// scalingAdviceText is the button's own explanation. Scaling measurements and the
+// permanent override warning have dedicated visible rows so neither can be pushed into
+// a tooltip by a long driver refusal.
+func (w *window) scalingAdviceText(snapshot app.Snapshot) string {
+	return w.scalingButtonNote(snapshot)
+}
+
 // controls says which commands accept input. It is one value so the policy can be
 // decided without touching Walk and asserted in a test.
 type controls struct {
-	toggle     bool
-	restore    bool
-	enable     bool
-	refresh    bool
-	openFolder bool
-	reset      bool
-	settings   bool
-	hide       bool
-	show       bool
-	exit       bool
+	toggle         bool
+	restore        bool
+	enable         bool
+	refresh        bool
+	openFolder     bool
+	reset          bool
+	settings       bool
+	scalingApply   bool
+	scalingRestore bool
+	hide           bool
+	show           bool
+	exit           bool
 }
 
 // availableControls keeps the read-only command live while the target monitor is
@@ -776,20 +1038,40 @@ type controls struct {
 // *does* own the desktop is the exception: it restores the arrangement it recorded
 // before it applied anything and never consults the fallback, so taking that button
 // away would leave the user holding the applied mode with no way out but exiting.
+//
+// The scaling pair is derived from a separate reason and is otherwise unconditioned by
+// the display half. In particular it stays live while the session owns an applied
+// mode: that is the only moment a user can see the black bars the button is for, so a
+// button disabled exactly then is a button that does not exist. Pressing it runs the
+// whole restore-set-reapply cycle, and the line under it says so. `設定…` is the
+// deliberate contrast and stays disabled while managed, because a profile change voids
+// what the saved arrangement means while a scaling change only threatens the device
+// names inside it, which the cycle re-derives.
+//
+// While the cycle itself runs, every mutating control is off, its own button included.
+// opMu already guarantees correctness -- a second click merely queues -- but a queued
+// command against a desktop that is mid-change is not something to offer. Refresh and
+// 開啟設定檔所在資料夾 are reads; hide and show change nothing on the desktop. Exit
+// starts a shutdown workflow and is therefore mutating, so it is off too.
 func (w *window) availableControls(snapshot app.Snapshot) controls {
 	configured := w.configState == configStateConfigured
-	interactive := configured && w.unavailableReason == "" && !w.busy
+	cycling := snapshot.State == app.StateScalingCycle
+	idle := !w.busy && !cycling
+	interactive := configured && w.unavailableReason == "" && idle
+	scalable := configured && w.scalingUnavailableReason == "" && idle
 	return controls{
-		toggle:     interactive,
-		restore:    interactive && (snapshot.Managed || snapshot.FallbackKnown),
-		enable:     interactive && !snapshot.AtGameMode,
-		refresh:    !w.busy,
-		openFolder: !w.busy,
-		reset:      !w.busy && w.configState == configStateReadOnly,
-		settings:   !w.busy && !snapshot.Managed && w.configState != configStateReadOnly,
-		hide:       true,
-		show:       true,
-		exit:       !w.busy,
+		toggle:         interactive,
+		restore:        interactive && (snapshot.Managed || snapshot.FallbackKnown),
+		enable:         interactive && !snapshot.AtGameMode,
+		refresh:        !w.busy,
+		openFolder:     !w.busy,
+		reset:          idle && w.configState == configStateReadOnly,
+		settings:       idle && !snapshot.Managed && w.configState != configStateReadOnly,
+		scalingApply:   scalable && !snapshot.Scaling.Owned,
+		scalingRestore: scalable && snapshot.Scaling.Owned,
+		hide:           true,
+		show:           true,
+		exit:           idle,
 	}
 }
 
@@ -803,6 +1085,7 @@ func (w *window) applyEnabled(snapshot app.Snapshot) {
 	w.resetButton.SetEnabled(available.reset)
 	w.resetButton.SetVisible(w.configState == configStateReadOnly)
 	w.settingsButton.SetEnabled(available.settings)
+	w.scalingButton.SetEnabled(available.scalingApply || available.scalingRestore)
 	w.hideButton.SetEnabled(available.hide)
 
 	_ = w.showAction.SetEnabled(available.show)
@@ -1041,11 +1324,181 @@ func stateText(snapshot app.Snapshot) string {
 		return watchedProcess(snapshot) + " 已結束，等待恢復顯示模式"
 	case app.StateRestoring:
 		return "正在恢復顯示模式"
+	case app.StateScalingCycle:
+		// The session names the phase in Message for the whole of the cycle, so this
+		// is only the sentence a snapshot without one would get.
+		return scalingCyclingText
 	case app.StateError:
 		return "發生錯誤"
 	default:
 		return string(snapshot.State)
 	}
+}
+
+// scalingText is the value line. During the cycle it names the phase rather than a
+// result, because there is no result yet and the previous one is about to stop being
+// true. Outside it the line is the read-back and only the read-back: a value the tool
+// asked for is not a value the driver stored, which was measured rather than assumed.
+func scalingText(snapshot app.Snapshot) string {
+	if snapshot.State == app.StateScalingCycle {
+		if message := strings.TrimSpace(snapshot.Message); message != "" {
+			return message
+		}
+		return scalingCyclingText
+	}
+	view := snapshot.Scaling
+	if view.Known {
+		return scalingPrefix + app.ScalingLabel(view.Effective)
+	}
+	if reason := firstLine(view.Reason); reason != "" {
+		return scalingPrefix + scalingUnreadablePre + reason
+	}
+	return scalingPrefix + scalingUnreadText
+}
+
+// scalingButtonText switches on ownership and prints the value a restore would put
+// back, because that value is the whole question the user is being asked.
+func scalingButtonText(snapshot app.Snapshot) string {
+	if !snapshot.Scaling.Owned {
+		return scalingApplyText
+	}
+	return scalingRestoreText + "（" + app.ScalingLabel(snapshot.Scaling.Saved) + "）"
+}
+
+// scalingButtonNote is the sentence that accompanies the button: why it is off, or --
+// while the session owns a mode -- what pressing it costs. The cost is real and
+// visible, so it is stated before the press rather than explained afterwards.
+func (w *window) scalingButtonNote(snapshot app.Snapshot) string {
+	if snapshot.State == app.StateScalingCycle {
+		return scalingCycleReason
+	}
+	if w.scalingUnavailableReason != "" {
+		return w.scalingUnavailableReason
+	}
+	if snapshot.Managed {
+		return scalingManagedCostText(snapshot)
+	}
+	return ""
+}
+
+func scalingManagedCostText(snapshot app.Snapshot) string {
+	mode := snapshot.Profile.GameMode
+	if mode.Width == 0 || mode.Height == 0 {
+		return "按下後畫面會先恢復原始排列、變更縮放、再切回設定的顯示模式。"
+	}
+	return "按下後畫面會先恢復原始排列、變更縮放、再切回 " + domain.ModeLabel(mode) + "。"
+}
+
+// scalingNoteText is the block under the button: what the driver did with the last
+// write, what the configured mode will look like, and the one thing this tool cannot
+// do for the user.
+func scalingNoteText(snapshot app.Snapshot) string {
+	return strings.Join(nonEmptyStrings(scalingDetailsText(snapshot), scalingOverrideText()), "\n")
+}
+
+func scalingDetailsText(snapshot app.Snapshot) string {
+	var lines []string
+	if mismatch := scalingMismatchNote(snapshot); mismatch != "" {
+		lines = append(lines, mismatch)
+	}
+	reminder := scalingAspectReminder(snapshot)
+	if reminder != "" {
+		lines = append(lines, reminder)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func scalingOverrideText() string { return scalingOverrideNote }
+
+func nonEmptyStrings(values ...string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+// scalingMismatchNote states a driver that stored something other than what was
+// written. It is not an error and is not worded as one: nothing broke and nothing needs
+// undoing. Both values are printed, because only then can the user tell which is which.
+func scalingMismatchNote(snapshot app.Snapshot) string {
+	view := snapshot.Scaling
+	if !view.Known || !view.RequestedKnown || view.Matched {
+		return ""
+	}
+	return "已要求「" + app.ScalingLabel(view.Requested) + "」，驅動實際套用的是「" +
+		app.ScalingLabel(view.Effective) + "」。"
+}
+
+// scalingAspectReminder is the profile design's static "this is not your panel's shape"
+// reminder, upgraded to a measurement now that the scaling value can be read. It never
+// blocks the choice -- the user may want the bars, or may have dealt with them
+// elsewhere -- and it never claims the bars are gone: full-screen scaling is stated as
+// the fact it is, and nothing more, because a game can still override it.
+//
+// The shape it compares against is the panel's separately enumerated native mode.
+// FallbackMode cannot answer this question: it may be an explicit restore override with
+// any aspect ratio the user chose.
+func scalingAspectReminder(snapshot app.Snapshot) string {
+	mode := snapshot.Profile.GameMode
+	native := snapshot.NativeMode
+	if mode.Width == 0 || mode.Height == 0 || !snapshot.NativeKnown {
+		return ""
+	}
+	if native.Width == 0 || native.Height == 0 {
+		return ""
+	}
+	if sameAspect(mode.Width, mode.Height, native.Width, native.Height) {
+		return ""
+	}
+	shape := "這個模式是 " + domain.AspectLabel(mode.Width, mode.Height)
+	if !snapshot.Scaling.Known {
+		return shape + scalingStaticReminder
+	}
+	effective := app.ScalingLabel(snapshot.Scaling.Effective)
+	// Compared on the geometry rather than on the raw number, and against the value
+	// this product asks for, so the display doing full-screen scaling counts too.
+	if snapshot.Scaling.Effective.Mode == app.ScalingFullScreenByGPU().Mode {
+		return shape + "，目前的 GPU 縮放是「" + effective + "」。"
+	}
+	return shape + "，而目前的 GPU 縮放是「" + effective + "」，畫面會有黑邊。"
+}
+
+// fitText folds a string into a fixed-width window. Wrapping is by rune count rather
+// than by measured pixels because it has to be decidable without a device context and
+// assertable in a test that never opens a window; the budget is chosen for the widest
+// characters these strings contain, so an ASCII-heavy driver message simply wraps
+// earlier than it needs to. Text past maxLines is cut with an ellipsis -- clipped, not
+// allowed to push the form wider -- and every caller keeps the whole string in the
+// widget's tooltip.
+func fitText(text string, budget, maxLines int) string {
+	if text == "" || budget <= 0 || maxLines <= 0 {
+		return text
+	}
+	var lines []string
+	for _, line := range strings.Split(text, "\n") {
+		runes := []rune(line)
+		for len(runes) > budget {
+			lines = append(lines, string(runes[:budget]))
+			runes = runes[budget:]
+		}
+		lines = append(lines, string(runes))
+	}
+	if len(lines) > maxLines {
+		lines = lines[:maxLines]
+		lines[maxLines-1] += "…"
+	}
+	return strings.Join(lines, "\n")
+}
+
+func firstLine(text string) string {
+	text = strings.TrimSpace(text)
+	if index := strings.IndexByte(text, '\n'); index >= 0 {
+		return strings.TrimSpace(text[:index])
+	}
+	return text
 }
 
 // watchedProcess names the executable the profile watches. The states that call it are

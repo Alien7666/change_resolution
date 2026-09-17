@@ -579,7 +579,7 @@ func TestDisableUsesFallbackWhenAppStartsInAnUnmanagedGameMode(t *testing.T) {
 	if !got.AtGameMode || got.Managed || f.clock.count() != 0 {
 		t.Fatalf("startup = %+v", got)
 	}
-	assertOperations(t, f.display.takeCalls(), "resolve", "current")
+	assertOperations(t, f.display.takeCalls(), "resolve", "current", "modes")
 	if err := f.s.Enable(); err != nil {
 		t.Fatal(err)
 	}
@@ -608,7 +608,7 @@ func TestRefreshAndShutdownLeaveUnmanagedGameModeUntouched(t *testing.T) {
 	if got, err := f.s.Refresh(); err != nil || !got.AtGameMode || got.Managed {
 		t.Fatalf("snapshot = %+v, err = %v", got, err)
 	}
-	assertOperations(t, f.display.takeCalls(), "resolve", "current")
+	assertOperations(t, f.display.takeCalls(), "resolve", "current", "modes")
 	if err := f.s.Shutdown(); err != nil {
 		t.Fatal(err)
 	}
@@ -1558,6 +1558,67 @@ func TestDisableDerivesTheFallbackFromTheEnumeratedModesWhenNoneIsConfigured(t *
 	}
 	if desktop := f.desktop(); !reflect.DeepEqual(desktop, fixtureLayout(fixtureNative)) {
 		t.Fatalf("restored desktop = %+v, want %+v", desktop, fixtureLayout(fixtureNative))
+	}
+}
+
+func TestRefreshKeepsExplicitFallbackAndReportsNativeModeSeparately(t *testing.T) {
+	profile := domain.LegacySeedProfile()
+	explicitFallback := profile.GameMode // deliberately 4:3, unlike the 16:9 panel
+	profile.FallbackMode = &explicitFallback
+	f := newFixtureWith(t, profile, fixtureNative, fixtureLayout(fixtureNative))
+	f.setModes(profile.GameMode, fixtureSide, fixtureNative)
+
+	got, err := f.s.Refresh()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertOperations(t, f.display.takeCalls(), "resolve", "current", "modes")
+	if !got.FallbackKnown || got.FallbackMode != explicitFallback {
+		t.Fatalf("fallback = %+v, known=%v; want explicit %+v", got.FallbackMode, got.FallbackKnown, explicitFallback)
+	}
+	if !got.NativeKnown || got.NativeMode != fixtureNative {
+		t.Fatalf("native = %+v, known=%v; want enumerated %+v", got.NativeMode, got.NativeKnown, fixtureNative)
+	}
+}
+
+func TestRefreshClearsStaleNativeWithoutInvalidatingExplicitFallback(t *testing.T) {
+	profile := domain.LegacySeedProfile()
+	explicitFallback := profile.GameMode
+	profile.FallbackMode = &explicitFallback
+	f := newFixtureWith(t, profile, fixtureNative, fixtureLayout(fixtureNative))
+	f.setModes(profile.GameMode, fixtureNative)
+	if _, err := f.s.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	if !f.s.Snapshot().NativeKnown {
+		t.Fatal("precondition: first refresh did not record native mode")
+	}
+	f.display.takeCalls()
+
+	enumerationFailed := errors.New("EnumDisplaySettingsW failed")
+	f.display.setFailure("modes", enumerationFailed)
+	got, err := f.s.Refresh()
+	if err != nil {
+		t.Fatalf("native diagnostic failure escaped Refresh: %v", err)
+	}
+	if got.NativeKnown || got.NativeMode != (domain.Mode{}) {
+		t.Fatalf("stale native survived failed refresh: %+v", got)
+	}
+	if !got.FallbackKnown || got.FallbackMode != explicitFallback || got.FallbackReason != "" {
+		t.Fatalf("native diagnostic failure changed explicit fallback: %+v", got)
+	}
+
+	f.display.setFailure("modes", nil)
+	f.display.setFailure("resolve", display.ErrTargetNotFound)
+	got, err = f.s.Refresh()
+	if !errors.Is(err, display.ErrTargetNotFound) {
+		t.Fatalf("Refresh error = %v, want missing target", err)
+	}
+	if got.NativeKnown || got.NativeMode != (domain.Mode{}) {
+		t.Fatalf("missing target left stale native: %+v", got)
+	}
+	if !got.FallbackKnown || got.FallbackMode != explicitFallback {
+		t.Fatalf("missing target changed explicit fallback: %+v", got)
 	}
 }
 

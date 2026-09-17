@@ -191,6 +191,31 @@ func (p *Provider) ConfigError() error {
 	return p.configErr
 }
 
+// ReadScaling is the settings dialog's provider-owned, read-only seam. The selected
+// monitor may differ from the active profile, and first run has no Session at all, so
+// borrowing Provider.Snapshot().Scaling would misattribute one monitor's value to
+// another. This resolves and measures the requested identity without any writes.
+func (p *Provider) ReadScaling(identity domain.MonitorIdentity) ScalingSnapshot {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	if p.isClosed() {
+		return ScalingSnapshot{Reason: ErrClosed.Error()}
+	}
+	target, err := p.displays.ResolveTarget(identity)
+	if err != nil {
+		return ScalingSnapshot{Reason: err.Error()}
+	}
+	probe := p.scalings.Probe()
+	if !probe.Available {
+		return ScalingSnapshot{Reason: scalingUnavailableReason(target, probe, nil)}
+	}
+	state, err := p.scalings.Read(identity)
+	if err != nil {
+		return ScalingSnapshot{Reason: scalingUnavailableReason(target, probe, err)}
+	}
+	return ScalingSnapshot{Available: true, Known: true, Effective: state.Effective}
+}
+
 func (p *Provider) Snapshot() Snapshot {
 	for {
 		p.mu.Lock()

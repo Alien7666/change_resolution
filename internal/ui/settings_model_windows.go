@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Alien7666/change_resolution/internal/app"
 	"github.com/Alien7666/change_resolution/internal/config"
 	"github.com/Alien7666/change_resolution/internal/display"
 	"github.com/Alien7666/change_resolution/internal/domain"
@@ -53,6 +54,12 @@ type settingsModel struct {
 	save     func(config.File) error
 	firstRun bool
 
+	// readScaling is owned by Provider. The dialog never constructs or writes through a
+	// scaling controller; it asks for one fresh, read-only measurement whenever its
+	// selected monitor changes, including first run where no Session exists.
+	readScaling func(domain.MonitorIdentity) app.ScalingSnapshot
+	scaling     app.ScalingSnapshot
+
 	draft           domain.Profile
 	legacyPrefilled bool
 	monitorRows     []monitorRow
@@ -65,11 +72,18 @@ type settingsModel struct {
 
 // newSettingsModel builds dialog-only state. Refresh is its only source read; changing
 // a selection reads from the cache and never touches a display or GPU setting.
-func newSettingsModel(displays display.Controller, lister process.Lister, profile domain.Profile, firstRun bool) *settingsModel {
+func newSettingsModel(
+	displays display.Controller,
+	lister process.Lister,
+	profile domain.Profile,
+	scalingView app.ScalingSnapshot,
+	firstRun bool,
+) *settingsModel {
 	model := &settingsModel{
 		displays:        displays,
 		lister:          lister,
 		save:            config.Save,
+		scaling:         scalingView,
 		firstRun:        firstRun,
 		draft:           profile.Copy(),
 		selectedMonitor: -1,
@@ -130,6 +144,7 @@ func (m *settingsModel) Refresh() error {
 	if m.firstRun && m.selectedMonitor < 0 && emptyMonitor(m.draft.Monitor) {
 		m.prefillLegacy(targets, counts)
 	}
+	m.refreshSelectedScaling()
 	return nil
 }
 
@@ -167,7 +182,16 @@ func (m *settingsModel) SelectMonitor(index int) error {
 	}
 	m.selectedMonitor = index
 	m.rebuildModeRows(index)
+	m.refreshSelectedScaling()
 	return nil
+}
+
+func (m *settingsModel) refreshSelectedScaling() {
+	if m.readScaling == nil || m.selectedMonitor < 0 || m.selectedMonitor >= len(m.monitorRows) {
+		m.scaling = app.ScalingSnapshot{}
+		return
+	}
+	m.scaling = m.readScaling(m.monitorRows[m.selectedMonitor].Target.Identity)
 }
 
 // SelectResolution chooses a resolution's highest reported refresh rate. The caller

@@ -426,10 +426,11 @@ func NewWindowsController(resolve func(domain.MonitorIdentity) (domain.Target, e
 // does, whatever the adapter calls itself.
 func loadNVAPI() (*windowsNVAPI, error) {
 	if err := nvapiDLL.Load(); err != nil {
-		return nil, fmt.Errorf("load nvapi64.dll: %w", err)
+		return nil, fmt.Errorf("%w: load nvapi64.dll: %v", ErrNvapiDLLUnavailable, err)
 	}
 	if err := nvapiQueryInterface.Find(); err != nil {
-		return nil, fmt.Errorf("resolve nvapi_QueryInterface in nvapi64.dll: %w", err)
+		return nil, fmt.Errorf("%w: resolve nvapi_QueryInterface in nvapi64.dll: %v",
+			ErrNvapiInterfaceUnavailable, err)
 	}
 
 	query := nvapiQueryInterface.Addr()
@@ -455,7 +456,8 @@ func loadNVAPI() (*windowsNVAPI, error) {
 		{name: "NvAPI_DISP_GetDisplayIdByDisplayName", address: api.getDisplayIDByName},
 	} {
 		if required.address == 0 {
-			return nil, fmt.Errorf("this NVIDIA driver does not provide %s", required.name)
+			return nil, fmt.Errorf("%w: this NVIDIA driver does not provide %s",
+				ErrNvapiInterfaceUnavailable, required.name)
 		}
 	}
 	return api, nil

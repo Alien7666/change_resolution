@@ -11,6 +11,7 @@ import (
 	"github.com/Alien7666/change_resolution/internal/config"
 	"github.com/Alien7666/change_resolution/internal/display"
 	"github.com/Alien7666/change_resolution/internal/domain"
+	"github.com/Alien7666/change_resolution/internal/scaling"
 )
 
 type fakeProviderStore struct {
@@ -137,6 +138,33 @@ func TestProviderStartsUnconfiguredWhenNoConfigFileExists(t *testing.T) {
 	}
 	if p.ConfigError() != nil {
 		t.Fatalf("missing file became a configuration error: %v", p.ConfigError())
+	}
+}
+
+func TestProviderReadsSelectedMonitorScalingWithoutASession(t *testing.T) {
+	profile := providerProfile("Dell U4924DW", `\\?\DISPLAY#DEL41A8#selected`)
+	displays := providerDisplay(profile)
+	scaler := &task15ScalingFake{
+		recorder:     &task15Recorder{},
+		availability: scaling.Availability{Available: true},
+		state: scaling.State{DisplayID: 42, Effective: scaling.Value{
+			Raw: 6, Mode: scaling.ModeAspectRatio, By: scaling.ByDisplay,
+		}},
+	}
+	provider := newScalingProvider(displays, stubProviderChecker{}, scaler, &fakeProviderStore{
+		path: "config.json", loadErr: fs.ErrNotExist,
+	})
+	defer func() { _ = provider.Shutdown() }()
+	if provider.Session() != nil {
+		t.Fatal("precondition: first run unexpectedly has a Session")
+	}
+
+	view := provider.ReadScaling(profile.Monitor)
+	if !view.Available || !view.Known || view.Effective != scaler.state.Effective {
+		t.Fatalf("ReadScaling() = %#v, want selected monitor's measured value", view)
+	}
+	if len(scaler.calls) != 1 || scaler.calls[0].identity.InstancePath != profile.Monitor.InstancePath {
+		t.Fatalf("scaling calls = %#v, want one read for selected identity", scaler.calls)
 	}
 }
 

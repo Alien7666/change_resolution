@@ -114,6 +114,13 @@ type Snapshot struct {
 	FallbackKnown  bool
 	FallbackReason string
 
+	// NativeMode is the panel's native mode derived from its current mode catalogue.
+	// It is deliberately separate from FallbackMode: an explicit fallback is a restore
+	// target chosen by the user and may have a different aspect ratio. NativeKnown is
+	// false when the latest refresh could not resolve or enumerate the monitor.
+	NativeMode  domain.Mode
+	NativeKnown bool
+
 	// AutoRestoreFailures counts the restores this session started by itself and
 	// could not complete. Nothing prompts the user on that path, so the UI tracks
 	// the counter to raise exactly one notification per failed automatic restore
@@ -407,6 +414,12 @@ func (s *Session) observed(target domain.Target, mode domain.Mode) {
 		snapshot.FallbackMode = derived.mode
 		snapshot.FallbackKnown = derived.known
 		snapshot.FallbackReason = derived.reason
+		// With no explicit override, DeriveFallback is exactly domain.NativeMode over
+		// this same fresh catalogue. Reuse that read instead of enumerating twice.
+		if s.profile.FallbackMode == nil {
+			snapshot.NativeMode = derived.mode
+			snapshot.NativeKnown = derived.known
+		}
 	})
 }
 
@@ -608,7 +621,16 @@ func (s *Session) Refresh() (Snapshot, error) {
 	if s.closed {
 		return s.Snapshot(), ErrClosed
 	}
-	_, _, err := s.readCurrent()
+	target, _, err := s.readCurrent()
+	switch {
+	case err != nil:
+		s.clearNativeView()
+	case s.profile.FallbackMode != nil:
+		// Explicit fallback bypasses the enumeration used by fallback derivation, but
+		// native aspect is a separate diagnostic fact the main window still needs.
+		// Failure here never changes fallback or the display toggle's availability.
+		s.refreshNativeView(target)
+	}
 	// Re-probing is part of a refresh: the user may have just installed the driver.
 	// Its outcome is deliberately dropped rather than merged into err -- a GPU-scaling
 	// failure is never allowed to make the display half look broken.
@@ -617,6 +639,23 @@ func (s *Session) Refresh() (Snapshot, error) {
 		s.state(StateNative, "已讀取目前顯示模式")
 	}
 	return s.Snapshot(), err
+}
+
+func (s *Session) refreshNativeView(target domain.Target) {
+	modes, err := s.displays.EnumModes(target)
+	native, known := domain.NativeMode(modes)
+	if err != nil {
+		native, known = domain.Mode{}, false
+	}
+	s.updateSnapshot(func(snapshot *Snapshot) {
+		snapshot.NativeMode, snapshot.NativeKnown = native, known
+	})
+}
+
+func (s *Session) clearNativeView() {
+	s.updateSnapshot(func(snapshot *Snapshot) {
+		snapshot.NativeMode, snapshot.NativeKnown = domain.Mode{}, false
+	})
 }
 
 func (s *Session) Enable() error {
@@ -1257,6 +1296,7 @@ func (s *Session) scalingViewOf(
 // nothing else in the window.
 func (s *Session) refreshScalingView() error {
 	probe := s.scalings.Probe()
+	target := s.Snapshot().Target
 	var state scaling.State
 	var readErr error
 	if probe.Available {
@@ -1271,9 +1311,9 @@ func (s *Session) refreshScalingView() error {
 		}
 		switch {
 		case !probe.Available:
-			view.Reason = probe.Reason
+			view.Reason = scalingUnavailableReason(target, probe, nil)
 		case readErr != nil:
-			view.Reason = readErr.Error()
+			view.Reason = scalingUnavailableReason(target, probe, readErr)
 		default:
 			view.Available, view.Known, view.Effective = true, true, state.Effective
 			view.Matched = view.RequestedKnown && state.Effective.Raw == view.Requested.Raw
@@ -1284,6 +1324,63 @@ func (s *Session) refreshScalingView() error {
 		return probe.Err
 	}
 	return readErr
+}
+
+// scalingUnavailableReason turns driver facts into the actionable sentence beside the
+// scaling button. Availability is still decided functionally by NVAPI; the adapter's
+// DeviceString is used only after that decision to name the control panel to open.
+func scalingUnavailableReason(target domain.Target, probe scaling.Availability, readErr error) string {
+	if errors.Is(probe.Err, scaling.ErrNvapiInterfaceUnavailable) {
+		return "這個 NVIDIA 驅動版本不提供需要的介面。"
+	}
+	if !probe.Available && errors.Is(probe.Err, scaling.ErrNvapiDLLUnavailable) {
+		adapter := strings.TrimSpace(target.AdapterDeviceString)
+		if adapter != "" {
+			return "偵測到 " + adapter + "，但找不到可用的 NVIDIA 驅動。請到" +
+				adapterControlPanel(adapter) + "設定全螢幕縮放。"
+		}
+		if reason := strings.TrimSpace(probe.Reason); reason != "" {
+			return reason
+		}
+		return "找不到可用的 NVIDIA 驅動，請到顯示卡控制台手動設定全螢幕縮放。"
+	}
+	if !probe.Available {
+		if reason := strings.TrimSpace(probe.Reason); reason != "" {
+			return reason
+		}
+		if probe.Err != nil {
+			return probe.Err.Error()
+		}
+		return "無法使用 GPU 縮放。"
+	}
+	if readErr == nil {
+		return ""
+	}
+	if errors.Is(readErr, scaling.ErrNotNvidiaDisplay) ||
+		errors.Is(readErr, scaling.ErrScalingTargetNotFound) ||
+		errors.Is(readErr, scaling.ErrScalingTargetAmbiguous) {
+		label := strings.TrimSpace(target.Identity.Label)
+		if label == "" {
+			label = "選取的顯示器"
+		}
+		return "「" + label + "」不在可唯一對應的 NVIDIA 顯示路徑上，" +
+			"請到該顯示卡的控制台手動設定全螢幕縮放。"
+	}
+	return readErr.Error()
+}
+
+func adapterControlPanel(adapter string) string {
+	lower := strings.ToLower(adapter)
+	switch {
+	case strings.Contains(lower, "amd"), strings.Contains(lower, "radeon"):
+		return " AMD Software "
+	case strings.Contains(lower, "intel"):
+		return " Intel Graphics Command Center "
+	case strings.Contains(lower, "nvidia"):
+		return " NVIDIA 控制台"
+	default:
+		return "顯示卡控制台"
+	}
 }
 
 // refreshTargetView re-reads the target at the tail of a workflow so the window never

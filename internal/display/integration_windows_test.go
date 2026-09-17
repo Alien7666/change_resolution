@@ -198,6 +198,27 @@ func TestWindowsNativeKeepsTheMonitorsOwnDeviceStringAsALabel(t *testing.T) {
 	}
 }
 
+func TestWindowsNativeKeepsTheAdapterDeviceStringForScalingDiagnostics(t *testing.T) {
+	adapter := newDisplayDevice(t, `\.\DISPLAY1`, "", displayDeviceAttachedToDesktop)
+	copyUTF16(t, adapter.DeviceString[:], "AMD Radeon RX 7800 XT")
+	api := &fakeWin32{
+		adapters: []displayDevice{adapter},
+		monitors: map[monitorKey][]displayDevice{
+			{adapter: `\.\DISPLAY1`}: {
+				newMonitorDevice(t, "Dell U4924DW", `MONITOR\DEL41A8\0001`),
+			},
+		},
+	}
+
+	targets, err := (&windowsNative{api: api}).listTargets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].AdapterDeviceString != "AMD Radeon RX 7800 XT" {
+		t.Fatalf("targets = %#v, want adapter DeviceString retained for diagnostics", targets)
+	}
+}
+
 // A cloned or mirrored adapter drives more than one monitor, and Win32 reports both
 // under the same \\.\DISPLAYn. listTargets reports one target per monitor, so the
 // two share a DeviceName -- that repetition is the only evidence Task 5's mirror

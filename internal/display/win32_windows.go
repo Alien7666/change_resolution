@@ -129,6 +129,7 @@ func (n *windowsNative) listTargets() ([]domain.Target, error) {
 	names := n.friendlyNames()
 	var targets []domain.Target
 	err := n.eachAttachedAdapter(func(adapter displayDevice, adapterName string) error {
+		adapterDeviceString := windows.UTF16ToString(adapter.DeviceString[:])
 		for monitorIndex := uint32(0); ; monitorIndex++ {
 			monitor := displayDevice{Cb: uint32(unsafe.Sizeof(displayDevice{}))}
 			ok, _ := n.api.enumDisplayDevices(&adapter.DeviceName[0], monitorIndex, &monitor, 0)
@@ -156,7 +157,11 @@ func (n *windowsNative) listTargets() ([]domain.Target, error) {
 				windows.UTF16ToString(monitor.DeviceString[:]),
 				identity.HardwareID,
 			)
-			targets = append(targets, domain.Target{DeviceName: adapterName, Identity: identity})
+			targets = append(targets, domain.Target{
+				DeviceName:          adapterName,
+				Identity:            identity,
+				AdapterDeviceString: adapterDeviceString,
+			})
 		}
 		return nil
 	})

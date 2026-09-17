@@ -15,6 +15,7 @@ import (
 	"github.com/Alien7666/change_resolution/internal/config"
 	"github.com/Alien7666/change_resolution/internal/display"
 	"github.com/Alien7666/change_resolution/internal/domain"
+	"github.com/Alien7666/change_resolution/internal/scaling"
 )
 
 // preflightRejection mirrors the error app.Session reports when the CDS_TEST
@@ -900,6 +901,7 @@ func TestStateTextCoversEveryState(t *testing.T) {
 	states := []app.State{
 		app.StateNative, app.StateApplying, app.StateManualOnly, app.StateWaitingForGame,
 		app.StateGameRunning, app.StateRestorePending, app.StateRestoring, app.StateError,
+		app.StateScalingCycle,
 	}
 	for _, state := range states {
 		snapshot := widescreenSnapshot()
@@ -953,9 +955,50 @@ func TestNoRenderedStringCarriesTheSeedHardware(t *testing.T) {
 		// the profile generates is scanned.
 		"trayTooltip": strings.TrimPrefix(trayTooltip(snapshot), windowTitle),
 	}
+
+	// Task 16 added a whole row. A renderer missing from this map is a renderer this
+	// guard silently stops covering, so every one of them is listed here.
+	scaled := scalingReadySnapshot()
+	scaled.Scaling.Requested, scaled.Scaling.RequestedKnown = app.ScalingFullScreenByGPU(), true
+	scaled.Scaling.Owned, scaled.Scaling.Saved = true, scalingAspectByDisplay()
+	scaled.Managed, scaled.AtGameMode = true, true
+	rendered["scalingRow"] = scalingText(scaled)
+	rendered["scalingButton"] = scalingButtonText(scaled)
+	rendered["scalingNote"] = scalingNoteText(scaled)
+	rendered["scalingReminder"] = scalingAspectReminder(scaled)
+	rendered["scalingMismatch"] = scalingMismatchNote(scaled)
+	rendered["scalingCost"] = scalingManagedCostText(scaled)
+	rendered["scalingExit"] = exitScalingWarning(scaled.Scaling)
+	cycling := scaled
+	cycling.State, cycling.Message = app.StateScalingCycle, "正在變更 GPU 縮放：寫入縮放設定…"
+	rendered["scalingCycleRow"] = scalingText(cycling)
+	cycleWindow := &window{}
+	cycleWindow.updateScalingAvailability(cycling)
+	rendered["scalingCycleBeside"] = cycleWindow.scalingButtonNote(cycling)
+	rendered["scalingCycleAdvice"] = cycleWindow.scalingAdviceText(cycling)
+	for name, view := range map[string]app.ScalingSnapshot{
+		"scalingLatch:vendor":   {Reason: "偵測到 AMD Radeon RX 7800 XT，這個功能只支援 NVIDIA。"},
+		"scalingLatch:unprobed": {},
+		"scalingLatch:none":     {Available: true, Known: true, Effective: scalingAspectByDisplay()},
+	} {
+		latched := scaled
+		latched.Scaling = view
+		w := &window{}
+		w.updateScalingAvailability(latched)
+		rendered[name] = w.scalingUnavailableReason
+		rendered["beside:"+name] = w.scalingButtonNote(latched)
+		rendered["advice:"+name] = w.scalingAdviceText(latched)
+	}
+	unresolved := scaled
+	unresolved.State = app.StateError
+	unresolved.Err = fmt.Errorf("resolve target: %w", display.ErrTargetNotFound)
+	unresolvedWindow := &window{}
+	unresolvedWindow.updateScalingAvailability(unresolved)
+	rendered["scalingLatch:target"] = unresolvedWindow.scalingUnavailableReason
 	for _, state := range []app.State{
 		app.StateNative, app.StateApplying, app.StateManualOnly, app.StateWaitingForGame,
 		app.StateGameRunning, app.StateRestorePending, app.StateRestoring, app.StateError,
+		app.StateScalingCycle,
 	} {
 		stated := snapshot
 		stated.State = state
@@ -996,5 +1039,599 @@ func TestTrayTooltipNamesTheConfiguredMonitorAndMode(t *testing.T) {
 	long.Profile.Monitor.Label = strings.Repeat("顯", 300)
 	if got := len([]rune(trayTooltip(long))); got >= 128 {
 		t.Errorf("tray tooltip is %d runes, which overruns NOTIFYICONDATA.szTip", got)
+	}
+}
+
+// --- Task 16: GPU scaling is a second, independent availability group ---------
+
+// scalingAspectByDisplay is the value the design was measured against: aspect-ratio
+// scaling performed by the monitor, which is the setting that leaves black bars on a
+// mode whose shape is not the panel's. Raw 6 is the number the driver reported.
+func scalingAspectByDisplay() scaling.Value {
+	return scaling.Value{Raw: 6, Mode: scaling.ModeAspectRatio, By: scaling.ByDisplay}
+}
+
+// scalingReadySnapshot is a window whose display half is healthy and whose driver
+// answered: the baseline both isolation tests break in one direction only.
+func scalingReadySnapshot() app.Snapshot {
+	snapshot := widescreenSnapshot()
+	snapshot.NativeMode, snapshot.NativeKnown = snapshot.FallbackMode, snapshot.FallbackKnown
+	snapshot.Scaling = app.ScalingSnapshot{
+		Available: true,
+		Known:     true,
+		Effective: scalingAspectByDisplay(),
+	}
+	return snapshot
+}
+
+// The bug this task exists to remove: one latched unavailableReason meant any NVAPI
+// failure took the configured-mode toggle with it, and the mode toggle has nothing to
+// do with the GPU scaling API.
+func TestScalingUnavailabilityLeavesTheFourByThreeToggleUsable(t *testing.T) {
+	const vendor = "偵測到 AMD Radeon RX 7800 XT，這個功能只支援 NVIDIA。請到該顯示卡的控制台手動設定全螢幕縮放。"
+	snapshot := widescreenSnapshot()
+	snapshot.Scaling = app.ScalingSnapshot{Reason: vendor}
+
+	w := &window{}
+	w.updateAvailability(snapshot)
+	w.updateScalingAvailability(snapshot)
+
+	if w.unavailableReason != "" {
+		t.Fatalf("a missing GPU-scaling driver latched the display half: %q", w.unavailableReason)
+	}
+	if w.scalingUnavailableReason != vendor {
+		t.Fatalf("scaling reason = %q, want the vendor text the session reported", w.scalingUnavailableReason)
+	}
+	got := w.availableControls(snapshot)
+	if !got.toggle || !got.enable || !got.restore {
+		t.Fatalf("an NVAPI failure disabled the display-mode controls: %+v", got)
+	}
+	if got.scalingApply || got.scalingRestore {
+		t.Fatalf("an unavailable scaling controller left its own button live: %+v", got)
+	}
+	if !strings.Contains(scalingText(snapshot), "AMD Radeon RX 7800 XT") {
+		t.Errorf("scaling row %q does not name the adapter that was detected", scalingText(snapshot))
+	}
+	// The reason is on screen under the button, not only in its tooltip, and it is the
+	// first thing there: a user who cannot press the button needs it before anything else.
+	if advice := w.scalingAdviceText(snapshot); !strings.HasPrefix(advice, vendor) {
+		t.Errorf("advice block %q does not open with the reason the button is disabled", advice)
+	}
+}
+
+// The other direction. The two halves own one sentence each: neither may be written
+// with the other's words, and a display failure that is only about a display mode --
+// the monitor reports no such mode -- leaves the scaling button entirely alone.
+func TestTargetUnavailabilityLeavesTheScalingButtonReasonIntact(t *testing.T) {
+	missing := scalingReadySnapshot()
+	missing.State = app.StateError
+	missing.Err = fmt.Errorf("resolve target: %w: %s", display.ErrTargetNotFound, `MONITOR\DEL41A8`)
+
+	w := &window{}
+	w.updateAvailability(missing)
+	w.updateScalingAvailability(missing)
+
+	if !strings.Contains(w.unavailableReason, "DELL U4924DW") {
+		t.Fatalf("display latch %q lost the configured monitor", w.unavailableReason)
+	}
+	if w.scalingUnavailableReason == "" {
+		t.Fatal("a monitor the tool cannot resolve left the scaling button live")
+	}
+	if w.scalingUnavailableReason == w.unavailableReason {
+		t.Fatalf("both halves are rendering one shared sentence: %q", w.unavailableReason)
+	}
+	if !strings.Contains(w.scalingUnavailableReason, "DELL U4924DW") {
+		t.Errorf("scaling reason %q does not name the monitor it is about", w.scalingUnavailableReason)
+	}
+	if strings.Contains(w.scalingUnavailableReason, "顯示模式切換") {
+		t.Errorf("the scaling reason %q describes the display half's disabled command", w.scalingUnavailableReason)
+	}
+	if strings.Contains(w.unavailableReason, "GPU 縮放") {
+		t.Errorf("the display reason %q describes the scaling half", w.unavailableReason)
+	}
+
+	// A mode the monitor does not report is purely a display-side refusal. It disables
+	// the mode toggle and must not reach the scaling button at all.
+	unsupported := scalingReadySnapshot()
+	unsupported.State, unsupported.Err = app.StateError, preflightRejection()
+	w = &window{}
+	w.updateAvailability(unsupported)
+	w.updateScalingAvailability(unsupported)
+	if w.unavailableReason == "" {
+		t.Fatal("precondition: the unsupported mode did not disable the mode toggle")
+	}
+	if w.scalingUnavailableReason != "" {
+		t.Fatalf("an unsupported display mode disabled the scaling button: %q", w.scalingUnavailableReason)
+	}
+	got := w.availableControls(unsupported)
+	if got.toggle || got.enable {
+		t.Fatalf("precondition: the mode commands stayed live: %+v", got)
+	}
+	if !got.scalingApply {
+		t.Fatalf("an unsupported display mode took the scaling button away: %+v", got)
+	}
+}
+
+func TestScalingButtonTextSwitchesToRestoreAndPrintsTheValueItWillRestore(t *testing.T) {
+	fresh := scalingReadySnapshot()
+	if got := scalingButtonText(fresh); got != scalingApplyText {
+		t.Fatalf("untouched scaling button = %q, want %q", got, scalingApplyText)
+	}
+
+	owned := scalingReadySnapshot()
+	owned.Scaling.Effective = app.ScalingFullScreenByGPU()
+	owned.Scaling.Owned, owned.Scaling.Saved = true, scalingAspectByDisplay()
+
+	got := scalingButtonText(owned)
+	if !strings.Contains(got, "還原") {
+		t.Errorf("owned scaling button %q does not offer a restore", got)
+	}
+	if want := app.ScalingLabel(scalingAspectByDisplay()); !strings.Contains(got, want) {
+		t.Errorf("owned scaling button %q does not print the value it will restore (%q)", got, want)
+	}
+}
+
+// The tool reports what took effect. A driver that stored something other than the
+// written value was measured on real hardware, so the line the user reads must be the
+// read-back and never the request.
+func TestScalingLineShowsTheEffectiveValueNotTheRequestedOne(t *testing.T) {
+	snapshot := scalingReadySnapshot()
+	snapshot.Scaling.Requested, snapshot.Scaling.RequestedKnown = app.ScalingFullScreenByGPU(), true
+	snapshot.Scaling.Matched = false
+
+	line := scalingText(snapshot)
+	if want := app.ScalingLabel(scalingAspectByDisplay()); !strings.Contains(line, want) {
+		t.Fatalf("scaling line %q does not print the effective value %q", line, want)
+	}
+	if strings.Contains(line, "全螢幕") {
+		t.Fatalf("scaling line %q prints the value that was asked for", line)
+	}
+}
+
+// A normalised write is not a failure: nothing broke and nothing needs undoing. Both
+// values are printed, and nothing in the row is styled or worded as an error.
+func TestAMismatchedReadBackIsShownAsBothValuesAndIsNotAnError(t *testing.T) {
+	snapshot := scalingReadySnapshot()
+	snapshot.Scaling.Requested, snapshot.Scaling.RequestedKnown = app.ScalingFullScreenByGPU(), true
+	snapshot.Scaling.Matched = false
+	snapshot.Scaling.Owned, snapshot.Scaling.Saved = true, scalingAspectByDisplay()
+
+	note := scalingNoteText(snapshot)
+	for _, want := range []string{
+		app.ScalingLabel(app.ScalingFullScreenByGPU()),
+		app.ScalingLabel(scalingAspectByDisplay()),
+	} {
+		if !strings.Contains(note, want) {
+			t.Errorf("scaling note %q does not print %q", note, want)
+		}
+	}
+	// The sentence about the normalised value itself must read as a statement of fact.
+	// The permanent override line below it legitimately says what the tool cannot do,
+	// so the wording check is aimed at the mismatch sentence rather than the block.
+	mismatch := scalingMismatchNote(snapshot)
+	if mismatch == "" {
+		t.Fatal("a driver that stored a different value said nothing")
+	}
+	for _, forbidden := range []string{"失敗", "錯誤", "無法"} {
+		if strings.Contains(mismatch, forbidden) {
+			t.Errorf("mismatch note %q words a normalised value as a failure (%q)", mismatch, forbidden)
+		}
+	}
+	if strings.Contains(scalingText(snapshot), "失敗") {
+		t.Errorf("scaling row %q words a normalised value as a failure", scalingText(snapshot))
+	}
+
+	w := &window{}
+	w.updateScalingAvailability(snapshot)
+	if w.scalingUnavailableReason != "" {
+		t.Errorf("a normalised value disabled the scaling button: %q", w.scalingUnavailableReason)
+	}
+}
+
+// The profile design promised a static reminder. With a read path it becomes measured,
+// and the honesty line about the one checkbox NVAPI does not expose sits beside it
+// permanently rather than as a note to fix later.
+func TestNonNativeChoiceShowsTheMeasuredScalingWarning(t *testing.T) {
+	snapshot := scalingReadySnapshot()
+
+	measured := scalingAspectReminder(snapshot)
+	if want := domain.AspectLabel(snapshot.Profile.GameMode.Width, snapshot.Profile.GameMode.Height); !strings.Contains(measured, want) {
+		t.Errorf("reminder %q does not name the configured mode's shape %q", measured, want)
+	}
+	if want := app.ScalingLabel(scalingAspectByDisplay()); !strings.Contains(measured, want) {
+		t.Errorf("reminder %q does not print the scaling value that was read back", measured)
+	}
+	if !strings.Contains(measured, "黑邊") {
+		t.Errorf("reminder %q does not say what the user will see", measured)
+	}
+
+	// Full-screen scaling is stated as a fact and nothing more. The tool cannot read
+	// whether a game overrode it, so it never claims the bars are gone.
+	fullScreen := scalingReadySnapshot()
+	fullScreen.Scaling.Effective = app.ScalingFullScreenByGPU()
+	if got := scalingAspectReminder(fullScreen); strings.Contains(got, "黑邊") {
+		t.Errorf("full-screen reminder %q still promises black bars", got)
+	}
+	if got := scalingAspectReminder(fullScreen); !strings.Contains(got, app.ScalingLabel(app.ScalingFullScreenByGPU())) {
+		t.Errorf("full-screen reminder %q does not print the value that was read back", got)
+	}
+
+	// No read path, no measurement: the promised static wording, with no value invented.
+	unread := scalingReadySnapshot()
+	unread.Scaling = app.ScalingSnapshot{}
+	static := scalingAspectReminder(unread)
+	if static == "" || strings.Contains(static, "（由") {
+		t.Errorf("unread reminder %q is not the static wording", static)
+	}
+
+	// A mode whose shape matches the panel's enumerated native mode needs no reminder.
+	native := scalingReadySnapshot()
+	native.NativeMode = domain.Mode{Width: 1280, Height: 360, RefreshHz: 60, BitsPerPixel: 32}
+	if got := scalingAspectReminder(native); got != "" {
+		t.Errorf("a same-shape mode produced a reminder: %q", got)
+	}
+
+	note := scalingNoteText(snapshot)
+	if !strings.Contains(note, scalingOverrideNote) {
+		t.Errorf("scaling note %q drops the override-checkbox line", note)
+	}
+	if !strings.Contains(scalingOverrideNote, "工具無法代為設定") {
+		t.Errorf("override line %q does not say the tool cannot set it", scalingOverrideNote)
+	}
+
+	// The same measurement reaches the settings dialog's 備註 column.
+	row := modeRow{Width: 1920, Height: 1440, Aspect: "4:3", FullScreenScalingReminder: true}
+	if got := modeNotes(row, snapshot.Scaling); !strings.Contains(got, app.ScalingLabel(scalingAspectByDisplay())) {
+		t.Errorf("settings note %q is still the static reminder", got)
+	}
+	if got := modeNotes(row, app.ScalingSnapshot{}); strings.Contains(got, "（由") {
+		t.Errorf("settings note %q invented a scaling value it never read", got)
+	}
+}
+
+func TestScalingAspectReminderUsesPanelNativeNotExplicitFallback(t *testing.T) {
+	snapshot := scalingReadySnapshot()
+	snapshot.Profile.GameMode = domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
+	snapshot.FallbackMode = domain.Mode{Width: 1600, Height: 1200, RefreshHz: 60, BitsPerPixel: 32}
+	snapshot.FallbackKnown = true
+	snapshot.NativeMode = domain.Mode{Width: 2560, Height: 1440, RefreshHz: 144, BitsPerPixel: 32}
+	snapshot.NativeKnown = true
+	if got := scalingAspectReminder(snapshot); got == "" || !strings.Contains(got, "4:3") {
+		t.Fatalf("native 16:9 with explicit 4:3 fallback suppressed reminder: %q", got)
+	}
+
+	snapshot.FallbackMode = domain.Mode{Width: 2560, Height: 1440, RefreshHz: 60, BitsPerPixel: 32}
+	snapshot.NativeMode = domain.Mode{Width: 1600, Height: 1200, RefreshHz: 60, BitsPerPixel: 32}
+	if got := scalingAspectReminder(snapshot); got != "" {
+		t.Fatalf("native 4:3 with explicit 16:9 fallback produced false warning: %q", got)
+	}
+}
+
+func TestScalingAspectReminderStaysHonestWhenNativeModeIsUnknown(t *testing.T) {
+	snapshot := scalingReadySnapshot()
+	snapshot.NativeMode, snapshot.NativeKnown = domain.Mode{}, false
+	if got := scalingAspectReminder(snapshot); got != "" {
+		t.Fatalf("unknown native mode produced a guessed reminder: %q", got)
+	}
+}
+
+// The only moment a user sees the black bars is while the configured mode is applied,
+// so a scaling button disabled exactly then is a button that does not exist.
+func TestScalingButtonStaysEnabledWhileTheSessionOwnsAnAppliedMode(t *testing.T) {
+	snapshot := scalingReadySnapshot()
+	snapshot.State, snapshot.Managed, snapshot.AtGameMode = app.StateWaitingForGame, true, true
+
+	w := &window{}
+	w.updateAvailability(snapshot)
+	w.updateScalingAvailability(snapshot)
+
+	got := w.availableControls(snapshot)
+	if !got.scalingApply {
+		t.Fatalf("an owned display mode disabled the scaling button: %+v", got)
+	}
+
+	owned := snapshot
+	owned.Scaling.Owned, owned.Scaling.Saved = true, scalingAspectByDisplay()
+	if got := w.availableControls(owned); !got.scalingRestore || got.scalingApply {
+		t.Fatalf("an owned scaling value did not switch the button to restore: %+v", got)
+	}
+}
+
+func TestScalingButtonWarnsThatTheScreensChangeModeTwiceMoreWhileManaged(t *testing.T) {
+	idle := scalingReadySnapshot()
+	w := &window{}
+	w.updateScalingAvailability(idle)
+	if got := w.scalingButtonNote(idle); got != "" {
+		t.Fatalf("an unmanaged session warned about a cycle it will not run: %q", got)
+	}
+
+	managed := idle
+	managed.State, managed.Managed, managed.AtGameMode = app.StateWaitingForGame, true, true
+	got := w.scalingButtonNote(managed)
+	for _, want := range []string{"恢復原始排列", "縮放", "再切回"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("managed warning %q does not contain %q", got, want)
+		}
+	}
+	if want := domain.ModeLabel(managed.Profile.GameMode); !strings.Contains(got, want) {
+		t.Errorf("managed warning %q does not name the mode it will put back (%q)", got, want)
+	}
+}
+
+// opMu already makes a second click merely queue. Disabling is about not offering a
+// command against a desktop that is in the middle of changing.
+func TestEveryMutatingControlIsDisabledDuringTheScalingCycle(t *testing.T) {
+	snapshot := scalingReadySnapshot()
+	snapshot.State = app.StateScalingCycle
+	snapshot.Managed, snapshot.AtGameMode = true, true
+	snapshot.Message = "正在變更 GPU 縮放：寫入縮放設定…"
+
+	w := &window{}
+	w.updateAvailability(snapshot)
+	w.updateScalingAvailability(snapshot)
+
+	got := w.availableControls(snapshot)
+	if got.toggle || got.restore || got.enable || got.settings || got.reset ||
+		got.scalingApply || got.scalingRestore || got.exit {
+		t.Fatalf("a mutating control stayed live during the cycle: %+v", got)
+	}
+	// Hiding and showing the window change nothing on the desktop and stay available.
+	if !got.show || !got.hide {
+		t.Fatalf("the cycle took away a control that changes nothing: %+v", got)
+	}
+
+	// Managed is held true for the whole cycle on purpose, so nothing flickers to the
+	// unapplied rendering at the one moment pressing it would mean nothing.
+	if !snapshot.Managed {
+		t.Fatal("fixture no longer models the masked Managed flag")
+	}
+	if got := scalingText(snapshot); !strings.Contains(got, "寫入縮放設定") {
+		t.Errorf("scaling row %q does not name the phase the cycle is on", got)
+	}
+	if got := (&window{}).statusText(snapshot); !strings.Contains(got, snapshot.Message) {
+		t.Errorf("status %q does not name the phase the cycle is on", got)
+	}
+	if got := stateText(snapshot); got == string(app.StateScalingCycle) {
+		t.Errorf("StateScalingCycle falls through to the default branch: %q", got)
+	}
+}
+
+func TestRequiredScalingDetailsRemainVisibleOutsideTheTooltip(t *testing.T) {
+	snapshot := scalingReadySnapshot()
+	snapshot.Scaling.Requested = app.ScalingFullScreenByGPU()
+	snapshot.Scaling.RequestedKnown = true
+	snapshot.Scaling.Matched = false
+
+	details := fitText(scalingDetailsText(snapshot), reasonLineBudget, detailLineLimit)
+	continuousDetails := strings.ReplaceAll(details, "\n", "")
+	for _, want := range []string{
+		app.ScalingLabel(app.ScalingFullScreenByGPU()),
+		app.ScalingLabel(scalingAspectByDisplay()),
+	} {
+		if !strings.Contains(continuousDetails, want) {
+			t.Fatalf("visible scaling details %q lost %q", details, want)
+		}
+	}
+	if got := fitText(scalingOverrideText(), reasonLineBudget, overrideLineLimit); strings.ReplaceAll(got, "\n", "") != scalingOverrideNote {
+		t.Fatalf("visible override line = %q, want full honesty line", got)
+	}
+}
+
+func TestHiddenExitWarningKeepsTheTrayAliveLongEnoughToBeDelivered(t *testing.T) {
+	if got := exitNoticeLifetime("warning", false); got <= 0 {
+		t.Fatalf("hidden exit warning lifetime = %s, want a positive tray lifetime", got)
+	}
+	if got := exitNoticeLifetime("warning", true); got != 0 {
+		t.Fatalf("visible warning lifetime = %s, want synchronous dialog path", got)
+	}
+	if got := exitNoticeLifetime("", false); got != 0 {
+		t.Fatalf("successful exit lifetime = %s, want immediate exit", got)
+	}
+}
+
+// The asymmetry is deliberate: a profile change voids what the saved arrangement
+// means, while a scaling change only threatens the device names inside it.
+func TestSettingsStaysDisabledWhileManagedEvenThoughScalingDoesNot(t *testing.T) {
+	snapshot := scalingReadySnapshot()
+	snapshot.State, snapshot.Managed, snapshot.AtGameMode = app.StateWaitingForGame, true, true
+
+	w := &window{configState: configStateConfigured}
+	w.updateScalingAvailability(snapshot)
+
+	got := w.availableControls(snapshot)
+	if got.settings {
+		t.Fatalf("settings stayed live while the session owned a mode: %+v", got)
+	}
+	if !got.scalingApply {
+		t.Fatalf("the scaling button was disabled for the settings dialog's reason: %+v", got)
+	}
+	if reason := settingsDisabledReason(snapshot); reason != settingsManagedText {
+		t.Fatalf("settings reason = %q", reason)
+	}
+}
+
+// Each of the cycle's three failure exits says what failed and what the desktop is
+// doing now. The window is the one place the user reads them, so it must pass them
+// through without rewriting or truncating them.
+func TestScalingCycleFailureMessagesReachTheStatusLine(t *testing.T) {
+	messages := map[string]string{
+		"restore failed":  "恢復原始顯示排列失敗，GPU 縮放未變更：driver refused the mode change",
+		"scaling failed":  "變更 GPU 縮放失敗，桌面已恢復為原始排列，工具不再管理顯示模式：NVAPI_ERROR",
+		"re-apply failed": "GPU 縮放已變更為「全螢幕（由 GPU 執行）」，但重新套用 3840 × 1080 @ 144 Hz 失敗，桌面維持在原始排列：driver refused the mode change",
+	}
+	for name, message := range messages {
+		t.Run(name, func(t *testing.T) {
+			snapshot := scalingReadySnapshot()
+			snapshot.State, snapshot.Message = app.StateError, message
+			snapshot.Err = errors.New(message)
+
+			if got := (&window{}).statusText(snapshot); !strings.Contains(got, message) {
+				t.Fatalf("status %q lost the cycle's exit wording", got)
+			}
+		})
+	}
+}
+
+// A previous smoke test found a long rejection widening the fixed window. Nothing the
+// driver can say may do that: the label is wrapped to a bounded width before it
+// reaches Walk, and the untouched text stays reachable as the tooltip.
+func TestALongScalingRejectionIsWrappedInsteadOfWideningTheWindow(t *testing.T) {
+	const long = "NVAPI_INCOMPATIBLE_STRUCT_VERSION (-9)：這個驅動版本的結構約定與工具不同，" +
+		"已停用 GPU 縮放功能到本次執行結束，不會用猜出來的版本重試。"
+
+	fitted := fitText(long, reasonLineBudget, reasonLineLimit)
+	for _, line := range strings.Split(fitted, "\n") {
+		if len([]rune(line)) > reasonLineBudget {
+			t.Fatalf("line %q is %d runes, which is wider than the fixed window allows", line, len([]rune(line)))
+		}
+	}
+	if strings.Count(fitted, "\n")+1 > reasonLineLimit {
+		t.Fatalf("fitted text runs to %d lines", strings.Count(fitted, "\n")+1)
+	}
+	if !strings.HasPrefix(long, strings.SplitN(fitted, "\n", 2)[0]) {
+		t.Fatalf("wrapping rewrote the first line: %q", fitted)
+	}
+
+	// Every label that can be handed driver text is bounded the same way.
+	for name, limit := range map[string]int{"advice": adviceLineLimit, "status": statusLineLimit} {
+		folded := fitText(strings.Repeat(long, 4), reasonLineBudget, limit)
+		if strings.Count(folded, "\n")+1 > limit {
+			t.Errorf("%s label runs to %d lines", name, strings.Count(folded, "\n")+1)
+		}
+		for _, line := range strings.Split(folded, "\n") {
+			if len([]rune(line)) > reasonLineBudget+1 {
+				t.Errorf("%s line %q is %d runes wide", name, line, len([]rune(line)))
+			}
+		}
+	}
+
+	// A short reason is left exactly as it is.
+	if got := fitText("找不到 NVIDIA 驅動", reasonLineBudget, reasonLineLimit); got != "找不到 NVIDIA 驅動" {
+		t.Fatalf("a short reason was rewritten: %q", got)
+	}
+	if got := fitText("", reasonLineBudget, reasonLineLimit); got != "" {
+		t.Fatalf("an empty reason rendered as %q", got)
+	}
+}
+
+// fakeScalingController answers the session without NVAPI. Restore is the only call
+// that can be made to fail, because the exit path is the one place a scaling failure
+// is deliberately swallowed.
+type fakeScalingController struct {
+	mu         sync.Mutex
+	effective  scaling.Value
+	restoreErr error
+	restores   int
+}
+
+func (f *fakeScalingController) Probe() scaling.Availability {
+	return scaling.Availability{Available: true}
+}
+
+func (f *fakeScalingController) Read(domain.MonitorIdentity) (scaling.State, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return scaling.State{DisplayID: 1, Effective: f.effective}, nil
+}
+
+func (f *fakeScalingController) Apply(_ domain.MonitorIdentity, value scaling.Value) (scaling.Outcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	previous := scaling.State{DisplayID: 1, Effective: f.effective}
+	f.effective = value
+	return scaling.Outcome{
+		Requested: value, Previous: previous,
+		State:        scaling.State{DisplayID: 1, Effective: value},
+		SetAttempted: true, Applied: true, ReadBackKnown: true, Matched: true,
+	}, nil
+}
+
+func (f *fakeScalingController) Restore(_ domain.MonitorIdentity, _ uint32, value scaling.Value) (scaling.Outcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.restores++
+	if f.restoreErr != nil {
+		return scaling.Outcome{Requested: value, SetAttempted: true}, f.restoreErr
+	}
+	previous := scaling.State{DisplayID: 1, Effective: f.effective}
+	f.effective = value
+	return scaling.Outcome{
+		Requested: value, Previous: previous,
+		State:        scaling.State{DisplayID: 1, Effective: value},
+		SetAttempted: true, Applied: true, ReadBackKnown: true, Matched: true,
+	}, nil
+}
+
+func (f *fakeScalingController) Close() error { return nil }
+
+// Session.Shutdown returns nil when only the scaling restore failed, by design: a tool
+// that cannot be closed is worse than a runtime-only scaling value left changed. The
+// signal is therefore structural -- the row still says this run owns a change -- and
+// the window has to read it from the session it just retired, because Provider stops
+// observing that session before it shuts it down.
+func TestExitReportsAScalingRestoreThatShutdownDeliberatelySwallowed(t *testing.T) {
+	t.Setenv(config.EnvPath, filepath.Join(t.TempDir(), "config.json"))
+	controller := &fakeScalingController{effective: scalingAspectByDisplay()}
+	provider := app.NewProviderWithScaling(&stubDisplays{}, stubProcesses{}, controller)
+	t.Cleanup(func() { _ = provider.Shutdown() })
+	if err := provider.Replace(domain.LegacySeedProfile()); err != nil {
+		t.Fatalf("configure provider: %v", err)
+	}
+	session := provider.Session()
+	if session == nil {
+		t.Fatal("precondition: no session to exercise")
+	}
+	if err := session.ApplyGPUScaling(); err != nil {
+		t.Fatalf("ApplyGPUScaling: %v", err)
+	}
+	if !session.Snapshot().Scaling.Owned {
+		t.Fatal("precondition: the successful write was not booked")
+	}
+	controller.mu.Lock()
+	controller.restoreErr = errors.New("NVAPI_ERROR")
+	controller.mu.Unlock()
+
+	if err := provider.Shutdown(); err != nil {
+		t.Fatalf("a failed scaling restore blocked the exit: %v", err)
+	}
+	after := shutdownScaling(provider, session)
+	if !after.Owned {
+		t.Fatal("a failed exit restore left no signal for the window to report")
+	}
+	warning := exitScalingWarning(after)
+	if warning == "" {
+		t.Fatal("the window says nothing about a scaling value it could not put back")
+	}
+	if want := app.ScalingLabel(scalingAspectByDisplay()); !strings.Contains(warning, want) {
+		t.Errorf("exit warning %q does not name the value it failed to restore (%q)", warning, want)
+	}
+	if !strings.Contains(warning, "重新開機") {
+		t.Errorf("exit warning %q does not say how the value goes away on its own", warning)
+	}
+}
+
+// The same hook must stay quiet when the restore worked, which is the case the
+// Provider's own cached snapshot cannot tell apart: it stops observing the session
+// before Shutdown runs, so its copy still says the value is owned.
+func TestExitSaysNothingWhenTheScalingRestoreSucceeded(t *testing.T) {
+	t.Setenv(config.EnvPath, filepath.Join(t.TempDir(), "config.json"))
+	controller := &fakeScalingController{effective: scalingAspectByDisplay()}
+	provider := app.NewProviderWithScaling(&stubDisplays{}, stubProcesses{}, controller)
+	t.Cleanup(func() { _ = provider.Shutdown() })
+	if err := provider.Replace(domain.LegacySeedProfile()); err != nil {
+		t.Fatalf("configure provider: %v", err)
+	}
+	session := provider.Session()
+	if err := session.ApplyGPUScaling(); err != nil {
+		t.Fatalf("ApplyGPUScaling: %v", err)
+	}
+	if err := provider.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if controller.restores == 0 {
+		t.Fatal("precondition: the exit path never attempted a restore")
+	}
+	if got := exitScalingWarning(shutdownScaling(provider, session)); got != "" {
+		t.Fatalf("a successful exit restore still warned: %q", got)
 	}
 }

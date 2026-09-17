@@ -50,6 +50,8 @@ const (
 var (
 	ErrInvalidFlags              = errors.New("invalid NVAPI display-config flags")
 	ErrNvapiUnavailable          = errors.New("NVAPI unavailable")
+	ErrNvapiDLLUnavailable       = errors.New("NVIDIA driver DLL unavailable")
+	ErrNvapiInterfaceUnavailable = errors.New("NVIDIA driver interface unavailable")
 	ErrNotNvidiaDisplay          = errors.New("target monitor is not driven by NVIDIA")
 	ErrScalingTargetNotFound     = errors.New("NVAPI scaling target not found")
 	ErrScalingTargetAmbiguous    = errors.New("NVAPI scaling target is ambiguous")
@@ -359,7 +361,7 @@ func (c *controller) ready() error {
 		}
 		api, err := c.load()
 		if err != nil {
-			return fmt.Errorf("%w: %v", ErrNvapiUnavailable, err)
+			return fmt.Errorf("%w: %w", ErrNvapiUnavailable, err)
 		}
 		if api == nil {
 			return fmt.Errorf("%w: loader returned no NVAPI implementation", ErrNvapiUnavailable)

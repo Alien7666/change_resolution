@@ -5,11 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/Alien7666/change_resolution/internal/app"
 	"github.com/Alien7666/change_resolution/internal/config"
 	"github.com/Alien7666/change_resolution/internal/domain"
+	"github.com/Alien7666/change_resolution/internal/scaling"
 )
 
 func TestWizardPrefillsTheLegacyValuesWhenTheOriginalMonitorIsPresent(t *testing.T) {
@@ -127,6 +130,55 @@ func TestANonNativeChoiceCarriesTheFullScreenScalingReminder(t *testing.T) {
 		if row.Width == 1920 && row.Height == 1440 && !row.FullScreenScalingReminder {
 			t.Fatalf("ModeRows() row = %#v, want scaling reminder", row)
 		}
+	}
+}
+
+// The settings dialog can select a monitor other than the session's current target.
+// Its note must therefore come from a fresh read for the selected identity, never from
+// the snapshot that happened to be on the main window when the dialog opened.
+func TestSelectingAnotherMonitorReadsScalingForThatMonitor(t *testing.T) {
+	first := settingsTarget(`\\.\DISPLAY1`, `\\?\DISPLAY#ONE#1`, `MONITOR\ONE`, "One")
+	second := settingsTarget(`\\.\DISPLAY2`, `\\?\DISPLAY#TWO#1`, `MONITOR\TWO`, "Two")
+	model := newSettingsModel(&fakeSettingsDisplay{
+		targets: []domain.Target{first, second},
+		modes: map[string][]domain.Mode{
+			first.DeviceName: {
+				{Width: 2560, Height: 1440, RefreshHz: 144, BitsPerPixel: 32},
+				{Width: 1920, Height: 1440, RefreshHz: 144, BitsPerPixel: 32},
+			},
+			second.DeviceName: {
+				{Width: 3840, Height: 2160, RefreshHz: 120, BitsPerPixel: 32},
+				{Width: 1600, Height: 1200, RefreshHz: 120, BitsPerPixel: 32},
+			},
+		},
+	}, &fakeSettingsLister{}, domain.Profile{}, app.ScalingSnapshot{}, true)
+	model.readScaling = func(identity domain.MonitorIdentity) app.ScalingSnapshot {
+		if identity.InstancePath == second.Identity.InstancePath {
+			return app.ScalingSnapshot{Available: true, Known: true, Effective: scaling.Value{
+				Raw: 2, Mode: scaling.ModeFullScreen, By: scaling.ByGPU,
+			}}
+		}
+		return app.ScalingSnapshot{Available: true, Known: true, Effective: scaling.Value{
+			Raw: 6, Mode: scaling.ModeAspectRatio, By: scaling.ByDisplay,
+		}}
+	}
+	if err := model.Refresh(); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if err := model.SelectMonitor(1); err != nil {
+		t.Fatalf("SelectMonitor: %v", err)
+	}
+
+	rows := model.ModeRows(aspectFourByThree)
+	if len(rows) != 1 {
+		t.Fatalf("ModeRows(4:3) = %#v, want one non-native row", rows)
+	}
+	note := modeNotes(rows[0], model.scaling)
+	if !strings.Contains(note, app.ScalingLabel(app.ScalingFullScreenByGPU())) {
+		t.Fatalf("selected monitor note = %q, want second monitor's measured scaling", note)
+	}
+	if strings.Contains(note, app.ScalingLabel(scaling.Value{Raw: 6, Mode: scaling.ModeAspectRatio, By: scaling.ByDisplay})) {
+		t.Fatalf("selected monitor note = %q, still shows the previous monitor's scaling", note)
 	}
 }
 
@@ -365,7 +417,7 @@ func refreshedSettingsModelWithProfile(t *testing.T, displays *fakeSettingsDispl
 			})
 		}
 	}
-	model := newSettingsModel(displays, &fakeSettingsLister{}, profile, true)
+	model := newSettingsModel(displays, &fakeSettingsLister{}, profile, app.ScalingSnapshot{}, true)
 	if err := model.Refresh(); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
@@ -374,7 +426,7 @@ func refreshedSettingsModelWithProfile(t *testing.T, displays *fakeSettingsDispl
 
 func refreshedSettingsModelWithLister(t *testing.T, displays *fakeSettingsDisplay, lister *fakeSettingsLister) *settingsModel {
 	t.Helper()
-	model := newSettingsModel(displays, lister, domain.Profile{}, true)
+	model := newSettingsModel(displays, lister, domain.Profile{}, app.ScalingSnapshot{}, true)
 	if err := model.Refresh(); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}

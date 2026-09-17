@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Alien7666/change_resolution/internal/app"
 	"github.com/Alien7666/change_resolution/internal/domain"
 	"github.com/lxn/walk"
 	dec "github.com/lxn/walk/declarative"
@@ -142,7 +143,7 @@ func showSettingsDialog(owner walk.Form, model *settingsModel, replace func(doma
 		flow:         newSettingsDialogFlow(model, replace),
 		aspect:       aspectAll,
 		monitorTable: &monitorTableModel{},
-		modeTable:    &modeTableModel{},
+		modeTable:    &modeTableModel{scaling: model.scaling},
 	}
 	refreshErr := model.Refresh()
 	d.flow.syncInitialProcessChoice()
@@ -298,6 +299,9 @@ func (d *settingsDialog) rebuild(refreshErr error) {
 	d.flow.withRebuild(func() {
 		d.monitorTable.rows = d.flow.model.MonitorRows()
 		d.monitorTable.PublishRowsReset()
+		// The selected monitor may have changed since this table model was built. Keep
+		// the 備註 column on the same fresh, provider-owned scaling read as settingsModel.
+		d.modeTable.scaling = d.flow.model.scaling
 		d.modeTable.rows = d.flow.model.ModeRows(d.aspect)
 		d.modeTable.PublishRowsReset()
 
@@ -529,7 +533,14 @@ func (d *settingsDialog) updateMonitorDetails() {
 }
 
 func (d *settingsDialog) updateModeDetails(row modeRow) {
-	_ = d.modeTip.SetText(modeNotes(row))
+	text := modeNotes(row, d.flow.model.scaling)
+	if row.FullScreenScalingReminder {
+		// The one thing the tool cannot do for the user belongs where the user is
+		// making the choice it affects, not only in the main window.
+		text += "\n" + scalingOverrideNote
+	}
+	_ = d.modeTip.SetText(text)
+	_ = d.modeTip.SetToolTipText(text)
 }
 
 func (d *settingsDialog) setStatus(text string) {
@@ -569,7 +580,8 @@ func (m *monitorTableModel) Value(row, column int) interface{} {
 
 type modeTableModel struct {
 	walk.TableModelBase
-	rows []modeRow
+	rows    []modeRow
+	scaling app.ScalingSnapshot
 }
 
 func (m *modeTableModel) RowCount() int { return len(m.rows) }
@@ -583,7 +595,7 @@ func (m *modeTableModel) Value(row, column int) interface{} {
 	case 2:
 		return fmt.Sprintf("%d Hz", item.HighestRefresh)
 	case 3:
-		return modeNotes(item)
+		return modeNotes(item, m.scaling)
 	default:
 		return ""
 	}
@@ -645,7 +657,7 @@ func monitorIdentityDetails(row monitorRow) string {
 	return strings.Join(details, "\n")
 }
 
-func modeNotes(row modeRow) string {
+func modeNotes(row modeRow, view app.ScalingSnapshot) string {
 	var notes []string
 	if row.Current {
 		notes = append(notes, "目前模式")
@@ -654,12 +666,27 @@ func modeNotes(row modeRow) string {
 		notes = append(notes, "原生模式")
 	}
 	if row.FullScreenScalingReminder {
-		notes = append(notes, "非原生比例，請確認已使用全螢幕縮放")
+		notes = append(notes, modeScalingNote(view))
 	}
 	if len(notes) == 0 {
 		return "—"
 	}
 	return strings.Join(notes, "；")
+}
+
+// modeScalingNote is the profile design's static reminder wherever the scaling value
+// could not be read, and the measured sentence wherever it could. It never invents a
+// value, and it never says the black bars are gone: full-screen scaling is reported as
+// the setting it is, because a game can still override it.
+func modeScalingNote(view app.ScalingSnapshot) string {
+	if !view.Known {
+		return "非原生比例，請確認已使用全螢幕縮放"
+	}
+	note := "非原生比例，目前 GPU 縮放：" + app.ScalingLabel(view.Effective)
+	if view.Effective.Mode == app.ScalingFullScreenByGPU().Mode {
+		return note
+	}
+	return note + "，畫面會有黑邊"
 }
 
 func indexOfStringFold(values []string, want string) int {

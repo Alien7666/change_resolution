@@ -69,6 +69,10 @@ type Target struct {
 	DeviceName string
 	Identity   MonitorIdentity
 	MatchedBy  MatchLevel
+
+	// AdapterDeviceString is diagnostic metadata only. Matching and every write
+	// continue to use the monitor identity and a freshly resolved DeviceName.
+	AdapterDeviceString string
 }
 
 // Profile is the configuration a session runs on. Every field comes from the user.
