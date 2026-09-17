@@ -103,3 +103,15 @@ Before Task 15 integration, scaling reports atomic write facts (previous value, 
 ### 2026-09-16 accepted integration checkpoint
 
 Task 11 completed in f880035 after independent review and root verification. Settings model/dialog are accepted in 281ca52/8172e58; Task 12 entry wiring is in progress. Scaling prerequisite safety fixes are accepted in 3eb477d, with root read-only NVAPI integration passing. Display restore identity/topology fixes are accepted in 1910241; they capture stable bindings for every saved display and refuse changed mappings before any test/apply. Config truncated-JSON location fixed in 8344e11. Original plan now has 13 of 17 tasks complete; Tasks 12, 15, 16 and final Task 17 verification remain.
+
+### 2026-09-16 Claude reconciliation and Task 16 resume
+
+Claude completed Task 12 in f4e5653 and Task 15 in 4cb0802, with the seen-flag clarification in 86a808c. The original plan records Tasks 1–15 complete (76/87 steps). Task 16 stopped on an API SSL error, leaving five UI files modified. Fresh baseline tests passed outside internal/ui; TestScalingUnavailabilityLeavesTheFourByThreeToggleUsable failed because the unavailable reason gained an extra generic sentence.
+
+The user now authorizes completing Task 16 and then pausing. Task 17 remains unstarted in this resumed scope. Parallel delegation is allowed again, but overlapping implementation stays under one Sol worker. Root owns review, verification, Git and progress records. Preserve the inherited UI draft, verify selected-monitor scaling reads and diagnostic wording, and launch the final binary with an isolated config for read-only layout inspection. No real display/scaling writes are authorized by these checks.
+
+### 2026-09-17 Task 16 verification
+
+The completed implementation passes the full test suite, build, vet, formatting and diff checks. The root also built the GUI artifact and inspected first-run selection, changing from Mi Monitor to XV272K V3, a non-native mode's measured reminder, the configured main window and a rejected configuration with a long error path. Scaling values changed with monitor selection; the required reminders and controls were visible. These checks used isolated configuration files and performed no display-mode or scaling writes. The 560 × 600 main form is accepted in place of the approximate 460 × 320 sketch to keep the distinct diagnostic and reminder areas visible. The missing-interface message follows the authoritative scaling spec without adding a numeric driver-version API.
+
+Task 16 is complete in `2bbc7c2`. Independent review and a scoped re-review passed after separating `Snapshot.NativeMode` / `NativeKnown` from the optional fallback override. The isolated 16:9-panel / 4:3-game / 4:3-fallback regression was also verified in the real UI without changing display state. Overall progress is 16/17 tasks and 82/87 steps. Work is paused as requested; Task 17 documentation, final branch verification and the actual hardware-write release checklist remain pending.

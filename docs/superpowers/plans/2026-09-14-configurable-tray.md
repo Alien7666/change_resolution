@@ -1096,6 +1096,8 @@ Expected: all tests pass under 20 repeats; the renaming fake is active in every 
 
 ### Task 16: Put GPU scaling on screen with its own availability state
 
+Completed 2026-09-17 in `2bbc7c2`. Independent spec and quality review passed after separating native-mode diagnostics from an explicit fallback override. Full tests, build, vet, formatting, app/scaling repeated tests and isolated GUI inspection passed. The main form uses 560 × 600 to keep required diagnostic text visible. Actual display/scaling writes remain the Task 17 manual release gate.
+
 **Files:**
 - Modify: `internal/ui/window_windows.go`
 - Modify: `internal/ui/window_windows_test.go`
@@ -1105,7 +1107,7 @@ Expected: all tests pass under 20 repeats; the renaming fake is active in every 
 - Consumes: `Snapshot.Scaling`.
 - Produces: a second, independent availability group and the measured non-native reminder.
 
-- [ ] **Step 1: Write the failing availability-isolation tests**
+- [x] **Step 1: Write the failing availability-isolation tests**
 
 ```go
 func TestScalingUnavailabilityLeavesTheFourByThreeToggleUsable(t *testing.T)
@@ -1124,11 +1126,11 @@ func TestSettingsStaysDisabledWhileManagedEvenThoughScalingDoesNot(t *testing.T)
 
 The four newly-named tests encode the Task 15 decision on the UI side. The scaling button is **enabled** while the session owns a mode — that is the only moment the user can see the black bars it fixes — but its label or the line beside it says what pressing it costs (畫面會先恢復原始排列、變更縮放、再切回遊戲模式). `設定…` is the deliberate contrast and stays disabled, for the reason recorded in Global Constraints. And while `Snapshot.State` is `StateScalingCycle`, every mutating control is disabled, including the scaling button itself: `opMu` already makes a second click merely queue, but a queued command against a desktop that is mid-change is not something to offer.
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `go test ./internal/ui`
 
-- [ ] **Step 3: Split the availability state and render the scaling row**
+- [x] **Step 3: Split the availability state and render the scaling row**
 
 `controls` grows `scalingApply` and `scalingRestore`, fed by a separate `scalingUnavailableReason`. Disabled always shows its reason **beside the button**, never only in a tooltip, matching how the unsupported-mode case already behaves. The reason wording comes from the scaling spec's table: no DLL names the detected adapter's `DeviceString` and points at that vendor's control panel; entry points missing names the driver version; the target not being on an NVIDIA path names the monitor.
 
@@ -1145,15 +1147,15 @@ A mismatched read-back prints both values and is not styled as an error; the but
 
 While the cycle runs, the row and the status line come from `StateScalingCycle` and name the phase rather than the result: 正在變更 GPU 縮放：恢復原始排列… / 寫入縮放設定… / 重新套用 1920 × 1440 @ 180 Hz…. `Snapshot.Managed` stays true throughout, so nothing in the window flickers to 啟用 at the moment pressing it would be meaningless. Each of the three failure exits has its own wording, and each must say what the desktop is doing now as well as what failed: restore failed → the mode is still applied and scaling was not changed; scaling failed → the desktop is back at the original arrangement and nothing is owned; re-apply failed → the scaling value did change, the desktop is at the original arrangement, and the toggle will put the mode back.
 
-- [ ] **Step 4: Upgrade the non-native reminder from static to measured**
+- [x] **Step 4: Upgrade the non-native reminder from static to measured**
 
 The profile spec promised a static reminder when the chosen mode's aspect differs from the native one. With a read path available it becomes measured — 這個模式是 4:3，而目前的 GPU 縮放是「長寬比（由顯示器執行）」，畫面會有黑邊 — in the settings dialog's 備註 column and in the main window. It never blocks the choice: the user may want the bars, or may have handled it elsewhere. Alongside it, keep the honesty line permanently: 若遊戲內仍有黑邊，請到 NVIDIA 控制台勾選「覆寫遊戲和程式所設定的縮放模式」——這一項工具無法代為設定。 That checkbox has no NVAPI interface at all, and the tool must not imply otherwise.
 
-- [ ] **Step 5: Reconcile the window layout one last time**
+- [x] **Step 5: Reconcile the window layout one last time**
 
 Two designs have now each added to a fixed-size window: a fourth button and an extra line from the profile work, one more line and one more button from this. Lay them out together rather than incrementally — roughly `460×320`, with 隱藏至系統匣 living in the tray menu if the button row does not fit at the fixed width. Build and look at it; a screenshot is not required but the binary must actually be launched to confirm nothing is clipped.
 
-- [ ] **Step 6: Verify and commit the scaling UI**
+- [x] **Step 6: Verify and commit the scaling UI**
 
 ```powershell
 gofmt -l ./internal ./cmd
