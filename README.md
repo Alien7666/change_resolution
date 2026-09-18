@@ -1,111 +1,121 @@
-# VALORANT 4:3 顯示工具
+# ResolutionTray
 
-[![CI](https://github.com/Alien7666/change_resolution/actions/workflows/ci.yml/badge.svg)](https://github.com/Alien7666/change_resolution/actions/workflows/ci.yml)
+ResolutionTray 是 Windows 專用的系統匣工具，讓你為**自己選定的顯示器**套用一個列舉得到的顯示模式，並在選定的程式結束後自動還原。目標顯示器、模式與要觀察的程式都由你設定；啟動、首次設定與重新整理都只讀取狀態，不會自行切換螢幕。
 
-Windows 系統匣工具，用來手動切換 Mi Monitor（`MONITOR\XMI27B2`）的顯示模式，並在 VALORANT 關閉後自動恢復原始解析度。取代原本的 Python/PyInstaller 解析度切換腳本。
+> 本分支的文件說明目前原始碼的行為。GitHub 已發布版本及其附件可能早於本分支；請以該 Release tag 的 README 與內容為準。若你需要本頁所述功能，請從此分支自行建置，或等待含有這些變更的新 Release。
 
-## 這個工具做什麼
+## 使用前要知道的事
 
-- 只變更**指定的 Mi Monitor** 的顯示模式。其他三台螢幕的解析度、刷新率與色彩深度完全不動；為了讓桌面保持連續，它們的**桌面位置**會依寬度差平移，並在恢復時一併還原。
-- 開啟「使用 4:3」時，套用 `1920×1440 @ 180 Hz`（32 bpp）；關閉時恢復啟用當下保存的原始模式。
-- 4:3 啟用期間會觀察 `VALORANT-Win64-Shipping.exe` 是否還在 Windows 程序清單中；程序從「存在」變成「不存在」後，等待 **3 秒**再自動恢復。
-- 只是**讀取**與**呼叫 Win32 顯示 API**，不會啟動、注入、掛勾 VALORANT，也不會開啟其行程、讀取其記憶體，或碰觸 Riot / Vanguard / 遊戲檔案。
+- 工具只對設定檔所識別的目標顯示器套用模式。其他顯示器的解析度、刷新率與色彩深度不會被改變；桌面座標可能為了維持最終排列而調整。
+- 不會啟動、注入或掛勾被觀察的程式，也不會開啟其程序控制代碼或讀取記憶體；它只列舉執行檔名稱。
+- 顯示模式與 GPU 縮放都是執行期變更，不會寫入 Windows 的永久顯示設定。工具異常結束時無法代為清理；下次啟動不會自動切換螢幕。
 
-## 事前準備：NVIDIA 全螢幕縮放
+## 第一次執行與一般操作
 
-Mi Monitor 只有原生 `2560×1440`，切到 `1920×1440` 屬於非原生比例。為了讓畫面正確縮放並避免變形黑邊，需要**在顯示卡層級啟用縮放**（一次性設定）：
+沒有設定檔時會開啟「初次設定」對話框。依序選擇：
 
-1. 開啟 NVIDIA 控制台 → **調整桌面尺寸與位置**。
-2. 縮放模式選擇「全螢幕」，並將「執行縮放的裝置」設為 **GPU**（而非顯示器或顯示器內建縮放）。
-3. 套用後即可。此設定只需做一次，之後每次工具切換解析度都會沿用。
+1. 目標顯示器。
+2. 該顯示器回報的顯示模式。
+3. 要觀察的執行檔名稱，或選擇「不觀察任何程序（只用手動切換）」。
 
-## 安裝（從 GitHub Release 下載）
+在按下儲存前，設定對話框的偵測、選擇與重新整理都是讀取，沒有預覽，也不會套用模式。按下「儲存」才會寫入設定檔，但仍不會套用模式；按「稍後再設定」、關閉對話框或取消時都不會留下檔案。未設定時，切換維持停用，之後可從系統匣的「設定…」回來完成它。
 
-1. 到 [Releases](https://github.com/Alien7666/change_resolution/releases) 下載最新版的 `ResolutionTray.exe` 與 `ResolutionTray.exe.sha256`。免安裝，單一執行檔。
-2. 校驗下載的檔案（PowerShell，在兩個檔案所在的目錄執行）：
+若偵測到相容的歷史設定，精靈可能預填值讓你確認；仍須按儲存，絕不會在首次啟動時自行寫檔或套用模式。
 
-   ```powershell
-   $expected = (Get-Content .\ResolutionTray.exe.sha256).Split(' ')[0]
-   (Get-FileHash -Algorithm SHA256 .\ResolutionTray.exe).Hash -eq $expected   # 必須印出 True
-   ```
+主視窗與系統匣顯示目前的目標、模式、觀察狀態與錯誤。勾選「使用 <設定的模式>」才會套用；手動關閉、被觀察程式從已出現變成消失後的延遲，或正常結束工具時，會嘗試恢復本次操作保存的排列。預設延遲是 3 秒；它記在設定檔的 **watch.restoreDelaySeconds**，目前設定視窗沒有可調整延遲的欄位。
 
-3. 校驗通過後直接執行 `ResolutionTray.exe`。
+「設定…」在工具管理已套用模式、處於**待恢復**，或仍擁有本次 GPU 縮放時都會停用；請先恢復顯示模式與 GPU 縮放後再改設定。待恢復表示桌面可能已變更、但遊戲模式尚未確認成功；工具會保留原始排列與穩定身分，只允許手動恢復或正常結束時嘗試恢復，不能再套用模式、寫入縮放或更換設定。GPU 縮放按鈕在一般管理模式可用時，會先恢復排列、變更縮放，再以重新讀取的資訊套用模式一次；螢幕可能因此額外切換兩次。
 
-> **執行檔沒有程式碼簽章。** 第一次執行時 Windows SmartScreen 會跳出「已保護您的電腦」，防毒軟體也可能一併攔截或隔離——這對自行建置、沒有購買程式碼簽章憑證的工具是正常現象，不代表檔案有問題。請先完成上面的 SHA256 校驗，再點「其他資訊」→「仍要執行」。若不放心，也可以依「[建置](#建置)」一節自行從原始碼建置。
+## 顯示器與桌面排列
 
-## 使用者流程
+設定檔不保存 **\\.\DISPLAYn**。Windows 可以在重開機、拔插或驅動變動後重新編號它；工具每次操作會以完整、忽略大小寫的裝置介面路徑重新識別顯示器。只有在設定時同型號唯一、且目前剛好只命中一台時，才會以硬體 ID 作為回復用的次要比對。找不到、鏡射，或有多個候選時會拒絕操作，絕不隨意挑第一台。
 
-1. **啟動工具不會改變任何螢幕。** 主視窗只讀取並顯示 Mi Monitor 目前的解析度與刷新率。
-2. **手動切換 4:3：** 勾選「使用 4:3（1920×1440 @ 180 Hz）」後，工具會：
-   - 以硬體 ID 前綴 `MONITOR\XMI27B2` 動態找出對應的 `\.\DISPLAYn`（不是寫死的 `DISPLAY1`）。
-   - 保存當下完整的桌面排列：每台螢幕的模式與桌面座標。
-   - 算出新的桌面排列：目標從 2560 縮到 1920 會留下 640 px 的空隙，滑鼠無法移到右邊的螢幕，因此位於目標右側的螢幕一起左移 640 px。主要顯示器固定在 `(0,0)`，本機的目標就是主要顯示器，所以目標本身不會移動。算不出安全排列就直接中止，不動任何螢幕。
-   - 先以 `CDS_TEST` 驗證目標模式，成功後才正式套用。
-   - 整個排列逐台依序套用：每台螢幕各自一次 `CDS_FULLSCREEN` 呼叫。不使用 `CDS_NORESET` 暫存加單次提交的寫法——該寫法在本機實測會被驅動以 `DISP_CHANGE_BADFLAGS` 拒絕，根本無法套用。
-   - 順序會避開中途重疊：目標縮小時先套用目標模式再平移其他螢幕，目標變大時先平移其他螢幕再套用目標模式。
-   - 任何一步失敗就把已經改過的螢幕改回原位與原模式，再回報原始錯誤；若連回復都失敗，會明確告知桌面被留在套用到一半的狀態。
-   - 套用完成後會重新讀取桌面並與計畫比對，不符就回報，不會把讀不到或位置不對的螢幕當成成功。
-   - 視窗可隱藏至系統匣繼續執行。
-3. **取消勾選 / 按「恢復 2K」：** 立即恢復先前保存的原始模式**與所有螢幕的原始座標**，並取消任何尚未執行的自動恢復計時。
-   - 若啟動時螢幕本來就已是 4:3（工具沒有保存到原始模式），手動恢復會套用 profile 內建的 `FallbackNativeMode`（`2560×1440 @ 180 Hz`）；此時沒有保存的排列可還原，工具會依目前桌面重新算一次排列，避免較寬的模式壓到旁邊的螢幕。
-   - 若恢復時螢幕編號已經改變、保存的排列不再對應目前的桌面，工具會中止恢復並回報錯誤，不會把螢幕移到錯誤的位置；4:3 仍由工具管理，修正後可再按一次恢復。
-4. **自動恢復：** 4:3 啟用期間，工具每秒檢查一次 `VALORANT-Win64-Shipping.exe` 是否還在程序清單中。程序從「有看到」變成「消失」的 3 秒後，自動恢復原始模式；若計時尚未到期遊戲又重新出現，恢復會被取消。
-5. **系統匣行為：** 關閉或最小化主視窗只會隱藏至系統匣，工具持續執行；托盤選單提供「顯示主視窗」「使用 4:3」「恢復原始解析度」「重新整理狀態」「結束」。左鍵點擊托盤圖示會還原並前景化主視窗。
-6. **目標螢幕不可用時：** 若啟動時 Mi Monitor 正在休眠或切到別的輸入源，工具找不到它，會停用 4:3 切換並顯示原因。等螢幕回來後按「重新整理」（或托盤的「重新整理狀態」）重新讀取即可解除，不需要重開工具。
-7. **結束工具：** 若目前仍由本工具管理 4:3，會先嘗試恢復原始模式再結束；若恢復失敗，工具會回報錯誤並保持執行，不會默默放著 4:3 不管。
+當目標模式的寬或高變動時，位於目標另一側、座標跨過該軸的鄰居會隨尺寸差同方向平移；主要顯示器保持在 **(0,0)**。例如目標由 **2560×1440** 縮為 **1920×1440** 時，右方鄰居會左移 **640 px**，以免在最終桌面留下無法跨越的空隙。
 
-切換解析度當下螢幕會短暫黑屏一下，這是實體顯示模式切換無可避免的現象；工具的目標是讓黑屏只發生在「手動開啟」「手動關閉」「遊戲結束後自動恢復」這三個時間點，不會因為 VALORANT 內部的 Alt+Tab / 桌面模式切換而反覆觸發。
+工具會先規劃並驗證最終排列，無法安全安排時不會變更任何螢幕。套用順序會依目標模式是變大或不變大決定；若一個軸變大、另一個軸變小，這個固定順序不承諾每個中間瞬間都沒有重疊，Windows 也可能在切換期間短暫黑屏。完成後仍會讀回並驗證最終排列。
 
-## 安全邊界（工具絕對不做的事）
+「原生模式」是從該螢幕列舉模式推得的資料，供比例提醒使用。**fallbackMode** 則是可選的恢復覆寫值；未設定時，工具會從該螢幕當下回報的模式推導。兩者用途不同，不能把 fallback 當成原生模式。
 
-- **絕不啟動、注入或掛勾 VALORANT**，也不會以任何方式和遊戲行程互動。
-- **絕不開啟 VALORANT 的行程控制代碼（`OpenProcess`）或讀寫其記憶體**；唯一使用的 API 是 `CreateToolhelp32Snapshot` + `Process32First(W)` / `Process32Next(W)`，只列舉行程的**執行檔名稱**做字串比對。
-- **絕不觸碰 Riot Client、Vanguard 或任何遊戲檔案**。
-- **絕不使用 `CDS_UPDATEREGISTRY`**：解析度變更只是暫時性的執行期切換，不會寫回登錄檔／永久生效；意外結束工具也不會讓 4:3 變成使用者的永久設定。
-- **絕不改變 Mi Monitor 以外顯示器的顯示模式**：不動它們的解析度、刷新率或色彩深度。唯一會寫入的欄位是桌面位置，而且只在為了讓桌面保持連續時平移；恢復時會連同目標的模式一併還原。主要顯示器永遠留在 `(0,0)`。
-- **算不出安全排列就什麼都不做**：若會造成螢幕重疊、有螢幕讀不到、或主要顯示器會被移動，工具直接中止並回報錯誤，不會套用一半的排列。
-- 套用目標模式前一定先以 `CDS_TEST` 驗證，驗證失敗就不會正式套用。
+## NVIDIA GPU 縮放
 
-## 建置
+如果所選模式與面板原生比例不同，可能需要全螢幕縮放，也可能是你刻意保留黑邊的選擇。ResolutionTray 不會把非原生比例視為必然需要縮放，亦不會宣稱黑邊一定已消失。
 
-需求：Windows 10/11 amd64、Go 1.27.x（若未安裝於 PATH，`build.ps1` 會退回使用 `C:\Program Files\Go\bin\go.exe`）。
+在支援的 NVIDIA 環境，主視窗的 GPU 縮放按鈕可明確要求「全螢幕（由 GPU 執行）」。按鈕是獨立的手動操作：
 
-```powershell
-# 完整可重現建置：go generate → go test ./... → go vet ./... → 建置 GUI 版 exe
+- 首次成功取得縮放管理權的變更，會保存變更前立即讀到的有效值。
+- 使用者按還原或正常退出時，工具會嘗試恢復該值；驅動可能正規化而無法忠實還原。
+- 不會隨顯示模式的開關、被觀察程式結束或自動恢復而自行寫入 GPU 縮放。
+- 驅動可能正規化請求值。畫面會同時顯示「要求值」與「實際生效值」；兩者不同不是錯誤，也不代表工具可判定遊戲畫面結果。
+
+正常結束時，顯示模式還原失敗會讓工具保持執行以供重試；GPU 縮放還原失敗只會警告，仍會結束。
+
+AMD 與 Intel 的縮放仍須在各自的顯示卡控制台手動設定；程式會停用該按鈕並顯示偵測到的供應商／驅動原因，這不會停用顯示模式切換。
+
+即使 NVIDIA 回讀為全螢幕 GPU 縮放，工具仍無法讀取或設定 NVIDIA 控制台的「覆寫遊戲和程式所設定的縮放模式」核取方塊。若遊戲內仍有黑邊，請在 NVIDIA 控制台自行檢查該選項；遊戲或程式也可能覆寫縮放設定。
+
+## 設定檔與錯誤復原
+
+預設路徑是 **%APPDATA%\ResolutionTray\config.json**。**RESOLUTION_TRAY_CONFIG** 可覆寫**完整檔案路徑**，適合測試或隔離設定；它不是資料夾路徑。
+
+目前 schema 只有 **version: 1**。儲存時使用 UTF-8、兩空白縮排與 LF，先在目的檔同目錄寫入「完整目的路徑加上 .tmp」的暫存檔，再同步資料並以重新命名取代原檔，避免中途中斷留下半份或空白設定。預設路徑的暫存檔是 **config.json.tmp**；若使用替代路徑，名稱會隨該路徑改變。範例：
+
+~~~json
+{
+  "version": 1,
+  "monitor": {
+    "instancePath": "\\\\?\\DISPLAY#example",
+    "hardwareId": "MONITOR\\EXAMPLE",
+    "modelWasUnique": true,
+    "label": "我的螢幕"
+  },
+  "gameMode": { "width": 1920, "height": 1440, "refreshHz": 180, "bitsPerPixel": 32 },
+  "fallbackMode": null,
+  "watch": { "processName": "game.exe", "restoreDelaySeconds": 3 }
+}
+~~~
+
+空白 **processName** 合法，表示只手動切換。**restoreDelaySeconds** 可為 0–60；缺席時的預設值是 3。本版本沒有 migration、舊版備份欄位或其他 schema 版本。
+
+讀取、JSON、版本或欄位驗證失敗時，工具會保留原始檔案並在訊息中保留完整路徑與原因；不會自動覆寫或修復。較新版本的檔案會進入唯讀拒絕狀態。
+
+顯示器因換線而找不到原先的介面路徑、但硬體 ID 的次要比對安全且唯一成功時，工具會對該 profile session 最多嘗試一次原子更新新的 **instancePath**；它只改這個身分路徑，保留其餘設定。若保存失敗，目前工作階段仍可用，畫面會保留重新綁定／設定錯誤警告，且不會重複嘗試寫入。有歧義時絕不重綁，必須回到「設定…」重選。
+
+若檔案確實無法使用，可先修正後按「重新讀取」，或明確選「重新設定」。後者會在確認後把原檔保留為 **config.bad-<時間>.json**，再開啟設定精靈；這是唯一會為損壞設定建立保留副本的使用者主動動作。
+
+## 安裝與建置
+
+從 [Releases](https://github.com/Alien7666/change_resolution/releases) 取得某個已發布版本時，請下載同一個 Release 附帶的 **ResolutionTray.exe** 與 **ResolutionTray.exe.sha256**，並確認來源可信任。SHA256 可確認下載內容與該 Release 所提供的校驗碼相符；它不取代來源信任或 Windows 的安全判斷。也可以從可審閱的原始碼自行建置。
+
+~~~powershell
+$expected = (Get-Content .\ResolutionTray.exe.sha256).Split(' ')[0]
+(Get-FileHash -Algorithm SHA256 .\ResolutionTray.exe).Hash -eq $expected
+~~~
+
+需求為 Windows 10/11 amd64 與 Go 1.27.x。下列是支援的正式建置入口，會產生完整 GUI 成品：
+
+~~~powershell
 ./build.ps1
-```
+~~~
 
-成功後會產生 `dist/ResolutionTray.exe`（GUI subsystem，不會顯示主控台視窗；`dist/` 已列入 `.gitignore`，不會提交進版控）。
+它會執行產生資源、測試、vet，並輸出 **dist/ResolutionTray.exe**。**go build ./...** 只用於編譯套件檢查，不會產生這個 GUI 發行成品。
 
-### 個別指令
-
-```powershell
-# 只跑單元測試與安全的 Win32 結構測試（不會實際切換螢幕解析度）
-go test ./...
-
-# 選擇性整合測試：只執行 CDS_TEST 驗證，不會真的改變顯示模式
-$env:RUN_DISPLAY_INTEGRATION = '1'
-go test ./internal/display -run TestWindowsControllerCanTestMiMonitorMode -v
-Remove-Item Env:RUN_DISPLAY_INTEGRATION
-```
-
-若 `go` 不在 PATH 上，可先執行：
-
-```powershell
+~~~powershell
 $env:PATH = "C:\Program Files\Go\bin;$env:PATH"
-```
+go test ./...
+go test -count=20 ./internal/app ./internal/scaling
 
-## 持續整合與發布
+# 僅在明確設定後才執行；預設跳過。
+$env:RUN_DISPLAY_INTEGRATION = '1'
+go test ./internal/display -run 'MiMonitor|Integration' -v
+Remove-Item Env:RUN_DISPLAY_INTEGRATION
 
-建置流程的唯一真相來源是 [`build.ps1`](build.ps1)；兩個 workflow 都直接呼叫它，不另外複製一份建置參數。
+$env:RUN_NVAPI_INTEGRATION = '1'
+go test ./internal/scaling -run Integration -v
+Remove-Item Env:RUN_NVAPI_INTEGRATION
+~~~
 
-- **CI** — [`.github/workflows/ci.yml`](.github/workflows/ci.yml)：每次 push、每個 pull request 以及手動觸發時，在 `windows-latest` 上依序執行 `gofmt` 檢查、`go mod tidy -diff`、`go build ./...`、`go vet ./...`、`go test ./...`、`go test -race ./...`，最後跑一次 `build.ps1` 確認執行檔仍然建得起來。競態偵測器（`-race`）需要 C 工具鏈，開發機沒有，只有 CI 跑得到。CI 永遠不會設定 `RUN_DISPLAY_INTEGRATION`，所以不會真的變更任何顯示模式。
-- **發布** — [`.github/workflows/release.yml`](.github/workflows/release.yml)：推一個 `v*` tag 即可發布。它會跑 `build.ps1`（含完整測試）、計算 SHA256，並建立該 tag 的 GitHub Release，附上 `ResolutionTray.exe` 與 `ResolutionTray.exe.sha256`。
+兩個整合 gate 預設都不設定；CI 也不設定任何一個。**-race** 需要 C toolchain，因此只在 CI 執行。真實顯示器模式切換與真實 GPU 縮放寫入仍需要受監督的硬體人工驗證，不能由上述命令宣稱已完成。
 
-```powershell
-# 發布新版本
-git tag v1.0.0
-git push origin v1.0.0
-```
+## 發布
 
-也可以在 GitHub 的 Actions 頁面手動觸發 Release workflow 做一次 dry run：會完整測試、建置並算出校驗碼，但不會發布任何 Release。
+**build.ps1** 是支援的正式 GUI 發行成品建置入口。Release workflow 只在推送 **v*** tag 時建立 GitHub Release；手動觸發只建置與計算校驗碼，不會發布。請依專案當下的版本策略建立 tag，不要假設特定的固定 tag 名稱。

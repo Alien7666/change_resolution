@@ -73,7 +73,7 @@ jobs:
           # Fail loudly rather than publishing a release with no assets.
           fail_on_unmatched_files: true
           body: |
-            **VALORANT 4:3 顯示工具** — Windows 系統匣工具，手動把 Mi Monitor（`MONITOR\XMI27B2`）切到 `1920×1440 @ 180 Hz`，並在 `VALORANT-Win64-Shipping.exe` 從程序清單消失 3 秒後自動恢復原始解析度。
+            **ResolutionTray** — Windows 系統匣工具，讓你選擇目標顯示器、顯示模式與要觀察的程式。啟動與首次設定只讀取狀態；只有明確操作才會套用顯示模式。
 
             ## 下載
 
@@ -92,11 +92,13 @@ jobs:
             (Get-FileHash -Algorithm SHA256 .\ResolutionTray.exe).Hash -eq '${{ steps.checksum.outputs.sha256 }}'
             ```
 
-            執行檔**沒有程式碼簽章**，第一次執行時 SmartScreen 與防毒軟體很可能會攔截——這對自行建置的未簽章工具是正常現象。請先比對上面的 SHA256，再選擇「其他資訊」→「仍要執行」。
+            請只從可信任的 Release 與來源取得檔案。SHA256 可確認下載內容與本 Release 的附件相符，但不取代來源信任或 Windows 的安全判斷。
 
             ## 使用前必讀
 
-            - **事前準備：NVIDIA 全螢幕縮放** — Mi Monitor 原生為 `2560×1440`，切到非原生的 `1920×1440` 前，必須先在 NVIDIA 控制台把縮放模式設為「全螢幕」並由 **GPU** 執行，否則畫面會變形或出現黑邊。這是一次性設定。
-            - **安全邊界** — 本工具只讀取顯示設定並呼叫 Win32 顯示 API。絕不啟動、注入或掛勾 VALORANT，不開啟其行程控制代碼或讀取記憶體，不觸碰 Riot / Vanguard 或任何遊戲檔案，也絕不使用 `CDS_UPDATEREGISTRY`（解析度變更純屬執行期，不會寫回登錄檔）。
+            - **初次設定** — 選擇目標顯示器、列舉出的模式與可選的觀察程式。取消或「稍後再設定」不會建立設定檔，也不會變更螢幕。
+            - **GPU 縮放** — 選用非原生比例時，你可自行決定是否需要全螢幕縮放或保留黑邊。支援的 NVIDIA 系統可用程式內的手動按鈕要求「全螢幕（由 GPU 執行）」；AMD 與 Intel 仍須在各自控制台設定。縮放不會隨模式開關或觀察程式結束而自動寫入。
+            - **遊戲覆寫** — 「覆寫遊戲和程式所設定的縮放模式」仍須在 NVIDIA 控制台自行設定；本工具無法讀取或修改它，也無法保證遊戲中的黑邊結果。
+            - **安全邊界** — 工具只列舉程式名稱，並使用 Win32 顯示 API 與 NVIDIA NVAPI 處理明確要求的顯示／縮放動作；不啟動、注入、掛勾或讀取被觀察程式，也不使用 `CDS_UPDATEREGISTRY`。顯示模式與 GPU 縮放都是執行期變更。
 
-            兩節的完整說明請見 [README](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md)。
+            完整說明請見 [README](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md)。

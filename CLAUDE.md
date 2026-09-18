@@ -1,77 +1,103 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for contributors working on ResolutionTray, a Windows-only Go system-tray tool for a user-configured display profile and optional NVIDIA GPU-scaling control.
 
-## Overview
+## Design authorities
 
-Windows-only Go system-tray tool. Manually toggles the target monitor resolved from `domain.MonitorIdentity`: first by whole, case-insensitive device-interface-path equality, then by a guarded unique-model hardware-ID fallback. It applies the session profile's game mode through `ChangeDisplaySettingsExW`, then restores the saved mode after the profile's watched process disappears for its configured delay. Startup only reads and displays state; it never changes a display mode on its own.
+Read these together before changing behaviour:
 
-Design spec: `docs/superpowers/specs/2026-09-13-go-display-tray-design.md`. Implementation plan: `docs/superpowers/plans/2026-09-13-go-display-tray.md`.
+1. [Shipped display-tray design](docs/superpowers/specs/2026-09-13-go-display-tray-design.md)
+2. [Configurable profile design](docs/superpowers/specs/2026-09-13-configurable-profile-design.md)
+3. [NVIDIA GPU-scaling design](docs/superpowers/specs/2026-09-14-gpu-scaling-design.md)
+4. [Active configurable-tray plan](docs/superpowers/plans/2026-09-14-configurable-tray.md)
+
+The three specifications define behaviour. The active plan resolves their implementation ordering and constraints. Do not treat old worktree copies under .claude or .superpowers as source code.
+
+## Runtime model
+
+Startup is read-only. A configured session applies the selected display mode only after an explicit user action, saves the current desktop arrangement for that run, and restores it on manual disable, watched-process disappearance after the profile delay, or normal shutdown. **RecoveryPending** means the desktop may have changed but the game mode was not confirmed: retain the original layout and stable bindings, permit only manual restore or normal-shutdown restore, and forbid another apply, scaling write, or profile change.
+
+Monitor identity uses the complete device-interface path, compared case-insensitively. A hardware-ID fallback is allowed only when the model was unique at configuration time and exactly one current monitor matches. A dynamic **\\.\DISPLAYn** is never stored and is never an identity. Missing, ambiguous, or mirrored targets are refusals, never “first match wins.”
 
 ## Package layout
 
-- `internal/domain` — `Mode`, `MonitorIdentity`, `MatchLevel`, `Target`, `Profile`, `MaxDimension`, and `LegacySeedProfile()`. Plain data, no Win32 dependency.
-- `internal/display` — `Controller` interface (`ResolveTarget`, `CurrentMode`, `CurrentLayout`, `TestMode`, `ApplyLayout`) plus the Win32 adapter (`EnumDisplayDevicesW`, `EnumDisplaySettingsW`, `ChangeDisplaySettingsExW`). `ResolveTarget` accepts the complete monitor identity and refuses missing, ambiguous, or mirrored targets. Never sets `CDS_UPDATEREGISTRY`, `DM_POSITION`, or `CDS_SET_PRIMARY`; every change targets only the resolved target device.
-- `internal/process` — `Checker` interface and the read-only Toolhelp implementation (`CreateToolhelp32Snapshot` + `Process32First/Next`). Matches only the executable name; never calls `OpenProcess`, reads memory, or inspects windows/command lines.
-- `internal/app` — `gameTracker` (pure presence/delay state transitions) and `Session` (serialized `Enable`/`Disable`/`Shutdown`/`Refresh`, background game-presence watcher, `SetOnChange` notifications). This is where the state machine described in the design spec lives, fully covered by fake-backed tests.
-- `internal/ui` — Walk main window and notification-area (tray) icon; renders `app.Snapshot` and forwards user actions to `Session`.
-- `cmd/resolution-tray` — production composition root (`main_windows.go`), the Common Controls 6 / DPI manifest, and the `go:generate` resource directive.
+- **internal/domain** — plain profile, mode, monitor identity, aspect and fallback derivation data. **LegacySeedProfile()** only pre-fills a first-run dialog; it is not a production session profile.
+- **internal/config** — version-1 JSON schema, strict parsing and validation, conversion to and from domain.Profile, and configuration storage. **Path()** uses **%APPDATA%\ResolutionTray\config.json** unless **RESOLUTION_TRAY_CONFIG** supplies the complete file path. **Save()** validates first, then atomically writes the destination path plus **.tmp** in the same directory, syncs, and renames. The default destination therefore uses **config.json.tmp**; an override uses its own path plus **.tmp**. **Load()** and rejected writes do not modify files; **Backup()** runs only after the user explicitly confirms reset.
+- **internal/display** — target enumeration/resolution, supported-mode catalogue, current layout, planning, validation and Win32 application. Non-target displays keep their mode fields; their **DM_POSITION** may move so the final desktop arrangement is safe. Do not reintroduce the false rule that positions never change.
+- **internal/process** — read-only Toolhelp process-name listing and observation. It never opens a process.
+- **internal/scaling** — NVIDIA availability probe, read, validate-then-apply, read-back, and restore. The Controller API is **Probe**, **Read**, **Apply**, **Restore**, and **Close**; it accepts **domain.MonitorIdentity**, never a display target/device name.
+- **internal/app** — Session serializes display and scaling operations, owns display/scaling restore state, performs the managed scaling cycle, watches the configured process, and publishes snapshots. Provider owns the replaceable session and configuration-facing lifecycle through **Snapshot**, **ReadScaling**, **SaveAndReplace**, **Replace**, **Reload**, **Reset**, and **Shutdown**. A safe unique secondary identity rebind may persist exactly one updated instancePath per session; it retains the complete loaded file, changes only that path, and leaves the current session usable with a persistent warning if saving fails.
+- **internal/ui** — Walk window, tray menu, and shared first-run/settings dialog. Render from app.Snapshot; marshal UI changes through **Synchronize**.
+- **cmd/resolution-tray** — production composition root and resource generation directive.
 
-## Commands
+## Configuration and settings
 
-**`go` is not on PATH.** Prepend it for any manual command:
+Schema version is exactly **1**. The profile contains monitor identity, game mode, optional fallback mode, process name, and **watch.restoreDelaySeconds**. The default delay is 3 seconds, the accepted range is 0–60 seconds, and it is serialized in config; it is deliberately not a settings-dialog field. An omitted fallback is derived from the monitor's current reported modes, not treated as the panel's native mode.
 
-```powershell
-$env:PATH = "C:\Program Files\Go\bin;$env:PATH"
-```
+A missing file is first run. Saving is the only normal creation path; cancel, close, and “later” leave no file. A malformed, unreadable, out-of-range, or newer-version file remains untouched. Preserve the exact file path and underlying error in user-facing failures. Never silently repair, overwrite, or migrate a rejected file. The reset flow may retain a rejected file only after explicit user confirmation, and must report the retained path.
 
-```powershell
-# Reproducible build: go generate → go test ./... → go vet ./... → GUI-subsystem exe
-./build.ps1
+The one exception is a successful, safe secondary identity fallback: Provider may atomically persist the newly resolved instancePath once per session, with all other loaded configuration unchanged. If that save fails, retain the live session and surface the rebind/configuration warning; do not retry automatic writes repeatedly. Ambiguous fallback is a refusal, not a rebind.
 
-# Individual commands
-go test ./...
-go vet ./...
-go generate ./cmd/resolution-tray
+Settings are disabled while Session owns an applied display mode, is RecoveryPending, or owns GPU scaling. Recover the display and scaling state before changing the profile. In a normal unmanaged state, NVIDIA scaling is a direct manual action; in a normal managed state it runs the full restore → scaling write → fresh re-apply cycle; RecoveryPending forbids scaling writes.
 
-# Opt-in integration test — only exercises CDS_TEST, never changes the real display
-$env:RUN_DISPLAY_INTEGRATION = '1'
-go test ./internal/display -run TestWindowsControllerCanTestMiMonitorMode -v
-Remove-Item Env:RUN_DISPLAY_INTEGRATION
-```
+**SaveAndReplace(profile)** holds one Provider operation gate, checks the replacement guard, saves the new config, then replaces the session. A rejected guard writes no configuration. **Replace** and **Reload** enforce the same guard; none may replace a session with saved recovery state.
 
-`go build` always targets `windows/amd64` with `CGO_ENABLED=0` and `-ldflags '-H windowsgui -s -w'`, producing `dist/ResolutionTray.exe` (gitignored, local artifact only).
+## GPU scaling rules
 
-### GitHub Actions
+GPU scaling is an explicit manual action. It is not coupled to toggling the display mode or process-driven restore. The first successful owned Apply records the effective value read immediately before that change; it is not a process-startup snapshot. Requested and effective read-back values must remain distinct: a driver-normalised result is successful with a mismatch, not an error.
 
-`build.ps1` stays the single source of truth for `go generate` and the link flags — both workflows call it instead of restating them.
+Apply scaling only on an explicit user request. Save its prior effective value only when the Apply is accepted; restore it on an explicit restore request or normal shutdown. Do not persist GPU scaling. A display restore failure during normal shutdown keeps the app alive and retryable. A scaling restore failure warns once and allows shutdown to finish.
 
-- `.github/workflows/ci.yml` — push to any branch, pull requests, `workflow_dispatch`. On `windows-latest`: `gofmt -l ./internal ./cmd` (fails if anything is listed), `go mod tidy -diff`, `go build ./...`, `go vet ./...`, `go test ./...`, `go test -race ./...`, then `./build.ps1` to prove the GUI binary still links. `-race` needs a C toolchain, so CI is the only place the race detector runs.
-- `.github/workflows/release.yml` — `v*` tag push, plus `workflow_dispatch` for a dry run that builds and checksums but publishes nothing. On `windows-latest`: `./build.ps1` (generate + full test suite + vet + build), SHA256 checksum, then `softprops/action-gh-release` attaches `dist/ResolutionTray.exe` and `dist/ResolutionTray.exe.sha256` to the release. Job permissions are `contents: write` and nothing else.
-- Neither workflow sets `RUN_DISPLAY_INTEGRATION`. CI must never run the opt-in integration tests, which drive the real Win32 display APIs.
-
-## Testing
-
-- `internal/domain`, `internal/display`, `internal/process`: pure/table-driven unit tests plus Win32-struct-layout and fake-adapter tests — no real display or process API calls.
-- `internal/app`: `Session` and `gameTracker` behavior is tested entirely against fake `display.Controller` / `process.Checker` implementations and a controllable clock; run with `go test -count=20 ./internal/app` to catch flaky ordering.
-- `internal/display/integration_windows_test.go` contains one opt-in test gated on `RUN_DISPLAY_INTEGRATION=1` that calls the real Win32 APIs but only with `CDS_TEST`, so it never mutates the user's actual display.
-- No Python tooling remains in the test loop; `go test ./...` is the only required check before building.
+NVIDIA’s “Override the scaling mode set by games and programs” checkbox has no supported API here. Do not promise the tool can read it, set it, or prove black bars disappeared. AMD and Intel remain manual control-panel paths and must not disable display-mode controls.
 
 ## Hard constraints
 
-- Windows `amd64` only; no non-Windows runtime support is needed.
-- `CGO_ENABLED=0` for production builds.
-- Startup must remain read-only: read and display state, never change a display mode.
-- Match the configured monitor through the identity ladder in `domain.MonitorIdentity`: the device interface path first, compared whole and case-insensitively; the hardware ID only as a fallback, only when the model was unique at the moment the user configured it, and only when it matches exactly one attached monitor. Never match by a fixed `DISPLAY1` index, and never take the first of several matches — ambiguity is an honest refusal, not a coin flip.
-- The game mode is whatever the user configured. `domain.LegacySeedProfile()` is not that configuration: it exists only to pre-fill the first-run wizard with the original `1920×1440 @ 180 Hz` values, and is never the profile a shipping session runs on.
-- Never launch the configured executable, inject or hook code, open its process, read its memory, or modify its application files. Only observe the configured executable name via Toolhelp.
-- Restore after the configured executable goes from seen/running to absent for the configured delay; manual disable restores immediately and cancels any pending automatic restore.
-- Never use `CDS_UPDATEREGISTRY`; always test a target mode (`CDS_TEST`) before applying it (`CDS_TEST`/apply, never combined).
-- Never modify any other display's mode or position — only the resolved target monitor is touched.
-- UI strings are in Traditional Chinese (繁體中文); preserve when editing `internal/ui`.
+- Windows amd64 only; production builds use CGO_ENABLED=0.
+- Startup and first-run discovery are read-only. No preview mode exists.
+- Never use **CDS_UPDATEREGISTRY**. Test a display mode with **CDS_TEST** before its separate apply.
+- Never use **NV_DISPLAYCONFIG_SAVE_TO_PERSISTENCE**. NVAPI validation uses flag word **0x01**; the formal apply uses exactly **0x00**.
+- Call **runtime.KeepAlive** for every backing value or slice passed through every NVAPI syscall.
+- Never carry any **\\.\DISPLAYn**, target, layout, plan, or saved arrangement across an NVAPI set. R1 resolves identity and reads fresh layout after the set; R2 consumes and clears the saved arrangement before it.
+- In a managed scaling cycle: stop the watcher; restore and consume saved display state; perform the scaling operation; then re-resolve identity, reread layout, replan, and reapply from scratch. The new saved arrangement is built only after the set.
+- Do not add a second watcher mechanism. The existing generation cancellation and fresh tracker semantics prevent an automatic restore interleaving with the cycle.
+- The shared-recorder fakes in app tests intentionally invalidate display device names after every formal scaling SetAttempted, including a driver-rejected set. Preserve them and extend their assertions for any ordering change.
+- UI strings are Traditional Chinese. No UI string may hard-code a particular monitor, mode, aspect ratio, or watched executable.
+- Do not launch, inject, hook, open, inspect memory of, or modify files belonging to the configured program.
 
-## Legacy Python scripts
+## Commands
 
-The pre-refactor Python/PyInstaller implementation is gone: `res.py`, `res-auto.py`, their `.spec` files and the committed `build/`/`dist/` artifacts were deleted in plan Task 7, and `build/`/`dist/` are now ignored. Do not reintroduce them.
+Go is not normally on PATH:
 
-`res-2k.py` and `res-2k.spec` may still exist in the working tree as the user's own untracked local files. They are not part of this project — do not extend, build, or delete them.
+~~~powershell
+$env:PATH = "C:\Program Files\Go\bin;$env:PATH"
+~~~
+
+~~~powershell
+# Full GUI artifact: generate resources → test → vet → dist/ResolutionTray.exe
+./build.ps1
+
+# Compile/check packages; this does not create the GUI distribution artifact.
+go build ./...
+go vet ./...
+go test ./...
+
+# Ordering-sensitive packages.
+go test -count=20 ./internal/app ./internal/scaling
+
+# Explicit, read-only hardware gates. Both are unset by default.
+$env:RUN_DISPLAY_INTEGRATION = '1'
+go test ./internal/display -run 'MiMonitor|Integration' -v
+Remove-Item Env:RUN_DISPLAY_INTEGRATION
+
+$env:RUN_NVAPI_INTEGRATION = '1'
+go test ./internal/scaling -run Integration -v
+Remove-Item Env:RUN_NVAPI_INTEGRATION
+~~~
+
+CI sets neither integration environment variable. The display gate is limited to CDS_TEST and read-only enumeration; the NVAPI gate is separate. **go test -race ./...** runs in CI only because local development lacks the C toolchain.
+
+## Build and release
+
+**build.ps1** is the supported production build entry and produces **dist/ResolutionTray.exe** with the GUI subsystem and generated resources. Plain **go build** is a compile check, not a release build.
+
+The release workflow creates a GitHub Release only from a pushed **v*** tag. A workflow-dispatch run builds and checksums without publishing. Do not assume a fixed version tag or claim a previously published asset includes changes that exist only on the current branch.

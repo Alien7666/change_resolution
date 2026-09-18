@@ -1175,6 +1175,8 @@ The window, its dialog captions and the tray icon were renamed from 「VALORANT 
 
 ### Task 17: Documentation, guidance and the release verification pass
 
+**2026-09-18 checkpoint:** documentation, final review, automated verification and commits are complete (86/87 total plan steps). All five whole-branch findings are fixed in `a649920`; scoped re-review passed with no blocking findings and two recorded minor follow-ups. Read-only GUI checks passed. Task 17 remains open solely for Step 4: the human display/scaling-write release gate. See [verification record](../verification/2026-09-18-configurable-tray.md). Do not restart Tasks 1–16 or the completed whole-branch audit.
+
 **Files:**
 - Modify: `README.md`
 - Modify: `CLAUDE.md`
@@ -1183,7 +1185,7 @@ The window, its dialog captions and the tray icon were renamed from 「VALORANT 
 **Interfaces:**
 - Validates every interface produced by Tasks 1–16.
 
-- [ ] **Step 1: Rewrite the user documentation**
+- [x] **Step 1: Rewrite the user documentation**
 
 `README.md`:
 
@@ -1197,7 +1199,7 @@ The window, its dialog captions and the tray icon were renamed from 「VALORANT 
 
 `CLAUDE.md`: refresh the package layout for `internal/config` and `internal/scaling`, the commands (including the new opt-in gate), the testing section (`-count=20 ./internal/app`, `-race` in CI only, the shared-recorder rule), and add to the hard-constraints list: never `SAVE_TO_PERSISTENCE`; the NVAPI apply flag word is exactly `0`; no NVAPI set while a display mode is owned; `runtime.KeepAlive` around every NVAPI syscall; never take the first of several identity matches. Task 1 already corrected the two contradicting bullets — do not undo that wording, extend around it.
 
-- [ ] **Step 2: Review the whole branch diff against the three specs**
+- [x] **Step 2: Review the whole branch diff against the three specs**
 
 ```powershell
 git diff main...HEAD --stat
@@ -1206,7 +1208,7 @@ git diff main...HEAD -- . ':(exclude)docs/superpowers/plans/2026-09-14-configura
 
 Check specifically for: a `\\.\DISPLAYn` carried across a scaling set; `0x02` anywhere but its declaration; `CDS_UPDATEREGISTRY`; a missing `runtime.KeepAlive`; any write on a config rejection path; any "first match wins" loop; a hard-coded `1920`, `2560`, `4:3` or `XMI27B2` outside tests and `LegacySeedProfile`; UI updates outside `Synchronize`; any new `OpenProcess`; generated artifacts staged.
 
-- [ ] **Step 3: Run the full automated verification**
+- [x] **Step 3: Run the full automated verification**
 
 ```powershell
 gofmt -l ./internal ./cmd
@@ -1228,7 +1230,7 @@ git status --short
 
 Work through the section at the end of this plan and record the results — in particular the one measurement neither spec has: writing scaling `2` while the desktop is at a non-native resolution.
 
-- [ ] **Step 5: Commit documentation and any review fixes**
+- [x] **Step 5: Commit documentation and any review fixes**
 
 ```powershell
 git add README.md CLAUDE.md
