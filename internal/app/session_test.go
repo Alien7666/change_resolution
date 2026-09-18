@@ -31,6 +31,9 @@ type fakeDisplay struct {
 	calls   []displayCall
 	fail    map[string]error
 	hook    func(string)
+	// applyBeforeError models the two native outcomes where Win32 changed the
+	// desktop before ApplyLayout reported that it could not verify or roll back.
+	applyBeforeError bool
 }
 
 func (d *fakeDisplay) record(operation string, target domain.Target, mode domain.Mode, plan domain.LayoutPlan) error {
@@ -115,14 +118,18 @@ func (d *fakeDisplay) TestMode(target domain.Target, mode domain.Mode) error {
 // compare the arrangement a restore produced against the one it started from.
 func (d *fakeDisplay) ApplyLayout(plan domain.LayoutPlan) error {
 	mode := plannedMode(plan)
-	if err := d.record("apply", domain.Target{}, mode, plan); err != nil {
+	err := d.record("apply", domain.Target{}, mode, plan)
+	d.mu.Lock()
+	mutateBeforeError := d.applyBeforeError
+	d.mu.Unlock()
+	if err != nil && !mutateBeforeError {
 		return err
 	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.current = mode
 	d.layout = applyPlan(d.layout, plan)
-	return nil
+	d.mu.Unlock()
+	return err
 }
 
 // plannedMode is the one mode a plan writes: every other display is only moved.
@@ -591,14 +598,45 @@ func TestDisableUsesFallbackWhenAppStartsInAnUnmanagedGameMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := f.display.takeCalls()
-	assertOperations(t, calls, "resolve", "layout", "test", "apply")
-	if calls[2].mode != *f.profile.FallbackMode || calls[3].mode != *f.profile.FallbackMode {
+	assertOperations(t, calls, "resolve", "layout", "targets", "test", "apply")
+	if calls[3].mode != *f.profile.FallbackMode || calls[4].mode != *f.profile.FallbackMode {
 		t.Fatalf("fallback = %+v", calls)
 	}
 	// Widening the target again would land on its neighbour, so the fallback has to
 	// plan the desktop as much as the managed path does.
 	if got := f.desktop(); !reflect.DeepEqual(got, fixtureLayout(*f.profile.FallbackMode)) {
 		t.Fatalf("fallback desktop = %+v", got)
+	}
+}
+
+func TestUnmanagedFallbackUncertainWriteKeepsItsPreWriteLayout(t *testing.T) {
+	f := newFixture(t)
+	f.setDesktop(f.profile.GameMode)
+	preWrite := f.desktop()
+	if _, err := f.s.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	f.display.takeCalls()
+	f.display.applyBeforeError = true
+	f.display.setFailure("apply", display.ErrLayoutNotVerified)
+
+	if err := f.s.Disable(); !errors.Is(err, display.ErrLayoutNotVerified) {
+		t.Fatalf("Disable error = %v", err)
+	}
+	if got := f.s.Snapshot(); got.Managed || !got.RecoveryPending {
+		t.Fatalf("fallback uncertainty snapshot = %+v", got)
+	}
+	if reflect.DeepEqual(f.desktop(), preWrite) {
+		t.Fatal("fake did not model the fallback write before verification failed")
+	}
+
+	f.display.setFailure("apply", nil)
+	f.display.applyBeforeError = false
+	if err := f.s.Disable(); err != nil {
+		t.Fatalf("retry exact recovery: %v", err)
+	}
+	if got := f.desktop(); !reflect.DeepEqual(got, preWrite) {
+		t.Fatalf("recovered desktop = %+v, want pre-write %+v", got, preWrite)
 	}
 }
 
@@ -655,6 +693,74 @@ func TestEnableKeepsUnsupportedModeSentinelInSnapshotErr(t *testing.T) {
 	}
 	if got.Managed || got.AtGameMode {
 		t.Fatalf("snapshot = %+v", got)
+	}
+}
+
+func TestUncertainApplyKeepsExactRecoveryUntilManualRestoreOrShutdown(t *testing.T) {
+	for name, sentinel := range map[string]error{
+		"unverified readback": display.ErrLayoutNotVerified,
+		"failed rollback":     display.ErrLayoutPartlyApplied,
+	} {
+		for _, restore := range []string{"manual", "shutdown"} {
+			t.Run(name+"/"+restore, func(t *testing.T) {
+				f := newFixture(t)
+				original := f.desktop()
+				f.display.applyBeforeError = true
+				f.display.setFailure("apply", fmt.Errorf("native write changed the desktop: %w", sentinel))
+
+				if err := f.s.Enable(); !errors.Is(err, sentinel) {
+					t.Fatalf("Enable error = %v, want %v", err, sentinel)
+				}
+				if got := f.s.Snapshot(); got.Managed || got.AtGameMode || !got.RecoveryPending {
+					t.Fatalf("uncertain apply snapshot = %+v", got)
+				}
+				if got := f.desktop(); reflect.DeepEqual(got, original) {
+					t.Fatal("fake did not model the desktop change before the uncertain error")
+				}
+
+				f.display.setFailure("apply", nil)
+				f.display.applyBeforeError = false
+				var err error
+				if restore == "manual" {
+					err = f.s.Disable()
+				} else {
+					err = f.s.Shutdown()
+				}
+				if err != nil {
+					t.Fatalf("%s recovery: %v", restore, err)
+				}
+				if got := f.desktop(); !reflect.DeepEqual(got, original) {
+					t.Fatalf("recovered desktop = %+v, want %+v", got, original)
+				}
+				if got := f.s.Snapshot(); got.RecoveryPending {
+					t.Fatalf("successful recovery stayed pending: %+v", got)
+				}
+			})
+		}
+	}
+}
+
+func TestRecoverySurvivesRefreshAndAlreadyConfiguredModeUntilExplicitRestore(t *testing.T) {
+	f := newFixture(t)
+	f.display.applyBeforeError = true
+	f.display.setFailure("apply", display.ErrLayoutNotVerified)
+	if err := f.s.Enable(); !errors.Is(err, display.ErrLayoutNotVerified) {
+		t.Fatalf("Enable error = %v", err)
+	}
+	f.display.setFailure("apply", nil)
+	f.display.applyBeforeError = false
+
+	if got, err := f.s.Refresh(); err != nil || !got.AtGameMode || !got.RecoveryPending {
+		t.Fatalf("Refresh = (%+v, %v), want configured mode with recovery retained", got, err)
+	}
+	if err := f.s.Enable(); !errors.Is(err, ErrDisplayRecoveryPending) {
+		t.Fatalf("Enable while recovery pending = %v, want ErrDisplayRecoveryPending", err)
+	}
+	if !f.s.Snapshot().RecoveryPending {
+		t.Fatal("Enable on an already-configured mode discarded recovery")
+	}
+	if err := f.s.Disable(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1552,8 +1658,8 @@ func TestDisableDerivesTheFallbackFromTheEnumeratedModesWhenNoneIsConfigured(t *
 		t.Fatal(err)
 	}
 	calls := f.display.takeCalls()
-	assertOperations(t, calls, "resolve", "layout", "modes", "test", "apply")
-	if calls[3].mode != fixtureNative || calls[4].mode != fixtureNative {
+	assertOperations(t, calls, "resolve", "layout", "modes", "targets", "test", "apply")
+	if calls[4].mode != fixtureNative || calls[5].mode != fixtureNative {
 		t.Fatalf("restore = %+v, want the derived fallback %+v", calls, fixtureNative)
 	}
 	if desktop := f.desktop(); !reflect.DeepEqual(desktop, fixtureLayout(fixtureNative)) {

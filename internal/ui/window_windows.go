@@ -46,6 +46,8 @@ const (
 	resetConfigText      = "重新設定"
 	settingsText         = "設定…"
 	settingsManagedText  = "請先恢復原始解析度再變更設定"
+	settingsRecoveryText = "請先恢復寫入前的顯示配置再變更設定"
+	settingsScalingText  = "請先還原 GPU 縮放設定再變更設定"
 
 	// The GPU-scaling row. Every literal here names an operation or a decision this
 	// product made; none of them names a monitor, a mode or an aspect, because all
@@ -69,6 +71,7 @@ const (
 	scalingUnconfiguredReason = "尚未設定顯示器，無法讀取或變更 GPU 縮放。"
 	scalingUnprobedReason     = "尚未讀取 GPU 縮放設定，請按「重新整理」。"
 	scalingCycleReason        = "正在變更 GPU 縮放，請稍候。"
+	scalingRecoveryReason     = "顯示配置仍待恢復；請先恢復原始顯示模式，再變更 GPU 縮放。"
 
 	scalingApplyOperation   = "變更 GPU 縮放"
 	scalingRestoreOperation = "還原 GPU 縮放設定"
@@ -603,7 +606,7 @@ func (w *window) showSettings(firstRun bool) (bool, error) {
 	}
 	model := newSettingsModel(w.displays, w.processes, profile, snapshot.Scaling, firstRun)
 	model.readScaling = w.provider.ReadScaling
-	return w.openSettings(model, w.provider.Replace)
+	return w.openSettings(model, w.provider.SaveAndReplace)
 }
 
 func shouldOpenFirstRun(provider *app.Provider) bool {
@@ -956,6 +959,8 @@ func (w *window) updateScalingAvailability(snapshot app.Snapshot) {
 	switch {
 	case w.configState != configStateConfigured:
 		w.scalingUnavailableReason = scalingUnconfiguredReason
+	case snapshot.RecoveryPending:
+		w.scalingUnavailableReason = scalingRecoveryReason
 	case unresolvedTarget(snapshot):
 		w.scalingUnavailableReason = "目前無法對應到 " + monitorLabelShort(snapshot) +
 			"，無法讀取或變更它的 GPU 縮放。"
@@ -1058,17 +1063,19 @@ func (w *window) availableControls(snapshot app.Snapshot) controls {
 	cycling := snapshot.State == app.StateScalingCycle
 	idle := !w.busy && !cycling
 	interactive := configured && w.unavailableReason == "" && idle
+	applicable := interactive && !snapshot.RecoveryPending
 	scalable := configured && w.scalingUnavailableReason == "" && idle
 	return controls{
-		toggle:         interactive,
-		restore:        interactive && (snapshot.Managed || snapshot.FallbackKnown),
-		enable:         interactive && !snapshot.AtGameMode,
-		refresh:        !w.busy,
-		openFolder:     !w.busy,
-		reset:          idle && w.configState == configStateReadOnly,
-		settings:       idle && !snapshot.Managed && w.configState != configStateReadOnly,
-		scalingApply:   scalable && !snapshot.Scaling.Owned,
-		scalingRestore: scalable && snapshot.Scaling.Owned,
+		toggle:     applicable,
+		restore:    interactive && (snapshot.Managed || snapshot.RecoveryPending || snapshot.FallbackKnown),
+		enable:     applicable && !snapshot.AtGameMode,
+		refresh:    !w.busy,
+		openFolder: !w.busy,
+		reset:      idle && w.configState == configStateReadOnly,
+		settings: idle && !snapshot.Managed && !snapshot.RecoveryPending && !snapshot.Scaling.Owned &&
+			w.configState != configStateReadOnly,
+		scalingApply:   scalable && !snapshot.RecoveryPending && !snapshot.Scaling.Owned,
+		scalingRestore: scalable && !snapshot.RecoveryPending && snapshot.Scaling.Owned,
 		hide:           true,
 		show:           true,
 		exit:           idle,
@@ -1100,8 +1107,14 @@ func (w *window) applyEnabled(snapshot app.Snapshot) {
 }
 
 func settingsDisabledReason(snapshot app.Snapshot) string {
+	if snapshot.RecoveryPending {
+		return settingsRecoveryText
+	}
 	if snapshot.Managed {
 		return settingsManagedText
+	}
+	if snapshot.Scaling.Owned {
+		return settingsScalingText
 	}
 	return ""
 }

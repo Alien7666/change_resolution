@@ -5,7 +5,7 @@
       name="Alien7666.ChangeResolution.ResolutionTray"
       version="1.0.0.0"
       processorArchitecture="amd64"/>
-  <description>VALORANT 4:3 display tray tool</description>
+  <description>Configurable ResolutionTray display profile tool</description>
 
   <!-- Common Controls 6: native visual styles for the Walk window and controls. -->
   <dependency>

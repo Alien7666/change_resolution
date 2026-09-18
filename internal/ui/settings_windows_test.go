@@ -46,7 +46,7 @@ func TestSettingsSectionsUnlockOnlyAfterThePreviousChoiceIsValid(t *testing.T) {
 	}
 }
 
-func TestDialogSaveCallsReplaceOnlyAfterOneSuccessfulModelSave(t *testing.T) {
+func TestDialogSaveDelegatesOneValidatedProfileToAtomicSaveAndReplace(t *testing.T) {
 	model, _, mode := dialogFlowFixture(t)
 	if err := model.SelectMonitor(0); err != nil {
 		t.Fatalf("SelectMonitor: %v", err)
@@ -54,12 +54,8 @@ func TestDialogSaveCallsReplaceOnlyAfterOneSuccessfulModelSave(t *testing.T) {
 	if err := model.SelectMode(mode); err != nil {
 		t.Fatalf("SelectMode: %v", err)
 	}
-	saves := 0
-	model.save = func(file config.File) error {
-		saves++
-		if file.Profile().GameMode != mode {
-			t.Fatalf("saved mode = %#v", file.Profile().GameMode)
-		}
+	model.save = func(config.File) error {
+		t.Fatal("dialog bypassed Provider.SaveAndReplace and wrote before the ownership guard")
 		return nil
 	}
 	replaces := 0
@@ -75,12 +71,12 @@ func TestDialogSaveCallsReplaceOnlyAfterOneSuccessfulModelSave(t *testing.T) {
 	if err := flow.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if saves != 1 || replaces != 1 || !flow.Accepted() {
-		t.Fatalf("saves=%d replaces=%d accepted=%v", saves, replaces, flow.Accepted())
+	if replaces != 1 || !flow.Accepted() {
+		t.Fatalf("save-and-replace calls=%d accepted=%v", replaces, flow.Accepted())
 	}
 }
 
-func TestDialogSaveFailureKeepsTheDraftAndNeverCallsReplace(t *testing.T) {
+func TestDialogAtomicSaveAndReplaceFailureKeepsTheDraft(t *testing.T) {
 	model, target, mode := dialogFlowFixture(t)
 	if err := model.SelectMonitor(0); err != nil {
 		t.Fatalf("SelectMonitor: %v", err)
@@ -89,19 +85,22 @@ func TestDialogSaveFailureKeepsTheDraftAndNeverCallsReplace(t *testing.T) {
 		t.Fatalf("SelectMode: %v", err)
 	}
 	wantErr := errors.New("atomic rename failed")
-	model.save = func(config.File) error { return wantErr }
-	replaces := 0
-	flow := newSettingsDialogFlow(model, func(domain.Profile) error {
-		replaces++
+	model.save = func(config.File) error {
+		t.Fatal("dialog wrote outside the atomic callback")
 		return nil
+	}
+	attempts := 0
+	flow := newSettingsDialogFlow(model, func(domain.Profile) error {
+		attempts++
+		return wantErr
 	})
 	flow.SetProcessName("game.exe")
 
 	if err := flow.Save(); !errors.Is(err, wantErr) {
 		t.Fatalf("Save error = %v", err)
 	}
-	if replaces != 0 || flow.Accepted() {
-		t.Fatalf("failed save replaced=%d accepted=%v", replaces, flow.Accepted())
+	if attempts != 1 || flow.Accepted() {
+		t.Fatalf("failed atomic call attempts=%d accepted=%v", attempts, flow.Accepted())
 	}
 	draft := model.Draft()
 	if draft.Monitor.InstancePath != target.Identity.InstancePath || draft.GameMode != mode || draft.ProcessName != "game.exe" {
@@ -117,7 +116,8 @@ func TestDialogReplaceFailureKeepsTheSavedDraftOpen(t *testing.T) {
 	if err := model.SelectMode(mode); err != nil {
 		t.Fatalf("SelectMode: %v", err)
 	}
-	model.save = func(config.File) error { return nil }
+	saves := 0
+	model.save = func(config.File) error { saves++; return nil }
 	wantErr := errors.New("session became managed")
 	flow := newSettingsDialogFlow(model, func(domain.Profile) error { return wantErr })
 	flow.UseManualOnly()
@@ -125,8 +125,8 @@ func TestDialogReplaceFailureKeepsTheSavedDraftOpen(t *testing.T) {
 	if err := flow.Save(); !errors.Is(err, wantErr) {
 		t.Fatalf("Save error = %v", err)
 	}
-	if flow.Accepted() || model.Draft().GameMode != mode {
-		t.Fatal("replace failure accepted the dialog or discarded its draft")
+	if saves != 0 || flow.Accepted() || model.Draft().GameMode != mode {
+		t.Fatalf("refused atomic save wrote=%d accepted=%v draft=%#v", saves, flow.Accepted(), model.Draft())
 	}
 }
 

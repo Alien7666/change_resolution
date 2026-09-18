@@ -278,7 +278,7 @@ func TestBusyWindowAcceptsNoCommand(t *testing.T) {
 	}
 }
 
-func TestSettingsEntryIsDisabledOnlyWhileManagedBusyOrReadOnly(t *testing.T) {
+func TestSettingsEntryIsDisabledWhileAnyRestoreObligationIsLive(t *testing.T) {
 	snapshot := resolvedSnapshot()
 	w := &window{configState: configStateConfigured}
 	if got := w.availableControls(snapshot); !got.settings {
@@ -293,8 +293,26 @@ func TestSettingsEntryIsDisabledOnlyWhileManagedBusyOrReadOnly(t *testing.T) {
 		t.Fatalf("managed reason = %q", got)
 	}
 
-	w.busy = true
 	snapshot.Managed = false
+	snapshot.RecoveryPending = true
+	if got := w.availableControls(snapshot); got.settings || !got.restore || got.toggle || got.enable {
+		t.Fatalf("recovery controls = %+v", got)
+	}
+	if got := settingsDisabledReason(snapshot); got == "" {
+		t.Fatal("recovery obligation has no visible settings reason")
+	}
+
+	snapshot.RecoveryPending = false
+	snapshot.Scaling.Owned = true
+	if got := w.availableControls(snapshot); got.settings {
+		t.Fatalf("scaling-owned controls = %+v", got)
+	}
+	if got := settingsDisabledReason(snapshot); got == "" {
+		t.Fatal("scaling ownership has no visible settings reason")
+	}
+
+	w.busy = true
+	snapshot.Scaling.Owned = false
 	if got := w.availableControls(snapshot); got.settings {
 		t.Fatalf("busy controls = %+v", got)
 	}
@@ -307,6 +325,21 @@ func TestSettingsEntryIsDisabledOnlyWhileManagedBusyOrReadOnly(t *testing.T) {
 	w.configState = configStateReadOnly
 	if got := w.availableControls(snapshot); got.settings {
 		t.Fatalf("read-only controls = %+v", got)
+	}
+}
+
+func TestRecoveryPendingBlocksScalingWithAVisibleReason(t *testing.T) {
+	snapshot := scalingReadySnapshot()
+	snapshot.RecoveryPending = true
+	w := &window{configState: configStateConfigured}
+	w.updateScalingAvailability(snapshot)
+
+	controls := w.availableControls(snapshot)
+	if controls.scalingApply || controls.scalingRestore {
+		t.Fatalf("scaling controls = %+v", controls)
+	}
+	if note := w.scalingButtonNote(snapshot); note == "" {
+		t.Fatal("blocked scaling control has no visible reason")
 	}
 }
 

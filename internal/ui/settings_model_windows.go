@@ -109,7 +109,7 @@ func (m *settingsModel) Refresh() error {
 	for _, target := range targets {
 		row := monitorRow{
 			Target:         target,
-			ModelWasUnique: counts[strings.ToLower(target.Identity.HardwareID)] == 1,
+			ModelWasUnique: counts[domain.MonitorModelKey(target.Identity.HardwareID)] == 1,
 		}
 		if layoutErr != nil {
 			row.Reason = fmt.Sprintf("無法讀取目前顯示配置：%v", layoutErr)
@@ -276,11 +276,19 @@ func (m *settingsModel) SaveReady() (bool, string) {
 // returns a profile after a successful write, so dialog wiring can call Provider.Replace
 // only on that success path.
 func (m *settingsModel) Save() (domain.Profile, error) {
+	profile, err := m.validatedProfile()
+	if err != nil {
+		return domain.Profile{}, err
+	}
+	if err := m.save(config.FromProfile(profile)); err != nil {
+		return domain.Profile{}, err
+	}
+	return profile, nil
+}
+
+func (m *settingsModel) validatedProfile() (domain.Profile, error) {
 	if ready, reason := m.SaveReady(); !ready {
 		return domain.Profile{}, fmt.Errorf("設定尚未可儲存：%s", reason)
-	}
-	if err := m.save(config.FromProfile(m.draft)); err != nil {
-		return domain.Profile{}, err
 	}
 	return m.Draft(), nil
 }
@@ -312,12 +320,12 @@ func (m *settingsModel) rebuildModeRows(index int) {
 
 func (m *settingsModel) prefillLegacy(_ []domain.Target, counts map[string]int) {
 	legacy := domain.LegacySeedProfile()
-	key := strings.ToLower(legacy.Monitor.HardwareID)
+	key := domain.MonitorModelKey(legacy.Monitor.HardwareID)
 	if counts[key] != 1 {
 		return
 	}
 	for index, row := range m.monitorRows {
-		if !strings.EqualFold(row.Target.Identity.HardwareID, legacy.Monitor.HardwareID) {
+		if domain.MonitorModelKey(row.Target.Identity.HardwareID) != key {
 			continue
 		}
 		if !containsMode(row.modes, legacy.GameMode) {
@@ -376,7 +384,7 @@ func groupedModeRows(modes []domain.Mode, current domain.Mode, hasCurrent bool) 
 func hardwareCounts(targets []domain.Target) map[string]int {
 	counts := make(map[string]int, len(targets))
 	for _, target := range targets {
-		counts[strings.ToLower(target.Identity.HardwareID)]++
+		counts[domain.MonitorModelKey(target.Identity.HardwareID)]++
 	}
 	return counts
 }

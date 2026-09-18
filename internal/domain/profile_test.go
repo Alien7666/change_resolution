@@ -97,6 +97,19 @@ func TestMaxDimensionBoundsAModeTheToolWouldRefuse(t *testing.T) {
 	}
 }
 
+func TestMonitorModelKeyBoundsAndCaseFoldsFullWin32HardwareIDs(t *testing.T) {
+	tests := map[string]string{
+		`MONITOR\XMI27B2\0009`: `MONITOR\XMI27B2`,
+		`monitor\xmi27b2\{4d36e96e-e325-11ce-bfc1-08002be10318}\0011`: `MONITOR\XMI27B2`,
+		`MONITOR\DEL41A8`: `MONITOR\DEL41A8`,
+	}
+	for hardwareID, want := range tests {
+		if got := MonitorModelKey(hardwareID); got != want {
+			t.Errorf("MonitorModelKey(%q) = %q, want %q", hardwareID, got, want)
+		}
+	}
+}
+
 // A Profile is handed around by value, and the optional fallback is the one field a
 // value copy does not separate. Copy is what a caller that publishes a profile to
 // another goroutine uses so that neither of them can change the other's restore.

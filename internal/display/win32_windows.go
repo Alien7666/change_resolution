@@ -335,10 +335,12 @@ type stagedChange struct {
 //	flags = 0                   ->  DISP_CHANGE_SUCCESSFUL
 //
 // A sequential apply has no atomicity of its own, so the three things the staged
-// transaction was meant to buy are bought here instead: orderForApply keeps the
-// intermediate desktops free of overlaps in the axis that moves, rollBack puts back
-// whatever was already changed when a later call fails, and verifyApplied holds the
-// result to the plan. See orderForApply for the one shape it does not cover.
+// transaction was meant to buy are handled here instead: orderForApply keeps the
+// intermediate desktops free of overlaps in the axis that moves, rollBack attempts to
+// put back whatever was already changed when a later call fails, and verifyApplied
+// holds the result to the plan. A failed rollback or verification remains an explicit
+// uncertain-write result for Session to recover from. See orderForApply for the one
+// shape the ordering does not cover.
 //
 // Only the target carries mode fields. Every other display declares DM_POSITION and
 // nothing else, which is what keeps its resolution, refresh rate and colour depth
@@ -409,8 +411,9 @@ func (n *windowsNative) stageChanges(plan domain.LayoutPlan) ([]stagedChange, er
 // neighbour in the shrinking axis moves inward before the target has given that space
 // up, and overlaps it until the target's own call lands. Deciding per display would
 // close it and is deliberately not done here. The consequence is bounded - a driver
-// that repacks instead of accepting the step is caught by verifyApplied and rolled
-// back - and the behaviour is pinned by
+// that repacks instead of accepting the step is caught by verifyApplied and reported;
+// Session retains the exact pre-write layout as a retryable recovery obligation. The
+// behaviour is pinned by
 // TestWindowsNativeApplyLayoutOrdersOncePerApplyNotOncePerDisplay.
 //
 // A target that does not grow in either axis gives up its space the moment its mode
@@ -484,8 +487,8 @@ func (n *windowsNative) rollBack(applied []stagedChange, cause error) error {
 //
 // Nothing is rolled back here. Every call succeeded, so there is no failed call to
 // undo, and a second unvalidated mode change on a desktop that already moved under
-// the tool would be guesswork; the recovery that fits is a restore, which re-plans
-// against the desktop as it actually is.
+// the tool would be guesswork. The caller retains the identity-bound pre-write layout
+// and can explicitly restore it against the desktop as it actually is.
 func (n *windowsNative) verifyApplied(plan domain.LayoutPlan) error {
 	observed, err := n.currentLayout()
 	if err != nil {

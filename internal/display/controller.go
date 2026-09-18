@@ -191,14 +191,14 @@ func resolveIdentity(targets []domain.Target, want domain.MonitorIdentity) (doma
 		}
 	}
 
-	model := modelOf(want.HardwareID)
+	model := domain.MonitorModelKey(want.HardwareID)
 	if model == "" {
 		return domain.Target{}, fmt.Errorf(
 			"%w: 設定中沒有可用來辨識顯示器的裝置介面路徑或硬體 ID，請重新選擇顯示器", ErrTargetNotFound)
 	}
 	matches := matchingTargets(targets, func(target domain.Target) bool {
 		return target.Identity.HardwareID != "" &&
-			strings.EqualFold(modelOf(target.Identity.HardwareID), model)
+			domain.MonitorModelKey(target.Identity.HardwareID) == model
 	})
 	if !want.ModelWasUnique {
 		// The rung is disabled for this profile, and that is a decision the user made
@@ -294,22 +294,4 @@ func describeMonitors(targets []domain.Target) string {
 		described = append(described, name)
 	}
 	return strings.Join(described, "、")
-}
-
-// modelOf reduces a monitor device ID to the segments that name the model.
-// EnumDisplayDevicesW reports a monitor's hardware ID as MONITOR\XMI27B2\0009 — on
-// some systems with the device class GUID between the two — where everything past
-// the model is instance detail that changes with the port the monitor is plugged
-// into. A profile may have stored either spelling, so both sides of a comparison are
-// reduced to the first two segments before they meet.
-//
-// This is the one place the secondary key is allowed to be loose, and it is loose in
-// a bounded way: it compares two whole model names, never a prefix of one against
-// the other.
-func modelOf(hardwareID string) string {
-	segments := strings.SplitN(hardwareID, `\`, 3)
-	if len(segments) < 2 {
-		return hardwareID
-	}
-	return segments[0] + `\` + segments[1]
 }

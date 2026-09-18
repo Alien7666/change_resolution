@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // MaxDimension is the one sanity bound on a display dimension the whole tool shares.
 // It is far beyond any real monitor, so nothing a driver reports is refused by it,
@@ -49,6 +52,19 @@ type MonitorIdentity struct {
 	HardwareID     string
 	ModelWasUnique bool
 	Label          string
+}
+
+// MonitorModelKey reduces a Win32 monitor hardware ID to the bounded key that names
+// the model. EnumDisplayDevicesW may append a per-unit suffix, including a device
+// class GUID plus an instance number; neither is allowed to make two units of one
+// model appear unique. The returned key is case-folded so it can be used directly as
+// a map key as well as by the display resolver.
+func MonitorModelKey(hardwareID string) string {
+	segments := strings.SplitN(hardwareID, `\`, 3)
+	if len(segments) < 2 {
+		return strings.ToUpper(hardwareID)
+	}
+	return strings.ToUpper(segments[0] + `\` + segments[1])
 }
 
 // MatchLevel reports which rung of the identity ladder produced a Target, so the UI

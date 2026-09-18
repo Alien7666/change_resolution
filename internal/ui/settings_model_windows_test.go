@@ -17,7 +17,8 @@ import (
 
 func TestWizardPrefillsTheLegacyValuesWhenTheOriginalMonitorIsPresent(t *testing.T) {
 	legacy := domain.LegacySeedProfile()
-	target := settingsTarget(`\\.\DISPLAY2`, `\\?\DISPLAY#XMI27B2#1`, legacy.Monitor.HardwareID, "Mi Monitor")
+	target := settingsTarget(`\\.\DISPLAY2`, `\\?\DISPLAY#XMI27B2#1`,
+		`monitor\xmi27b2\{4d36e96e-e325-11ce-bfc1-08002be10318}\0009`, "Mi Monitor")
 	model := refreshedSettingsModel(t, &fakeSettingsDisplay{
 		targets: []domain.Target{target},
 		modes:   map[string][]domain.Mode{target.DeviceName: {legacy.GameMode}},
@@ -32,6 +33,25 @@ func TestWizardPrefillsTheLegacyValuesWhenTheOriginalMonitorIsPresent(t *testing
 	}
 	if !model.LegacyPrefilled() {
 		t.Fatal("LegacyPrefilled() = false, want true")
+	}
+}
+
+func TestWizardRefusesLegacyPrefillWhenTwoFullIDsNameTheSameModel(t *testing.T) {
+	legacy := domain.LegacySeedProfile()
+	first := settingsTarget(`\\.\DISPLAY1`, `\\?\DISPLAY#XMI27B2#1`,
+		`MONITOR\XMI27B2\0009`, "Mi Monitor A")
+	second := settingsTarget(`\\.\DISPLAY2`, `\\?\DISPLAY#XMI27B2#2`,
+		`monitor\xmi27b2\{4d36e96e-e325-11ce-bfc1-08002be10318}\0011`, "Mi Monitor B")
+	model := refreshedSettingsModel(t, &fakeSettingsDisplay{
+		targets: []domain.Target{first, second},
+		modes: map[string][]domain.Mode{
+			first.DeviceName:  {legacy.GameMode},
+			second.DeviceName: {legacy.GameMode},
+		},
+	})
+
+	if model.LegacyPrefilled() || model.selectedMonitor >= 0 {
+		t.Fatalf("ambiguous legacy model was prefilled: selected=%d draft=%#v", model.selectedMonitor, model.Draft())
 	}
 }
 
@@ -68,8 +88,9 @@ func TestSelectingAMonitorRecordsItsInstancePathAndWhetherTheModelWasUnique(t *t
 }
 
 func TestTwoMonitorsOfOneModelAppearAsTwoRowsAndSetModelWasUniqueFalse(t *testing.T) {
-	first := settingsTarget(`\\.\DISPLAY1`, `\\?\DISPLAY#SAME#1`, `MONITOR\SAME`, "Same")
-	second := settingsTarget(`\\.\DISPLAY2`, `\\?\DISPLAY#SAME#2`, `MONITOR\SAME`, "Same")
+	first := settingsTarget(`\\.\DISPLAY1`, `\\?\DISPLAY#SAME#1`, `MONITOR\SAME\0009`, "Same")
+	second := settingsTarget(`\\.\DISPLAY2`, `\\?\DISPLAY#SAME#2`,
+		`monitor\same\{4d36e96e-e325-11ce-bfc1-08002be10318}\0011`, "Same")
 	model := refreshedSettingsModel(t, &fakeSettingsDisplay{
 		targets: []domain.Target{first, second},
 		modes: map[string][]domain.Mode{

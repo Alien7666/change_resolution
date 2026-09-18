@@ -942,6 +942,30 @@ func TestDisplayFailuresNeverChangeScalingOwnershipOrSavedValue(t *testing.T) {
 	}
 }
 
+func TestPendingDisplayRecoveryBlocksEveryNVAPIWrite(t *testing.T) {
+	f := newScalingFixture(t)
+	f.display.applyBeforeError = true
+	f.display.setFailure("apply", display.ErrLayoutNotVerified)
+	if err := f.s.Enable(); !errors.Is(err, display.ErrLayoutNotVerified) {
+		t.Fatalf("Enable error = %v", err)
+	}
+	f.rig.recorder.take()
+
+	if err := f.s.ApplyGPUScaling(); !errors.Is(err, ErrDisplayRecoveryPending) {
+		t.Fatalf("ApplyGPUScaling error = %v, want ErrDisplayRecoveryPending", err)
+	}
+	if err := f.s.RestoreGPUScaling(); !errors.Is(err, ErrDisplayRecoveryPending) {
+		t.Fatalf("RestoreGPUScaling error = %v, want ErrDisplayRecoveryPending", err)
+	}
+	requireNoScalingEvent(t, f.rig.recorder.take())
+
+	f.display.setFailure("apply", nil)
+	f.display.applyBeforeError = false
+	if err := f.s.Disable(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestScalingRestoreFailureDoesNotBlockShutdown(t *testing.T) {
 	f := newScalingFixture(t)
 	f.queueApplied(ScalingFullScreenByGPU())
@@ -1239,6 +1263,48 @@ func TestACycleWhoseReapplyFailsKeepsTheScalingResultAndOwnsNoDisplayMode(t *tes
 	f.display.setFailure("test", nil)
 	if err := f.s.Enable(); err != nil {
 		t.Fatalf("the retry is an ordinary Enable and it failed: %v", err)
+	}
+}
+
+func TestACycleReapplyWithUncertainWritesKeepsExactDisplayRecovery(t *testing.T) {
+	f := newScalingFixture(t)
+	original := f.desktop()
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+
+	f.display.mu.Lock()
+	f.display.hook = func(operation string) {
+		if operation != "apply" {
+			return
+		}
+		f.display.mu.Lock()
+		f.display.fail["apply"] = display.ErrLayoutNotVerified
+		f.display.applyBeforeError = true
+		f.display.hook = nil
+		f.display.mu.Unlock()
+	}
+	f.display.mu.Unlock()
+	f.queueApplied(ScalingFullScreenByGPU())
+
+	if err := f.s.ApplyGPUScaling(); !errors.Is(err, display.ErrLayoutNotVerified) {
+		t.Fatalf("ApplyGPUScaling error = %v", err)
+	}
+	got := f.s.Snapshot()
+	if got.Managed || got.AtGameMode || !got.RecoveryPending || !got.Scaling.Owned {
+		t.Fatalf("cycle snapshot = %+v", got)
+	}
+	if sameArrangement(f.desktop(), original) {
+		t.Fatal("fake did not retain the uncertain re-apply desktop")
+	}
+
+	f.display.setFailure("apply", nil)
+	f.display.applyBeforeError = false
+	if err := f.s.Disable(); err != nil {
+		t.Fatalf("display recovery: %v", err)
+	}
+	if got := f.desktop(); !sameArrangement(got, original) {
+		t.Fatalf("recovered desktop = %+v, want arrangement %+v", got, original)
 	}
 }
 

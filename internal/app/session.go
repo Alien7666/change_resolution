@@ -39,7 +39,13 @@ const (
 	StateScalingCycle State = "scaling-cycle"
 )
 
-var ErrClosed = errors.New("display session is closed")
+var (
+	ErrClosed = errors.New("display session is closed")
+
+	// ErrDisplayRecoveryPending refuses any operation that could overwrite the only
+	// exact layout captured before a display write whose result could not be proved.
+	ErrDisplayRecoveryPending = errors.New("顯示配置仍待恢復，請先恢復原始顯示模式")
+)
 
 // ErrFallbackUnknown reports that a restore was asked for and the session could not
 // work out which mode to restore to. It is reachable only for a profile that records
@@ -89,10 +95,14 @@ type Snapshot struct {
 	// with and became an assumption the moment the user could choose.
 	AtGameMode bool
 
-	Managed  bool
-	Revision uint64
-	Message  string
-	Err      error
+	Managed bool
+	// RecoveryPending means a display write may have changed the desktop but did not
+	// complete verifiably. Managed remains false because the configured mode was not
+	// successfully applied; Restore still uses the exact pre-write layout.
+	RecoveryPending bool
+	Revision        uint64
+	Message         string
+	Err             error
 
 	// Profile is the configuration this session runs on, copied rather than shared so
 	// that reading a snapshot cannot reach back into the session. It travels in every
@@ -197,10 +207,14 @@ type Session struct {
 	// the reason as text while a refusal has to carry the error.
 	fallback fallback
 
+	// saved and its bindings hold the exact pre-write layout for either successful
+	// managed ownership or an uncertain-write recovery obligation. The booleans keep
+	// those meanings distinct; they are never both true.
 	saved               domain.Layout
 	savedBindings       map[string]displayBinding
 	managedTargetDevice string
 	managed             bool
+	recoveryPending     bool
 	closed              bool
 	generation          uint64
 	watcher             *sessionWatcher
@@ -635,7 +649,7 @@ func (s *Session) Refresh() (Snapshot, error) {
 	// Its outcome is deliberately dropped rather than merged into err -- a GPU-scaling
 	// failure is never allowed to make the display half look broken.
 	_ = s.refreshScalingView()
-	if err == nil && !s.managed {
+	if err == nil && !s.managed && !s.recoveryPending {
 		s.state(StateNative, "已讀取目前顯示模式")
 	}
 	return s.Snapshot(), err
@@ -663,6 +677,9 @@ func (s *Session) Enable() error {
 	defer s.opMu.Unlock()
 	if s.closed {
 		return ErrClosed
+	}
+	if s.recoveryPending {
+		return ErrDisplayRecoveryPending
 	}
 	if s.managed {
 		return nil
@@ -703,6 +720,9 @@ func (s *Session) applyGameMode() (State, string, error) {
 		return StateError, "", s.fail("bind target display", err)
 	}
 	if err := s.apply(target, s.profile.GameMode, plan); err != nil {
+		if uncertainLayoutWrite(err) {
+			s.keepDisplayRecovery(layout, bindings, target.DeviceName)
+		}
 		return StateError, "", err
 	}
 	s.saved, s.savedBindings = layout, bindings
@@ -717,6 +737,30 @@ func (s *Session) applyGameMode() (State, string, error) {
 	})
 	s.startWatcher()
 	return state, message, nil
+}
+
+func uncertainLayoutWrite(err error) bool {
+	return errors.Is(err, display.ErrLayoutNotVerified) || errors.Is(err, display.ErrLayoutPartlyApplied)
+}
+
+// keepDisplayRecovery retains the only identity-bound description of the desktop as
+// it stood before a write whose final state is uncertain. It deliberately does not
+// claim managed ownership or a successful game mode.
+func (s *Session) keepDisplayRecovery(
+	layout domain.Layout,
+	bindings map[string]displayBinding,
+	targetDevice string,
+) {
+	s.saved, s.savedBindings = layout, bindings
+	s.managedTargetDevice = targetDevice
+	s.managed = false
+	s.recoveryPending = true
+	s.gameSeen = false
+	s.updateSnapshot(func(snapshot *Snapshot) {
+		snapshot.AtGameMode = false
+		snapshot.Managed = false
+		snapshot.RecoveryPending = true
+	})
 }
 
 // apply pre-flights the target's mode and only then applies the whole arrangement.
@@ -790,7 +834,7 @@ func (s *Session) Disable() error {
 // Saved ownership survives every resolve/plan/test/apply failure so restoration is
 // retryable.
 func (s *Session) restore(allowFallback bool) error {
-	if s.managed {
+	if s.managed || s.recoveryPending {
 		return s.restoreSaved()
 	}
 	if !allowFallback {
@@ -805,7 +849,11 @@ func (s *Session) restore(allowFallback bool) error {
 // longer part of that layout aborts the restore: the displays have been renumbered
 // under the tool, so the saved coordinates belong to an arrangement that is gone.
 func (s *Session) restoreSaved() error {
-	s.state(StateRestoring, "正在恢復原始顯示模式")
+	message := "正在恢復原始顯示模式"
+	if s.recoveryPending {
+		message = "正在恢復寫入前的顯示配置"
+	}
+	s.state(StateRestoring, message)
 	target, err := s.displays.ResolveTarget(s.profile.Monitor)
 	if err != nil {
 		return s.fail("resolve target for restore", err)
@@ -874,8 +922,21 @@ func (s *Session) restoreFallback() error {
 	if err != nil {
 		return s.fail("plan display layout", err)
 	}
+	bindings, err := s.readDisplayBindings(layout)
+	if err != nil {
+		return s.fail("read display identities", err)
+	}
+	if err := verifyResolvedBinding(target, bindings); err != nil {
+		return s.fail("bind target display", err)
+	}
 	s.state(StateRestoring, "正在恢復 "+domain.ModeLabel(derived.mode))
-	return s.finishRestore(target, derived.mode, plan)
+	if err := s.finishRestore(target, derived.mode, plan); err != nil {
+		if uncertainLayoutWrite(err) {
+			s.keepDisplayRecovery(layout, bindings, target.DeviceName)
+		}
+		return err
+	}
+	return nil
 }
 
 // firstMissingDisplay names the first display in the saved arrangement that is no
@@ -894,6 +955,7 @@ func (s *Session) finishRestore(target domain.Target, mode domain.Mode, plan dom
 		return err
 	}
 	s.managed = false
+	s.recoveryPending = false
 	s.saved = domain.Layout{}
 	s.savedBindings = nil
 	s.managedTargetDevice = ""
@@ -904,7 +966,7 @@ func (s *Session) finishRestore(target domain.Target, mode domain.Mode, plan dom
 	s.updateSnapshot(func(snapshot *Snapshot) {
 		snapshot.Target, snapshot.CurrentMode = target, mode
 		snapshot.MatchedBy = target.MatchedBy
-		snapshot.AtGameMode, snapshot.Managed = mode == s.profile.GameMode, false
+		snapshot.AtGameMode, snapshot.Managed, snapshot.RecoveryPending = mode == s.profile.GameMode, false, false
 		snapshot.State, snapshot.Message, snapshot.Err = StateNative, "已恢復顯示模式", nil
 	})
 	return nil
@@ -938,6 +1000,42 @@ func (s *Session) Shutdown() error {
 	close(s.notifyStop)
 	s.mu.Unlock()
 	s.opMu.Unlock()
+	s.watchers.Wait()
+	<-s.notifyDone
+	close(s.shutdownDone)
+	return nil
+}
+
+// retireForReplacement is the in-process profile transition boundary. Unlike normal
+// process shutdown, it must not swallow any restore obligation: the process remains
+// alive, so closing the only owner would remove the user's retry path. beforeClose is
+// run while opMu excludes every Session operation; SaveAndReplace uses that slot so a
+// file is written only after the guard passes and before this session can change state.
+func (s *Session) retireForReplacement(beforeClose func() error) error {
+	s.opMu.Lock()
+	if s.closed {
+		s.opMu.Unlock()
+		return ErrClosed
+	}
+	if s.managed || s.recoveryPending || s.scalingOwned {
+		s.opMu.Unlock()
+		return ErrSessionManaged
+	}
+	if beforeClose != nil {
+		if err := beforeClose(); err != nil {
+			s.opMu.Unlock()
+			return err
+		}
+	}
+	watcher := s.stopWatcher()
+	s.closed = true
+	s.mu.Lock()
+	s.notificationsClosed = true
+	s.onChange = nil
+	close(s.notifyStop)
+	s.mu.Unlock()
+	s.opMu.Unlock()
+	joinWatcher(watcher)
 	s.watchers.Wait()
 	<-s.notifyDone
 	close(s.shutdownDone)
@@ -1093,6 +1191,10 @@ func (s *Session) changeScaling(restore bool) error {
 		s.opMu.Unlock()
 		return ErrClosed
 	}
+	if s.recoveryPending {
+		s.opMu.Unlock()
+		return ErrDisplayRecoveryPending
+	}
 	if restore && !s.scalingOwned {
 		s.opMu.Unlock()
 		return nil
@@ -1194,8 +1296,14 @@ func (s *Session) runScalingCycle(restore bool) error {
 		// nothing to restore. The end state is the ordinary unmanaged one plus whatever
 		// that write left behind, and the retry is one press of the mode toggle.
 		s.endCycle()
-		failure := fmt.Errorf("GPU 縮放已變更為「%s」，但重新套用 %s 失敗，桌面維持在原始排列：%w",
-			ScalingLabel(effectiveValue(outcome)), s.gameModeLabel(), applyErr)
+		var failure error
+		if s.recoveryPending {
+			failure = fmt.Errorf("GPU 縮放已變更為「%s」，但重新套用 %s 後無法確認顯示配置；已保留寫入前排列，請先恢復：%w",
+				ScalingLabel(effectiveValue(outcome)), s.gameModeLabel(), applyErr)
+		} else {
+			failure = fmt.Errorf("GPU 縮放已變更為「%s」，但重新套用 %s 失敗，桌面維持在原始排列：%w",
+				ScalingLabel(effectiveValue(outcome)), s.gameModeLabel(), applyErr)
+		}
 		return s.finishScaling(outcome, StateError, failure.Error(), failure)
 	}
 	s.endCycle()

@@ -108,7 +108,7 @@ func (f *settingsDialogFlow) Save() error {
 		}
 		return fmt.Errorf("設定尚未可儲存：%s", gates.Reason)
 	}
-	profile, err := f.model.Save()
+	profile, err := f.model.validatedProfile()
 	if err != nil {
 		return err
 	}

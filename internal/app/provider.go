@@ -17,9 +17,9 @@ import (
 )
 
 var (
-	// ErrSessionManaged keeps a profile transition from invalidating the saved
-	// desktop arrangement that only the current session knows how to restore.
-	ErrSessionManaged = errors.New("目前的顯示模式仍由工具管理，請先恢復原始顯示模式再變更設定")
+	// ErrSessionManaged keeps a profile transition from invalidating display or
+	// scaling state that only the current session knows how to restore.
+	ErrSessionManaged = errors.New("目前仍有待恢復的顯示模式或 GPU 縮放設定，請先恢復再變更設定")
 
 	// ErrResetUnavailable prevents a normal, understood configuration from being
 	// moved aside through the recovery-only Reset action.
@@ -280,12 +280,32 @@ func (p *Provider) Replace(profile domain.Profile) error {
 	return err
 }
 
+// SaveAndReplace is the settings dialog's bounded persistence transaction. The old
+// session holds its operation gate while the restoration guard is checked and the
+// file is saved. A refusal or save failure leaves that session open and writes no
+// replacement; only a successful save closes it and installs the matching profile.
+func (p *Provider) SaveAndReplace(profile domain.Profile) error {
+	p.opMu.Lock()
+	if p.isClosed() {
+		p.opMu.Unlock()
+		return ErrClosed
+	}
+	file := config.FromProfile(profile)
+	old := p.Session()
+	err := p.retireForReplacement(old, func() error { return p.store.Save(file) })
+	if err == nil {
+		p.installSession(profile, file)
+	}
+	p.opMu.Unlock()
+	if err == nil {
+		p.signalChange()
+	}
+	return err
+}
+
 func (p *Provider) replace(profile domain.Profile, file config.File) error {
 	old := p.Session()
-	if old != nil && old.Snapshot().Managed {
-		return ErrSessionManaged
-	}
-	if err := p.retire(old); err != nil {
+	if err := p.retireForReplacement(old, nil); err != nil {
 		return err
 	}
 	p.installSession(profile, file)
@@ -302,13 +322,9 @@ func (p *Provider) Reload() error {
 		return ErrClosed
 	}
 
-	file, loadErr := p.store.Load()
 	old := p.Session()
-	if old != nil && old.Snapshot().Managed {
-		p.opMu.Unlock()
-		return ErrSessionManaged
-	}
-	if err := p.retire(old); err != nil {
+	file, loadErr := p.store.Load()
+	if err := p.retireForReplacement(old, nil); err != nil {
 		p.opMu.Unlock()
 		return err
 	}
@@ -328,6 +344,13 @@ func (p *Provider) Reset() (string, error) {
 	if p.isClosed() {
 		p.opMu.Unlock()
 		return "", ErrClosed
+	}
+	if current := p.Session(); current != nil {
+		snapshot := current.Snapshot()
+		if snapshot.Managed || snapshot.RecoveryPending || snapshot.Scaling.Owned {
+			p.opMu.Unlock()
+			return "", ErrSessionManaged
+		}
 	}
 	if !p.ReadOnly() {
 		p.opMu.Unlock()
@@ -406,6 +429,42 @@ func (p *Provider) retire(old *Session) error {
 
 	if err := old.Shutdown(); err != nil {
 		p.installExisting(old)
+		return err
+	}
+	return nil
+}
+
+func (p *Provider) retireForReplacement(old *Session, beforeClose func() error) error {
+	if old == nil {
+		if beforeClose != nil {
+			p.writeMu.Lock()
+			err := beforeClose()
+			p.writeMu.Unlock()
+			return err
+		}
+		return nil
+	}
+	transition := func() error {
+		// A secondary-key rebind also writes through writeMu. Let an older one finish
+		// first, then save the replacement and invalidate its generation without a gap;
+		// no stale callback can overwrite the new file between those two actions.
+		p.writeMu.Lock()
+		defer p.writeMu.Unlock()
+		if beforeClose != nil {
+			if err := beforeClose(); err != nil {
+				return err
+			}
+		}
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.session != old {
+			return ErrClosed
+		}
+		p.generation++
+		p.session = nil
+		return nil
+	}
+	if err := old.retireForReplacement(transition); err != nil {
 		return err
 	}
 	return nil

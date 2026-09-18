@@ -27,6 +27,7 @@ type fakeProviderStore struct {
 	saved      []config.File
 	opened     []string
 	openErr    error
+	saveHook   func(config.File)
 }
 
 func (s *fakeProviderStore) Path() (string, error) { return s.path, nil }
@@ -38,6 +39,9 @@ func (s *fakeProviderStore) Load() (config.File, error) {
 }
 
 func (s *fakeProviderStore) Save(file config.File) error {
+	if s.saveHook != nil {
+		s.saveHook(file)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.saves++
@@ -281,6 +285,120 @@ func TestReloadIsRefusedWhileTheSessionOwnsAnAppliedMode(t *testing.T) {
 	}
 }
 
+func providerWithOwnedScaling(t *testing.T) (*Provider, *Session, *fakeProviderStore, *task15ScalingFake) {
+	t.Helper()
+	profile := domain.LegacySeedProfile()
+	rig := newTask15FakeRig(t)
+	store := &fakeProviderStore{path: `C:\scratch\config.json`, file: config.FromProfile(profile)}
+	p := newScalingProvider(rig.displays, stubProviderChecker{}, rig.scaling, store)
+	old := p.Session()
+
+	previous := rig.scaling.currentState()
+	requested := ScalingFullScreenByGPU()
+	after := scaling.State{DisplayID: previous.DisplayID, Effective: requested}
+	rig.scaling.queueApply(scaling.Outcome{
+		Requested: requested, Previous: previous, State: after,
+		SetAttempted: true, Applied: true, ReadBackKnown: true, Matched: true,
+	}, nil)
+	rig.scaling.setState(after)
+	if err := old.ApplyGPUScaling(); err != nil {
+		t.Fatalf("ApplyGPUScaling: %v", err)
+	}
+
+	restoreFailure := errors.New("NVAPI restore failed")
+	rig.scaling.queueRestore(scaling.Outcome{
+		Requested: old.scalingSaved, Previous: after, State: after,
+		SetAttempted: true, ReadBackKnown: true,
+	}, restoreFailure)
+	return p, old, store, rig.scaling
+}
+
+func TestReplaceAndReloadRefuseOutstandingScalingOwnershipBeforeShutdown(t *testing.T) {
+	for _, operation := range []string{"replace", "reload"} {
+		t.Run(operation, func(t *testing.T) {
+			p, old, store, scaler := providerWithOwnedScaling(t)
+			defer func() { _ = p.Shutdown() }()
+			if operation == "reload" {
+				store.mu.Lock()
+				store.file = config.FromProfile(providerProfile("reloaded", `\\?\DISPLAY#RELOADED`))
+				store.mu.Unlock()
+			}
+
+			var err error
+			if operation == "replace" {
+				err = p.Replace(providerProfile("replacement", `\\?\DISPLAY#NEW`))
+			} else {
+				err = p.Reload()
+			}
+			if !errors.Is(err, ErrSessionManaged) {
+				t.Fatalf("%s error = %v, want ErrSessionManaged", operation, err)
+			}
+			if p.Session() != old || !p.Snapshot().Scaling.Owned {
+				t.Fatalf("%s discarded the scaling owner: session=%p snapshot=%+v", operation, p.Session(), p.Snapshot())
+			}
+			for _, call := range scaler.takeCalls() {
+				if call.operation == "restore" {
+					t.Fatalf("%s retired the session before refusing: calls=%+v", operation, scaler.calls)
+				}
+			}
+		})
+	}
+}
+
+func TestSaveAndReplaceRefusalWritesNothingAndKeepsTheLiveProfile(t *testing.T) {
+	p, old, store, _ := providerWithOwnedScaling(t)
+	defer func() { _ = p.Shutdown() }()
+	originalFile := store.file
+	replacement := providerProfile("replacement", `\\?\DISPLAY#NEW`)
+
+	if err := p.SaveAndReplace(replacement); !errors.Is(err, ErrSessionManaged) {
+		t.Fatalf("SaveAndReplace error = %v, want ErrSessionManaged", err)
+	}
+	if saves, _ := store.counts(); saves != 0 {
+		t.Fatalf("refused replacement saved %d files", saves)
+	}
+	if store.file.Profile().Monitor != originalFile.Profile().Monitor || p.Session() != old ||
+		p.Snapshot().Profile.Monitor != old.Snapshot().Profile.Monitor {
+		t.Fatalf("disk/live profile diverged: disk=%+v provider=%+v", store.file.Profile(), p.Snapshot().Profile)
+	}
+}
+
+func TestProviderTransitionsCannotDiscardDisplayRecovery(t *testing.T) {
+	for _, operation := range []string{"replace", "reload", "reset"} {
+		t.Run(operation, func(t *testing.T) {
+			profile := providerProfile("first", `\\?\DISPLAY#FIRST`)
+			displays := providerDisplay(profile)
+			store := &fakeProviderStore{path: `C:\scratch\config.json`, file: config.FromProfile(profile)}
+			p := newProvider(displays, stubProviderChecker{}, store)
+			defer func() { _ = p.Shutdown() }()
+			old := p.Session()
+			displays.applyBeforeError = true
+			displays.setFailure("apply", display.ErrLayoutNotVerified)
+			if err := old.Enable(); !errors.Is(err, display.ErrLayoutNotVerified) {
+				t.Fatalf("Enable error = %v", err)
+			}
+
+			var err error
+			switch operation {
+			case "replace":
+				err = p.Replace(providerProfile("second", `\\?\DISPLAY#SECOND`))
+			case "reload":
+				err = p.Reload()
+			case "reset":
+				_, err = p.Reset()
+			}
+			if !errors.Is(err, ErrSessionManaged) {
+				t.Fatalf("%s error = %v, want ErrSessionManaged", operation, err)
+			}
+			if p.Session() != old || !p.Snapshot().RecoveryPending {
+				t.Fatalf("%s discarded recovery: session=%p snapshot=%+v", operation, p.Session(), p.Snapshot())
+			}
+			displays.setFailure("apply", nil)
+			displays.applyBeforeError = false
+		})
+	}
+}
+
 func TestProviderWritesBackTheInstancePathAfterASecondaryKeyRebind(t *testing.T) {
 	profile := providerProfile("rebound", `\\?\DISPLAY#OLD`)
 	displays := providerDisplay(profile)
@@ -315,6 +433,50 @@ func TestProviderWritesBackTheInstancePathAfterASecondaryKeyRebind(t *testing.T)
 	}
 	if snapshot.Err != nil {
 		t.Fatalf("snapshot error after successful rebind = %v", snapshot.Err)
+	}
+}
+
+func TestSaveAndReplaceCannotBeOverwrittenByAnOlderBlockedRebind(t *testing.T) {
+	first := providerProfile("first", `\\?\DISPLAY#OLD`)
+	second := providerProfile("second", `\\?\DISPLAY#SECOND`)
+	displays := providerDisplay(first)
+	displays.target.Identity.InstancePath = `\\?\DISPLAY#REBOUND`
+	displays.target.MatchedBy = domain.MatchHardwareID
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	store := &fakeProviderStore{path: `C:\scratch\config.json`, file: config.FromProfile(first)}
+	store.saveHook = func(file config.File) {
+		if file.Monitor.Label == first.Monitor.Label {
+			once.Do(func() {
+				close(started)
+				<-release
+			})
+		}
+	}
+	p := newProvider(displays, stubProviderChecker{}, store)
+	defer func() { _ = p.Shutdown() }()
+
+	if _, err := p.Session().Refresh(); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	<-started
+	done := make(chan error, 1)
+	go func() { done <- p.SaveAndReplace(second) }()
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("SaveAndReplace: %v", err)
+	}
+
+	store.mu.Lock()
+	disk := store.file.Profile()
+	saves := store.saves
+	store.mu.Unlock()
+	if disk.Monitor != second.Monitor || p.Snapshot().Profile.Monitor != second.Monitor {
+		t.Fatalf("stale rebind won: disk=%+v live=%+v want=%+v", disk.Monitor, p.Snapshot().Profile.Monitor, second.Monitor)
+	}
+	if saves != 2 {
+		t.Fatalf("saves=%d, want old rebind then replacement", saves)
 	}
 }
 
