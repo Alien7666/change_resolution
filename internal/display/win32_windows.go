@@ -3,6 +3,7 @@ package display
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"unsafe"
 
 	"github.com/Alien7666/change_resolution/internal/domain"
@@ -401,20 +402,36 @@ func (n *windowsNative) stageChanges(plan domain.LayoutPlan) ([]stagedChange, er
 	return staged, nil
 }
 
+// applyAxis is the single line a rearrangement moves along: which axis, and which
+// way down it. It is what turns "outermost first" from a phrase into a comparison.
+type applyAxis struct {
+	vertical bool
+	// forward is true when the displays travel toward larger coordinates, which is
+	// what a target giving space up looks like from its neighbours.
+	forward bool
+}
+
+// leads reports whether a display at coordinate a has to make its call before one at
+// coordinate b. Whoever is furthest along the direction of travel goes first, so the
+// display behind it is never walked into a display that has not moved yet.
+func (axis applyAxis) leads(a, b int32) bool {
+	if axis.forward {
+		return a > b
+	}
+	return a < b
+}
+
+func (axis applyAxis) coordinate(position pointL) int32 {
+	if axis.vertical {
+		return position.Y
+	}
+	return position.X
+}
+
 // orderForApply decides which display crosses into Win32 first. A transient gap
 // between displays is harmless; a transient overlap is not, because Windows repacks
 // a desktop it considers invalid and the tool then no longer knows where anything
 // sits.
-//
-// The order is decided once per apply rather than once per display, which leaves one
-// shape uncovered: when the target grows in one axis and shrinks in the other, a
-// neighbour in the shrinking axis moves inward before the target has given that space
-// up, and overlaps it until the target's own call lands. Deciding per display would
-// close it and is deliberately not done here. The consequence is bounded - a driver
-// that repacks instead of accepting the step is caught by verifyApplied and reported;
-// Session retains the exact pre-write layout as a retryable recovery obligation. The
-// behaviour is pinned by
-// TestWindowsNativeApplyLayoutOrdersOncePerApplyNotOncePerDisplay.
 //
 // A target that does not grow in either axis gives up its space the moment its mode
 // lands, so it goes first and its neighbours close the gap behind it. A target that
@@ -422,6 +439,29 @@ func (n *windowsNative) stageChanges(plan domain.LayoutPlan) ([]stagedChange, er
 // move away first and the target's mode goes last. The decision is read off the
 // staged sizes -- the planned mode against the one the driver reported -- never off
 // a particular resolution.
+//
+// Placing the target is not enough on its own, because the neighbours also queue
+// behind each other. Two displays touching above the target both shift right when it
+// is restored to its full width; moving the inner one first parks it on the outer
+// one, and Windows repacks. So when the neighbours agree on a single line of travel,
+// they are sorted along it and the one furthest along that direction calls first --
+// outermost first while the target grows, innermost first while it shrinks. The key
+// is each display's position before the apply, because that is where it still is
+// when the call in front of it is made.
+//
+// movementAxis is what decides whether there is a line to sort along at all, and it
+// refuses whenever the movement is not one; see its own comment for why. When it
+// refuses, the neighbours keep the order the plan listed them in, which is the order
+// the displays were read in.
+//
+// TestWindowsNativeApplyLayoutOrdersOncePerApplyNotOncePerDisplay still pins the
+// shape this rule does not cover: a target that grows in one axis and shrinks in the
+// other pushes one neighbour outward and pulls another inward in the same apply, and
+// a single target slot cannot serve both. Sorting cannot rescue it either -- the two
+// neighbours are not even on the same axis -- so that test now pins the refusal as
+// well as the cost of it. The consequence stays bounded: a driver that repacks
+// instead of accepting the overlapping step is caught by verifyApplied and reported,
+// and Session retains the exact pre-write layout as a retryable recovery obligation.
 func orderForApply(staged []stagedChange) []stagedChange {
 	target := -1
 	for i, step := range staged {
@@ -433,24 +473,84 @@ func orderForApply(staged []stagedChange) []stagedChange {
 	if target < 0 {
 		return staged
 	}
+	others := make([]stagedChange, 0, len(staged)-1)
+	for i, step := range staged {
+		if i != target {
+			others = append(others, step)
+		}
+	}
+	if axis, ok := movementAxis(staged[target], others); ok {
+		sort.SliceStable(others, func(i, j int) bool {
+			return axis.leads(
+				axis.coordinate(others[i].previous.DmPosition),
+				axis.coordinate(others[j].previous.DmPosition),
+			)
+		})
+	}
 	ordered := make([]stagedChange, 0, len(staged))
 	if !staged[target].growsMode {
 		ordered = append(ordered, staged[target])
 	}
-	for i, step := range staged {
-		if i != target {
-			ordered = append(ordered, step)
-		}
-	}
+	ordered = append(ordered, others...)
 	if staged[target].growsMode {
 		ordered = append(ordered, staged[target])
 	}
 	return ordered
 }
 
+// movementAxis reads the one line this apply moves along off the displays that
+// actually move, and answers false whenever the arrangement is not a single line.
+//
+// It is deliberately unanimous rather than best-effort. Sorting a subset of the
+// neighbours would claim an ordering the apply does not have: the displays left out
+// still make their calls somewhere in the sequence, so the guarantee "no display
+// crosses into one that has not moved yet" would simply be false while looking true.
+// Plan order is the honest answer for every shape below.
+//
+//   - A target that resizes in both axes drives two rearrangements at once, one
+//     outward and one inward. Which of them a given neighbour is answering cannot be
+//     read off its displacement, and the two want opposite sequences.
+//   - A display that moves diagonally is on no single axis.
+//   - Displays that move on different axes, or the same axis in opposite directions,
+//     do not describe a line at all.
+//
+// A display that does not move is not a mover and casts no vote, but it is still
+// sorted with the rest: it sits on the same line and its call is a no-op wherever it
+// lands.
+func movementAxis(target stagedChange, others []stagedChange) (applyAxis, bool) {
+	if target.previous.DmPelsWidth != target.next.DmPelsWidth &&
+		target.previous.DmPelsHeight != target.next.DmPelsHeight {
+		return applyAxis{}, false
+	}
+	var axis applyAxis
+	moved := false
+	for _, step := range others {
+		deltaX := step.next.DmPosition.X - step.previous.DmPosition.X
+		deltaY := step.next.DmPosition.Y - step.previous.DmPosition.Y
+		if deltaX == 0 && deltaY == 0 {
+			continue
+		}
+		if deltaX != 0 && deltaY != 0 {
+			return applyAxis{}, false
+		}
+		travel := applyAxis{vertical: deltaX == 0, forward: deltaX > 0 || deltaY > 0}
+		if !moved {
+			axis, moved = travel, true
+			continue
+		}
+		if travel != axis {
+			return applyAxis{}, false
+		}
+	}
+	return axis, moved
+}
+
 // rollBack puts every display this apply already changed back to what the driver
 // reported before it started, most recent first, and returns the failure that caused
-// it.
+// it. Walking applied backwards is what makes that the exact reverse of the order
+// orderForApply chose, which is the only order that unwinds safely: if the outermost
+// display had to move before the one behind it, the one behind it has to come home
+// before the outermost does.
 //
 // A rollback call that fails itself is reported as exactly that: saying only that
 // the apply failed would tell the user their desktop is untouched when it is not.

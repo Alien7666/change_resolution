@@ -462,6 +462,26 @@ func appliedDeviceOrder(api *fakeWin32) []string {
 	return order
 }
 
+func stagedPositionChange(device string, from, to pointL) stagedChange {
+	return stagedChange{
+		deviceName: device,
+		previous:   devMode{DmPosition: from},
+		next:       devMode{DmPosition: to},
+	}
+}
+
+func stagedTarget(device string, grows bool) stagedChange {
+	return stagedChange{deviceName: device, setsMode: true, growsMode: grows}
+}
+
+func stagedDeviceOrder(staged []stagedChange) []string {
+	order := make([]string, len(staged))
+	for i, step := range staged {
+		order[i] = step.deviceName
+	}
+	return order
+}
+
 func findChange(t *testing.T, plan domain.LayoutPlan, device string) domain.LayoutChange {
 	t.Helper()
 	for _, change := range plan.Changes {
@@ -548,7 +568,10 @@ func TestWindowsNativeApplyLayoutAppliesTheTargetFirstWhenItShrinks(t *testing.T
 
 // Growing the target back is the same rule with the sign flipped: the target cannot
 // occupy space its neighbours still hold, so they move away first and its mode is
-// the last call.
+// the last call. The neighbours are ordered among themselves too: DISPLAY3 and
+// DISPLAY5 share the row above the target, so moving DISPLAY3 first would park
+// it 640 pixels inside DISPLAY5, which has not moved yet. The outermost goes
+// first.
 func TestWindowsNativeApplyLayoutMovesTheOtherDisplaysFirstWhenTheTargetGrows(t *testing.T) {
 	narrowed, err := PlanModeChange(offsetTargetLayout(), `\.\DISPLAY1`, miMonitorGame)
 	if err != nil {
@@ -566,7 +589,7 @@ func TestWindowsNativeApplyLayoutMovesTheOtherDisplaysFirstWhenTheTargetGrows(t 
 		t.Fatal(err)
 	}
 	assertApplySequence(t, api, plan, []string{
-		`\.\DISPLAY3`, `\.\DISPLAY2`, `\.\DISPLAY5`, `\.\DISPLAY1`,
+		`\.\DISPLAY5`, `\.\DISPLAY2`, `\.\DISPLAY3`, `\.\DISPLAY1`,
 	})
 	// The plan still lists the target second, where the read order put it, so the
 	// sequence above cannot have come from the plan's order. Only the rule moves the
@@ -576,6 +599,173 @@ func TestWindowsNativeApplyLayoutMovesTheOtherDisplaysFirstWhenTheTargetGrows(t 
 		t.Fatalf("plan order %v is already the apply order; the test cannot tell the rule from the list", planned)
 	}
 	assertDesktop(t, api, layoutFrom(plan, before))
+}
+
+// The live four-monitor desktop has two touching displays above the target. On a
+// restore from 1920 to 2560 wide they both move right, so the outer AOC has to move
+// before the inner ZOWIE. Moving ZOWIE first parks 640 pixels of it on the AOC and
+// gives Windows a chance to repack the desktop before the AOC's own call arrives.
+func TestWindowsNativeRestoreMovesOuterNeighboursFirstWhenTheTargetGrows(t *testing.T) {
+	nativeLayout := domain.Layout{Displays: []domain.DisplayState{
+		{DeviceName: `\.\DISPLAY1`, Mode: miMonitorNative, Position: domain.Point{}, Primary: true},
+		{DeviceName: `\.\DISPLAY2`, Mode: sideMode, Position: domain.Point{X: 2560, Y: 0}},
+		{DeviceName: `\.\DISPLAY3`, Mode: topMode, Position: domain.Point{X: 636, Y: -1080}},
+		{DeviceName: `\.\DISPLAY8`, Mode: topMode, Position: domain.Point{X: 2556, Y: -1080}},
+	}}
+	narrowPlan, err := PlanModeChange(nativeLayout, `\.\DISPLAY1`, miMonitorGame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrowed := layoutFrom(narrowPlan, nativeLayout)
+	restorePlan, err := PlanRestore(nativeLayout, narrowed, `\.\DISPLAY1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	api := fakeDesktop(t, narrowed)
+	devices := []string{`\.\DISPLAY1`, `\.\DISPLAY2`, `\.\DISPLAY3`, `\.\DISPLAY8`}
+	var intermediate [][]domain.DisplayState
+	api.afterChange = func(f *fakeWin32, _ win32Call) {
+		intermediate = append(intermediate, desktopStates(f, devices))
+	}
+	native := &windowsNative{api: api}
+	if err := native.applyLayout(restorePlan); err != nil {
+		t.Fatal(err)
+	}
+
+	assertApplySequence(t, api, restorePlan, []string{
+		`\.\DISPLAY2`, `\.\DISPLAY8`, `\.\DISPLAY3`, `\.\DISPLAY1`,
+	})
+	for i, states := range intermediate {
+		if first, second, found := overlappingPair(states); found {
+			t.Fatalf("after call %d, %s and %s overlap: %+v", i+1, first, second, states)
+		}
+	}
+	for i, call := range api.calls {
+		if call.device == `\.\DISPLAY1` {
+			want := dmPosition | dmPelsWidth | dmPelsHeight | dmDisplayFrequency | dmBitsPerPel
+			if call.mode.DmFields != want {
+				t.Fatalf("target DmFields=%#x, want %#x", call.mode.DmFields, want)
+			}
+			continue
+		}
+		if call.mode.DmFields != dmPosition {
+			t.Fatalf("call %d (%s) DmFields=%#x, want DM_POSITION alone", i, call.device, call.mode.DmFields)
+		}
+	}
+	assertDesktop(t, api, nativeLayout)
+}
+
+func TestOrderForApplyOrdersOnlyCollinearNeighbours(t *testing.T) {
+	tests := map[string]struct {
+		staged []stagedChange
+		want   []string
+	}{
+		"rightmost first while growing right": {
+			staged: []stagedChange{
+				stagedTarget("target", true),
+				stagedPositionChange("inner", pointL{X: 100}, pointL{X: 200}),
+				stagedPositionChange("unchanged", pointL{X: 150}, pointL{X: 150}),
+				stagedPositionChange("outer", pointL{X: 200}, pointL{X: 300}),
+			},
+			want: []string{"outer", "unchanged", "inner", "target"},
+		},
+		"leftmost first while closing left": {
+			staged: []stagedChange{
+				stagedPositionChange("outer", pointL{X: 300}, pointL{X: 200}),
+				stagedPositionChange("unchanged", pointL{X: 250}, pointL{X: 250}),
+				stagedPositionChange("inner", pointL{X: 200}, pointL{X: 100}),
+				stagedTarget("target", false),
+			},
+			want: []string{"target", "inner", "unchanged", "outer"},
+		},
+		"bottommost first while growing down": {
+			staged: []stagedChange{
+				stagedPositionChange("inner", pointL{Y: 100}, pointL{Y: 200}),
+				stagedTarget("target", true),
+				stagedPositionChange("outer", pointL{Y: 200}, pointL{Y: 300}),
+			},
+			want: []string{"outer", "inner", "target"},
+		},
+		"topmost first while closing up": {
+			staged: []stagedChange{
+				stagedPositionChange("outer", pointL{Y: 300}, pointL{Y: 200}),
+				stagedTarget("target", false),
+				stagedPositionChange("inner", pointL{Y: 200}, pointL{Y: 100}),
+			},
+			want: []string{"target", "inner", "outer"},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := stagedDeviceOrder(orderForApply(tt.staged)); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("order=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOrderForApplyPreservesMixedAxisAndConflictingMovementOrder(t *testing.T) {
+	tests := map[string][]stagedChange{
+		"different axes": {
+			stagedTarget("target", true),
+			stagedPositionChange("horizontal", pointL{X: 100}, pointL{X: 200}),
+			stagedPositionChange("vertical", pointL{Y: 100}, pointL{Y: 200}),
+		},
+		"one diagonal move": {
+			stagedTarget("target", true),
+			stagedPositionChange("diagonal", pointL{X: 100, Y: 100}, pointL{X: 200, Y: 200}),
+			stagedPositionChange("horizontal", pointL{X: 200}, pointL{X: 300}),
+		},
+		"opposite directions": {
+			stagedTarget("target", true),
+			stagedPositionChange("right", pointL{X: 100}, pointL{X: 200}),
+			stagedPositionChange("left", pointL{X: 300}, pointL{X: 200}),
+		},
+	}
+	for name, staged := range tests {
+		t.Run(name, func(t *testing.T) {
+			want := stagedDeviceOrder(staged[1:])
+			want = append(want, "target")
+			if got := stagedDeviceOrder(orderForApply(staged)); !reflect.DeepEqual(got, want) {
+				t.Fatalf("order=%v, want the non-target order preserved as %v", got, want)
+			}
+		})
+	}
+}
+
+func TestWindowsNativeSortedGrowthRollsBackInReverseApplyOrder(t *testing.T) {
+	nativeLayout := domain.Layout{Displays: []domain.DisplayState{
+		{DeviceName: `\.\DISPLAY1`, Mode: miMonitorNative, Position: domain.Point{}, Primary: true},
+		{DeviceName: `\.\DISPLAY2`, Mode: sideMode, Position: domain.Point{X: 2560, Y: 0}},
+		{DeviceName: `\.\DISPLAY3`, Mode: topMode, Position: domain.Point{X: 636, Y: -1080}},
+		{DeviceName: `\.\DISPLAY8`, Mode: topMode, Position: domain.Point{X: 2556, Y: -1080}},
+	}}
+	narrowPlan, err := PlanModeChange(nativeLayout, `\.\DISPLAY1`, miMonitorGame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrowed := layoutFrom(narrowPlan, nativeLayout)
+	restorePlan, err := PlanRestore(nativeLayout, narrowed, `\.\DISPLAY1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	api := fakeDesktop(t, narrowed)
+	api.changeResults = map[string]int32{`\.\DISPLAY3`: dispChangeBadParam}
+	native := &windowsNative{api: api}
+	err = native.applyLayout(restorePlan)
+	if err == nil {
+		t.Fatal("a rejected display was reported as success")
+	}
+	wantCalls := []string{
+		`\.\DISPLAY2`, `\.\DISPLAY8`, `\.\DISPLAY3`,
+		`\.\DISPLAY8`, `\.\DISPLAY2`,
+	}
+	if got := appliedDeviceOrder(api); !reflect.DeepEqual(got, wantCalls) {
+		t.Fatalf("calls=%v, want apply then reverse rollback %v", got, wantCalls)
+	}
+	assertDesktop(t, api, narrowed)
 }
 
 // A mode picker offers plenty of modes that are wider and shorter than the one the
