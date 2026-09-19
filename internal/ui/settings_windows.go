@@ -675,9 +675,8 @@ func modeNotes(row modeRow, view app.ScalingSnapshot) string {
 }
 
 // modeScalingNote is the profile design's static reminder wherever the scaling value
-// could not be read, and the measured sentence wherever it could. It never invents a
-// value, and it never says the black bars are gone: full-screen scaling is reported as
-// the setting it is, because a game can still override it.
+// could not be read, and names the read-back setting wherever it could. It never
+// invents a value or infers whether black bars are visible from that setting.
 func modeScalingNote(view app.ScalingSnapshot) string {
 	if !view.Known {
 		return "非原生比例，請確認已使用全螢幕縮放"
@@ -686,7 +685,7 @@ func modeScalingNote(view app.ScalingSnapshot) string {
 	if view.Effective.Mode == app.ScalingFullScreenByGPU().Mode {
 		return note
 	}
-	return note + "，畫面會有黑邊"
+	return note + "，畫面可能有黑邊"
 }
 
 func indexOfStringFold(values []string, want string) int {

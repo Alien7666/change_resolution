@@ -1261,8 +1261,9 @@ func TestAMismatchedReadBackIsShownAsBothValuesAndIsNotAnError(t *testing.T) {
 	}
 }
 
-// The profile design promised a static reminder. With a read path it becomes measured,
-// and the honesty line about the one checkbox NVAPI does not expose sits beside it
+// The profile design promised a static reminder. With a read path it is paired with
+// the driver's setting, without treating that setting as proof of the rendered image;
+// the honesty line about the one checkbox NVAPI does not expose sits beside it
 // permanently rather than as a note to fix later.
 func TestNonNativeChoiceShowsTheMeasuredScalingWarning(t *testing.T) {
 	snapshot := scalingReadySnapshot()
@@ -1274,8 +1275,8 @@ func TestNonNativeChoiceShowsTheMeasuredScalingWarning(t *testing.T) {
 	if want := app.ScalingLabel(scalingAspectByDisplay()); !strings.Contains(measured, want) {
 		t.Errorf("reminder %q does not print the scaling value that was read back", measured)
 	}
-	if !strings.Contains(measured, "黑邊") {
-		t.Errorf("reminder %q does not say what the user will see", measured)
+	if !strings.Contains(measured, "畫面可能有黑邊") {
+		t.Errorf("reminder %q does not make black bars uncertain", measured)
 	}
 
 	// Full-screen scaling is stated as a fact and nothing more. The tool cannot read
@@ -1319,6 +1320,27 @@ func TestNonNativeChoiceShowsTheMeasuredScalingWarning(t *testing.T) {
 	}
 	if got := modeNotes(row, app.ScalingSnapshot{}); strings.Contains(got, "（由") {
 		t.Errorf("settings note %q invented a scaling value it never read", got)
+	}
+}
+
+// A normalised aspect-ratio readback tells us what the driver selected, but cannot
+// prove what an unowned game's rendered image looks like on the panel.
+func TestAspectRatioReadBackOnlySaysBlackBarsMayAppear(t *testing.T) {
+	view := app.ScalingSnapshot{Known: true, Effective: scaling.Value{
+		Raw: 5, Mode: scaling.ModeAspectRatio, By: scaling.ByGPU,
+	}}
+	snapshot := scalingReadySnapshot()
+	snapshot.Scaling = view
+
+	main := scalingAspectReminder(snapshot)
+	if !strings.Contains(main, "畫面可能有黑邊") || strings.Contains(main, "畫面會有黑邊") {
+		t.Errorf("main-window reminder = %q, want an uncertain black-bar warning", main)
+	}
+
+	row := modeRow{Width: 1920, Height: 1440, Aspect: "4:3", FullScreenScalingReminder: true}
+	settings := modeNotes(row, view)
+	if !strings.Contains(settings, "畫面可能有黑邊") || strings.Contains(settings, "畫面會有黑邊") {
+		t.Errorf("settings reminder = %q, want an uncertain black-bar warning", settings)
 	}
 }
 

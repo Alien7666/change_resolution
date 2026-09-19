@@ -1446,10 +1446,10 @@ func scalingMismatchNote(snapshot app.Snapshot) string {
 }
 
 // scalingAspectReminder is the profile design's static "this is not your panel's shape"
-// reminder, upgraded to a measurement now that the scaling value can be read. It never
-// blocks the choice -- the user may want the bars, or may have dealt with them
-// elsewhere -- and it never claims the bars are gone: full-screen scaling is stated as
-// the fact it is, and nothing more, because a game can still override it.
+// reminder, paired with the driver setting that was read back when available. The
+// readback names a setting, not the rendered image, so a non-full-screen setting can
+// only say that black bars may appear. It never blocks the choice -- the user may want
+// the bars, or may have dealt with them elsewhere.
 //
 // The shape it compares against is the panel's separately enumerated native mode.
 // FallbackMode cannot answer this question: it may be an explicit restore override with
@@ -1476,7 +1476,7 @@ func scalingAspectReminder(snapshot app.Snapshot) string {
 	if snapshot.Scaling.Effective.Mode == app.ScalingFullScreenByGPU().Mode {
 		return shape + "，目前的 GPU 縮放是「" + effective + "」。"
 	}
-	return shape + "，而目前的 GPU 縮放是「" + effective + "」，畫面會有黑邊。"
+	return shape + "，而目前的 GPU 縮放是「" + effective + "」，畫面可能有黑邊。"
 }
 
 // fitText folds a string into a fixed-width window. Wrapping is by rune count rather
