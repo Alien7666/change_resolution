@@ -1177,6 +1177,8 @@ The window, its dialog captions and the tray icon were renamed from 「VALORANT 
 
 **2026-09-18 checkpoint:** documentation, final review, automated verification and commits are complete (86/87 total plan steps). All five whole-branch findings are fixed in `a649920`; scoped re-review passed with no blocking findings and two recorded minor follow-ups. Read-only GUI checks passed. Task 17 remains open solely for Step 4: the human display/scaling-write release gate. See [verification record](../verification/2026-09-18-configurable-tray.md). Do not restart Tasks 1–16 or the completed whole-branch audit.
 
+**2026-09-19 hardware checkpoint:** supervised 2461W non-native direct scaling, managed scaling/restore cycle, watcher re-arm with three-second automatic restore, tray hide/show and normal-exit scaling restore are measured. XV272K V3's proposed shrink safely refused the existing layout before writes; no planner change is needed. Raw 5 did not reliably predict visible black bars, so `6b5005b` changes both UI reminders to uncertain wording, with regression tests, renewed full gates and real GUI verification. Step 4 remains open: finish the remaining first-run apply, Mi growth/migration and manual-cancel checks, and record the final desktop baseline. Overall remains 86/87; do not mark unmeasured observations passed.
+
 **Files:**
 - Modify: `README.md`
 - Modify: `CLAUDE.md`
