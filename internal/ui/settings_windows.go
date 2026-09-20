@@ -304,7 +304,18 @@ func (d *settingsDialog) create(owner walk.Form) error {
 						OnTextChanged:     d.onProcessSearch,
 						OnEditingFinished: d.onProcessSearch,
 					},
-					dec.ListBox{AssignTo: &d.processList, Model: []string{}, MinSize: dec.Size{Height: 72}, OnCurrentIndexChanged: d.onProcessSelected},
+					dec.ListBox{
+						AssignTo: &d.processList, Model: []string{}, MinSize: dec.Size{Height: 72},
+						// Three routes to the same commit, because the change event alone
+						// is not one. A list that holds a current row -- after a search
+						// narrows it to one, say -- reports no change when that row is
+						// clicked, so the selection looks made and never reaches the
+						// draft. Releasing the mouse on the list, and activating a row,
+						// both commit whatever is current.
+						OnCurrentIndexChanged: d.onProcessSelected,
+						OnItemActivated:       d.onProcessSelected,
+						OnMouseUp:             func(int, int, walk.MouseButton) { d.onProcessSelected() },
+					},
 					dec.LineEdit{AssignTo: &d.processEdit, CueBanner: "程序檔名，例如 game.exe", OnTextChanged: d.onProcessTextChanged},
 					dec.CheckBox{AssignTo: &d.manualOnly, Text: "不觀察任何程序（只用手動切換）", OnCheckedChanged: d.onManualOnlyChanged},
 					dec.TextLabel{AssignTo: &d.processTip, Text: "請選擇或輸入程序檔名", MinSize: dec.Size{Height: 20}},
@@ -487,6 +498,9 @@ func (d *settingsDialog) onProcessSelected() {
 		return
 	}
 	name := d.processRows[index]
+	if name == d.flow.model.Draft().ProcessName {
+		return
+	}
 	d.flow.SetProcessName(name)
 	d.flow.withRebuild(func() {
 		d.manualOnly.SetChecked(false)
