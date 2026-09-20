@@ -1,0 +1,79 @@
+diff --git a/internal/display/layout.go b/internal/display/layout.go
+index 69f1af4..321a9ee 100644
+--- a/internal/display/layout.go
++++ b/internal/display/layout.go
+@@ -29,8 +29,10 @@ const (
+ // keeping the desktop contiguous.
+ //
+ // Changing the target's width by delta would otherwise leave a delta-wide dead zone
+-// the mouse cannot cross, so every display that sits to the right of the target
+-// moves by that delta, and the same rule applies downwards for a height change.
++// the mouse cannot cross, so the displays beyond the edge that moved slide by that
++// delta, and the same rule applies downwards for a height change. Which displays
++// those are is decided by slidesHorizontally and slidesVertically, not by a larger
++// coordinate alone.
+ // Windows keeps the primary display at the origin, so the whole arrangement is then
+ // translated to put the primary back at (0,0); when the target is itself the
+ // primary, that translation is empty and the target never moves.
+@@ -57,10 +59,10 @@ func PlanModeChange(layout domain.Layout, targetDevice string, mode domain.Mode)
+ 		if display.DeviceName == targetDevice {
+ 			next.Mode = mode
+ 		}
+-		if display.Position.X > target.Position.X {
++		if slidesHorizontally(display, target) {
+ 			next.Position.X = display.Position.X - deltaX
+ 		}
+-		if display.Position.Y > target.Position.Y {
++		if slidesVertically(display, target) {
+ 			next.Position.Y = display.Position.Y - deltaY
+ 		}
+ 		arranged[i] = next
+@@ -230,3 +232,48 @@ func overlaps(a, b domain.DisplayState) bool {
+ func outOfRange(coordinate int32) bool {
+ 	return coordinate > maxCoordinate || coordinate < -maxCoordinate
+ }
++
++// slidesHorizontally reports whether a display has to move when the target's width
++// changes, and slidesVertically does the same for its height. Two things must hold,
++// and requiring only the first is the defect these replaced.
++//
++// The display must start at or beyond the edge that moved, because only the space
++// past that edge opens or closes. And it must overlap the target's own band in the
++// other axis, because a display in a different row is not on the far side of
++// anything -- it is simply elsewhere, and sliding it moves it into a display that
++// had no reason to expect company.
++//
++// On the desk this was written for, the monitor above the primary starts at a larger
++// X than a monitor in the row below. Narrowing the one above used to drag the one
++// below into the primary, and every plan was refused before a single call was made.
++func slidesHorizontally(display, target domain.DisplayState) bool {
++	if display.DeviceName == target.DeviceName {
++		return false
++	}
++	if display.Position.X < target.Position.X+int32(target.Mode.Width) {
++		return false
++	}
++	return overlap(
++		display.Position.Y, display.Position.Y+int32(display.Mode.Height),
++		target.Position.Y, target.Position.Y+int32(target.Mode.Height),
++	) > 0
++}
++
++func slidesVertically(display, target domain.DisplayState) bool {
++	if display.DeviceName == target.DeviceName {
++		return false
++	}
++	if display.Position.Y < target.Position.Y+int32(target.Mode.Height) {
++		return false
++	}
++	return overlap(
++		display.Position.X, display.Position.X+int32(display.Mode.Width),
++		target.Position.X, target.Position.X+int32(target.Mode.Width),
++	) > 0
++}
++
++// overlap returns how much two half-open intervals share. Zero means they touch at
++// a point or a line, which is not enough to make one the far side of the other.
++func overlap(aStart, aEnd, bStart, bEnd int32) int32 {
++	return min(aEnd, bEnd) - max(aStart, bStart)
++}
