@@ -25,11 +25,15 @@ type settingsGates struct {
 // usable and when a successful write may replace the running profile. It contains no
 // Walk objects, so the safety policy is tested without launching a window.
 type settingsDialogFlow struct {
-	model         *settingsModel
-	replace       func(domain.Profile) error
-	processChosen bool
-	rebuilding    bool
-	accepted      bool
+	model   *settingsModel
+	replace func(domain.Profile) error
+	// manualOnly records the one thing the draft cannot say for itself: that an
+	// empty process name is a deliberate choice to watch nothing rather than a step
+	// the user has not reached yet. Whether a process was chosen is read from the
+	// draft, so no widget can leave the two disagreeing.
+	manualOnly bool
+	rebuilding bool
+	accepted   bool
 }
 
 func newSettingsDialogFlow(model *settingsModel, replace func(domain.Profile) error) *settingsDialogFlow {
@@ -37,9 +41,19 @@ func newSettingsDialogFlow(model *settingsModel, replace func(domain.Profile) er
 }
 
 func (f *settingsDialogFlow) syncInitialProcessChoice() {
-	if !f.model.firstRun || f.model.LegacyPrefilled() || strings.TrimSpace(f.model.Draft().ProcessName) != "" {
-		f.processChosen = true
+	// An existing profile with no process name is already watching nothing, and
+	// reopening the dialog must not turn that settled choice back into an unfinished
+	// step. A blank first run is the only case where nothing has been decided.
+	if !f.model.firstRun || f.model.LegacyPrefilled() {
+		f.manualOnly = strings.TrimSpace(f.model.Draft().ProcessName) == ""
 	}
+}
+
+// processChosen reports whether the process step is settled. It is derived rather
+// than tracked: a draft carrying a name is a choice however it got there, which is
+// what stops the dialog refusing to save a configuration it is already holding.
+func (f *settingsDialogFlow) processChosen() bool {
+	return strings.TrimSpace(f.model.Draft().ProcessName) != "" || f.manualOnly
 }
 
 func (f *settingsDialogFlow) Gates() settingsGates {
@@ -54,13 +68,13 @@ func (f *settingsDialogFlow) Gates() settingsGates {
 	// process choice would otherwise disable the button and say nothing at all --
 	// the control and its explanation have to come from one place or the dialog has
 	// a dead end in it.
-	if ready && !f.processChosen {
+	if ready && !f.processChosen() {
 		reason = missingProcessChoice
 	}
 	return settingsGates{
 		Mode:    monitorSelected,
 		Process: modeSelected,
-		Save:    ready && f.processChosen,
+		Save:    ready && f.processChosen(),
 		Reason:  reason,
 	}
 }
@@ -91,7 +105,9 @@ func (f *settingsDialogFlow) SetProcessName(name string) {
 		return
 	}
 	f.model.SetProcessName(name)
-	f.processChosen = strings.TrimSpace(name) != ""
+	if strings.TrimSpace(name) != "" {
+		f.manualOnly = false
+	}
 }
 
 func (f *settingsDialogFlow) UseManualOnly() {
@@ -99,12 +115,12 @@ func (f *settingsDialogFlow) UseManualOnly() {
 		return
 	}
 	f.model.UseManualOnly()
-	f.processChosen = true
+	f.manualOnly = true
 }
 
 func (f *settingsDialogFlow) clearProcessChoice() {
-	if !f.rebuilding && strings.TrimSpace(f.model.Draft().ProcessName) == "" {
-		f.processChosen = false
+	if !f.rebuilding {
+		f.manualOnly = false
 	}
 }
 
@@ -319,7 +335,7 @@ func (d *settingsDialog) rebuild(refreshErr error) {
 
 		draft := d.flow.model.Draft()
 		_ = d.processEdit.SetText(draft.ProcessName)
-		d.manualOnly.SetChecked(d.flow.processChosen && strings.TrimSpace(draft.ProcessName) == "")
+		d.manualOnly.SetChecked(d.flow.manualOnly && strings.TrimSpace(draft.ProcessName) == "")
 		d.updateMonitorDetails()
 	})
 

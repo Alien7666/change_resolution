@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/Alien7666/change_resolution/internal/app"
 	"github.com/Alien7666/change_resolution/internal/config"
 	"github.com/Alien7666/change_resolution/internal/domain"
 )
@@ -309,5 +310,90 @@ func TestGateReasonsAreRecognisedSoAStaleOneCanBeCleared(t *testing.T) {
 		if !isGateReason(reason) {
 			t.Fatalf("gateReasons lists %q but isGateReason does not recognise it", reason)
 		}
+	}
+}
+
+// The dialog used to track "a process was chosen" in a flag beside the draft, so a
+// name that reached the draft by a path that did not set the flag left the tool
+// refusing to save a configuration it was already holding. Whatever puts the name
+// there, the choice is made.
+func TestADraftCarryingAProcessNameCountsAsChosenHoweverItGotThere(t *testing.T) {
+	model, _, mode := dialogFlowFixture(t)
+	flow := newSettingsDialogFlow(model, func(domain.Profile) error { return nil })
+	if err := flow.SelectMonitor(0); err != nil {
+		t.Fatalf("SelectMonitor: %v", err)
+	}
+	if err := flow.SelectMode(mode); err != nil {
+		t.Fatalf("SelectMode: %v", err)
+	}
+
+	// Reach the draft without going through the flow at all, the way a widget event
+	// that arrived while the dialog was rebuilding used to.
+	model.SetProcessName("notepad++.exe")
+
+	gates := flow.Gates()
+	if !gates.Save {
+		t.Fatalf("save refused while the draft already names %q: %+v",
+			model.Draft().ProcessName, gates)
+	}
+	if gates.Reason != "" {
+		t.Fatalf("reason = %q, want none once the draft names a process", gates.Reason)
+	}
+}
+
+// An empty name is ambiguous on its own: it is either "watch nothing" or "not there
+// yet". Only the deliberate choice unlocks save.
+func TestAnEmptyProcessNameOnlyCountsWhenItWasChosenDeliberately(t *testing.T) {
+	model, _, mode := dialogFlowFixture(t)
+	flow := newSettingsDialogFlow(model, func(domain.Profile) error { return nil })
+	if err := flow.SelectMonitor(0); err != nil {
+		t.Fatalf("SelectMonitor: %v", err)
+	}
+	if err := flow.SelectMode(mode); err != nil {
+		t.Fatalf("SelectMode: %v", err)
+	}
+
+	if gates := flow.Gates(); gates.Save {
+		t.Fatalf("an untouched process step unlocked save: %+v", gates)
+	}
+
+	flow.UseManualOnly()
+	if gates := flow.Gates(); !gates.Save {
+		t.Fatalf("a deliberate manual-only choice did not unlock save: %+v", gates)
+	}
+
+	// Naming a process after choosing manual-only replaces that choice rather than
+	// leaving both recorded.
+	flow.SetProcessName("game.exe")
+	if flow.manualOnly {
+		t.Fatal("naming a process left the manual-only choice standing")
+	}
+	if gates := flow.Gates(); !gates.Save {
+		t.Fatalf("gates after naming a process = %+v", gates)
+	}
+}
+
+// Reopening the dialog on a profile that deliberately watches nothing must not turn
+// that settled choice back into an unfinished step.
+func TestReopeningAManualOnlyProfileKeepsItSettled(t *testing.T) {
+	target := settingsTarget(`\.\DISPLAY1`, `\?\DISPLAY#ONE#1`, `MONITOR\ONE`, "One")
+	mode := domain.Mode{Width: 1920, Height: 1080, RefreshHz: 144, BitsPerPixel: 32}
+	displays := &fakeSettingsDisplay{
+		targets: []domain.Target{target},
+		modes:   map[string][]domain.Mode{target.DeviceName: {mode}},
+	}
+	profile := domain.Profile{
+		Monitor:  target.Identity,
+		GameMode: mode,
+	}
+	model := newSettingsModel(displays, &fakeSettingsLister{}, profile, app.ScalingSnapshot{}, false)
+	if err := model.Refresh(); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	flow := newSettingsDialogFlow(model, func(domain.Profile) error { return nil })
+	flow.syncInitialProcessChoice()
+
+	if !flow.processChosen() {
+		t.Fatal("a saved profile that watches nothing reopened as an unfinished step")
 	}
 }
