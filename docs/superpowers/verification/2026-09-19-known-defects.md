@@ -1,4 +1,4 @@
-# 已知缺陷（2026-09-19，缺陷 2、3 已於 6c54796 修復）
+# 已知缺陷（2026-09-19 起；缺陷 1 已於 bfc688d、2 與 3 於 6c54796、4 於 1f39bf7 修復）
 
 樹是綠的，HEAD `96e2ee4`。下列缺陷都**已確認、未修復**。
 
@@ -99,3 +99,70 @@ return settingsGates{
 - 計畫 86/87 步，唯一未勾的是手動驗收（Task 17 Step 4）
 - 手動測試文件：`docs/superpowers/verification/2026-09-19-manual-test-plan.md`
 - `docs/superpowers/verification/2026-09-18-configurable-tray.md` 有未提交的變更（codex 的實測紀錄）
+
+---
+
+# 2026-09-20 追加
+
+缺陷 1 已於 `bfc688d` 修復（11 個測試逐一判定，新增兩條迴歸測試並經突變驗證）。實機重測情境一時又發現兩個。
+
+## 4. 螢幕被重新編號後沒有回頭路 — 阻斷性 — **已修復 `1f39bf7`**
+
+**症狀**：工具正在管理模式時，取消勾選解析度、按「恢復原始解析度」、關閉程式，三者都撞同一個錯：
+
+```
+plan display layout: display layout is not safe to apply:
+the configured monitor moved from \.\DISPLAY8 to \.\DISPLAY5 while its mode was managed
+```
+
+`onExit` 在 `Shutdown()` 失敗時不呼叫 `finishExit()`（這是刻意的：還原失敗不該默默放棄使用者的模式），於是**視窗關不掉**，只能從工作管理員結束行程，再手動把螢幕設回去。
+
+**重現**：2461W 設為目標並套用 1440×1080，按 GPU 縮放按鈕。NVAPI 寫入把 2461W 從 `\.\DISPLAY8` 換成 `\.\DISPLAY5`。
+
+**原因**：`restoreSaved` 拿存下來的 `\.\DISPLAYn` 跟現在解析出來的比對，不同就放棄。但 DISPLAYn 是插槽不是螢幕，而**工具自己的 NVAPI 寫入正是會搬動插槽的東西之一** — R1–R5 排序規則整套就是為了這件事設計的，卻沒有人處理「已經被換號之後怎麼辦」。
+
+**修法**：`remapSavedNames` 用 `captureDisplayBindings` 早就存在旁邊的螢幕身分，把存下來的名字重新綁到現在的名字上，讓座標跟著擁有它的螢幕走。仍然要成立的條件是「每一台存過的螢幕都還接著」，至於它現在叫幾號不關工具的事。真的被拔掉仍然拒絕，而且訊息會點名是哪一台（檢查順序特意排在數量比對之前，否則只會說「4 台變 3 台」）。
+
+`verifyDisplayBindings` 一併移除：它的兩項檢查正是重新對應在做的事，差別只在那個「名字必須相同」的要求 —— 那就是缺陷本身。
+
+**測試判定**：三個測試受影響，逐一處理，沒有整批改期望值。
+
+- `TestRestoreAbortsWhenTheSavedArrangementNoLongerFitsTheDesktop`、`TestRestoreRefusesWhenTheResolvedTargetNowUsesAnotherSavedDeviceName`：只有呼叫順序期望要改（現在必須先讀桌面與身分才判斷名字）。兩者仍然拒絕，理由不變
+- `TestRestoreNamesTheNeighbourThatIsNoLongerInTheSavedLayout`：它用的 `renameDisplay` 同時改 layout 和 targets，模擬的是**重新編號**而不是**拔掉**。新程式分得出兩者，所以這個測試現在斷言的是缺陷本身。拆成兩條：重新編號 → 還原成功；真的拔掉（新增 `detachDisplay`）→ 拒絕並點名
+- `TestRestoreRefusesWhenNeighboursExchangeSavedDeviceNames` 沒有失敗，但通過的理由變了 — 現在是重新對應後的排列真的重疊，由排列器擋下（`\.\DISPLAY4 and \.\DISPLAY2 would overlap`）。已實測確認並改寫註解，不留「碰巧通過」
+
+新增 `TestRestoreFollowsTheConfiguredMonitorThroughARenumbering`，就是使用者遇到的那一條。
+
+**突變驗證**：
+
+- 拿掉 layout 改名 → 三條重新編號測試全倒
+- 拿掉 `managedTargetDevice` 更新 → 目標改號那條倒，錯誤正是原本的 `moved from ... while its mode was managed`
+- 把「不見了」改成沿用舊名 → 拔掉那條倒，訊息退化成「4 台變 3 台」，點不出是哪一台
+
+重複身分那個防護測不到 — 上游 `captureDisplayBindings` 已經擋掉重複。保留為不變量守衛，程式與測試都標註它不可達，不假裝有覆蓋。
+
+## 5. GPU 縮放要到全螢幕卻拿到長寬比 — 未修復
+
+**症狀**：套用 1440×1080 後按 GPU 縮放，視窗顯示：
+
+> 已要求「全螢幕（由 GPU 執行）」，驅動實際套用的是「長寬比（由 GPU 執行）」
+
+黑邊不消失。
+
+**已確認的事實**（使用者實機讀數）：
+
+| 讀數 | 結論 |
+|---|---|
+| 管理循環寫入後，在 1440×1080 讀到 raw 5 | 寫入有生效也跨模式存活（原本 raw 6 → 變 5 並留住）。不是暫時性寫入 |
+| NVIDIA 控制台手動設 raw 2，黑邊消失 | 驅動在 1440×1080 下接受 raw 2，而且 2 真的能消黑邊 |
+| 程式讀回 raw 2 | 讀取端正確，`decodeValue` 對照表無誤 |
+
+所以唯一壞掉的是「要 2、拿到 5」。`flagValidateOnly` 那一趟先回 `statusOK`，代表 2 是合法值而非被拒絕。
+
+**假說**：`runScalingCycle` 步驟 2 先 `restoreSaved()` 把螢幕還原成原生 2560×1440，步驟 3 才寫入 NVAPI。原生下 source == native，`NV_SCALING_GPU_SCALING_TO_NATIVE`(2) 是空操作，驅動改存 5。步驟 4 才切回 1440×1080。
+
+**未證實**。原本設計的測試因為起始值已經是 2，`applyLocked` 的同值 no-op 直接跳過，沒發出任何 NVAPI 呼叫，所以測不到。正確的測法是先把 NVCP 設成外觀比例（raw 5）造出不同的起始值，再讓程式在 1440×1080 下走 `writeScaling`（未管理路徑）。
+
+**若假說成立**，修法要把 NVAPI 寫入移到套用遊戲模式之後，而那會讓裝置名稱在持有排列時被重新編號 — 正是缺陷 4 修好的那套重新對應機制要派上用場的地方。
+
+**附帶**：視窗那句「請到 NVIDIA 控制台勾選『覆寫遊戲和程式所設定的縮放模式』」對桌面黑邊是錯的，那個勾選管的是遊戲覆寫縮放。根因確定後一併改掉。
