@@ -5,6 +5,7 @@ package ui
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -199,6 +200,7 @@ type settingsDialog struct {
 	processSearch *walk.LineEdit
 	processList   *walk.ListBox
 	processEdit   *walk.LineEdit
+	browseButton  *walk.PushButton
 	manualOnly    *walk.CheckBox
 	processTip    *walk.TextLabel
 
@@ -316,7 +318,17 @@ func (d *settingsDialog) create(owner walk.Form) error {
 						OnItemActivated:       d.onProcessSelected,
 						OnMouseUp:             func(int, int, walk.MouseButton) { d.onProcessSelected() },
 					},
-					dec.LineEdit{AssignTo: &d.processEdit, CueBanner: "程序檔名，例如 game.exe", OnTextChanged: d.onProcessTextChanged},
+					dec.Composite{
+						Layout: dec.HBox{MarginsZero: true, Spacing: 6},
+						Children: []dec.Widget{
+							dec.LineEdit{AssignTo: &d.processEdit, CueBanner: "程序檔名，例如 game.exe", OnTextChanged: d.onProcessTextChanged},
+							// The list can only offer what is running, and the whole point
+							// of this tool is to be configured before the game is started.
+							// Picking the executable answers "what is it called" without
+							// requiring the name to be remembered exactly.
+							dec.PushButton{AssignTo: &d.browseButton, Text: "瀏覽…", MaxSize: dec.Size{Width: 90}, OnClicked: d.onBrowseProcess},
+						},
+					},
 					dec.CheckBox{AssignTo: &d.manualOnly, Text: "不觀察任何程序（只用手動切換）", OnCheckedChanged: d.onManualOnlyChanged},
 					dec.TextLabel{AssignTo: &d.processTip, Text: "請選擇或輸入程序檔名", MinSize: dec.Size{Height: 20}},
 				},
@@ -550,6 +562,9 @@ func (d *settingsDialog) rebuildProcesses() {
 	_ = d.processList.SetModel(d.processRows)
 	_ = d.processList.SetCurrentIndex(indexOfStringFold(d.processRows, d.flow.model.Draft().ProcessName))
 	tip := processTipText(query, len(d.processRows), d.flow.model.ProcessCount(), d.flow.model.ProcessError())
+	if note := notRunningNote(d.flow.model.Draft().ProcessName, d.flow.model.ProcessNames(""), d.flow.model.ProcessError()); note != "" {
+		tip += "\n" + note
+	}
 	_ = d.processTip.SetText(tip)
 	_ = d.processTip.SetToolTipText(tip)
 }
@@ -803,4 +818,49 @@ func processTipText(query string, shown, total int, err error) string {
 		return fmt.Sprintf("沒有程序符合「%s」（共 %d 個執行中）；仍可手動輸入完整檔名", query, total)
 	}
 	return fmt.Sprintf("符合「%s」的有 %d / %d 個", query, shown, total)
+}
+
+// onBrowseProcess names the watched process from an executable on disk. Only the
+// file name is kept: the tool matches Toolhelp's executable names and never touches
+// the file, so where it lives is not its business.
+func (d *settingsDialog) onBrowseProcess() {
+	dlg := &walk.FileDialog{
+		Title:  "選擇要觀察的遊戲執行檔",
+		Filter: "程式 (*.exe)|*.exe|所有檔案 (*.*)|*.*",
+	}
+	accepted, err := dlg.ShowOpen(d.dialog)
+	if err != nil {
+		d.setStatus("開啟檔案選擇器失敗：" + err.Error())
+		return
+	}
+	if !accepted || strings.TrimSpace(dlg.FilePath) == "" {
+		return
+	}
+
+	name := filepath.Base(dlg.FilePath)
+	d.flow.SetProcessName(name)
+	d.flow.withRebuild(func() {
+		d.manualOnly.SetChecked(false)
+		_ = d.processEdit.SetText(name)
+	})
+	d.rebuildProcesses()
+	d.applyGates()
+}
+
+// notRunningNote reports that the watched process is not running right now. That is
+// the normal state for a tool configured before the game is started, so it is a note
+// and not a refusal -- but it is also exactly what a mistyped name looks like, and
+// saying nothing is how a name that can never match gets saved.
+func notRunningNote(chosen string, running []string, err error) string {
+	chosen = strings.TrimSpace(chosen)
+	if chosen == "" || err != nil {
+		return ""
+	}
+	for _, name := range running {
+		if strings.EqualFold(name, chosen) {
+			return ""
+		}
+	}
+	return "「" + chosen + "」目前沒有在執行。遊戲還沒開啟的話這是正常的；" +
+		"若遊戲正在執行卻出現這行，表示名稱不符，自動恢復不會觸發。"
 }

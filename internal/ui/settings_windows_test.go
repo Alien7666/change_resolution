@@ -5,6 +5,7 @@ package ui
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Alien7666/change_resolution/internal/app"
@@ -435,5 +436,39 @@ func TestTheProcessTipReportsWhatTheFilterDid(t *testing.T) {
 				t.Fatalf("processTipText = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// A name that never matches and a game that has not started yet look the same to
+// the tool: neither is running. Saying nothing is how "valorant.exe" gets saved for
+// a process actually called VALORANT-Win64-Shipping.exe, and the restore silently
+// never fires.
+func TestAChosenProcessThatIsNotRunningSaysSo(t *testing.T) {
+	running := []string{"explorer.exe", "VALORANT-Win64-Shipping.exe"}
+
+	if note := notRunningNote("VALORANT-Win64-Shipping.exe", running, nil); note != "" {
+		t.Fatalf("a running process was reported as absent: %q", note)
+	}
+	if note := notRunningNote("valorant-win64-shipping.EXE", running, nil); note != "" {
+		t.Fatalf("matching is case-insensitive, like the watcher's: %q", note)
+	}
+	if note := notRunningNote("", running, nil); note != "" {
+		t.Fatalf("no chosen process should produce no note: %q", note)
+	}
+
+	note := notRunningNote("valorant.exe", running, nil)
+	if note == "" {
+		t.Fatal("a name that matches nothing running produced no note at all")
+	}
+	if !strings.Contains(note, "valorant.exe") {
+		t.Fatalf("the note does not name the process it is about: %q", note)
+	}
+	if !strings.Contains(note, "自動恢復不會觸發") {
+		t.Fatalf("the note does not say what goes wrong if the name is not the game's: %q", note)
+	}
+
+	// A failed listing is not evidence that anything is absent.
+	if note := notRunningNote("valorant.exe", nil, errors.New("存取被拒")); note != "" {
+		t.Fatalf("an unreadable process list produced an absence claim: %q", note)
 	}
 }
