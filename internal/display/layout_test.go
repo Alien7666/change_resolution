@@ -38,8 +38,13 @@ func positions(t *testing.T, plan domain.LayoutPlan) map[string]domain.Point {
 }
 
 // The defect this planner exists for: dropping the Mi Monitor from 2560 to 1920
-// wide used to leave a 640 px dead zone the mouse could not cross. Every display to
-// the right of the target closes that gap by exactly the width delta.
+// wide used to leave a 640 px dead zone the mouse could not cross. The display
+// beyond the target's right edge closes that gap by exactly the width delta.
+//
+// The two monitors in the row above do not move. They sit alongside the target
+// rather than beyond the edge that moved, so no gap opens between them and it and
+// nothing about their own arrangement changed. Sliding them as well was what let a
+// monitor in one row be dragged into a monitor in another.
 func TestPlanModeChangeClosesTheGapOnTheMeasuredDesktop(t *testing.T) {
 	plan, err := PlanModeChange(measuredLayout(), `\.\DISPLAY1`, miMonitorGame)
 	if err != nil {
@@ -48,8 +53,8 @@ func TestPlanModeChangeClosesTheGapOnTheMeasuredDesktop(t *testing.T) {
 	want := map[string]domain.Point{
 		`\.\DISPLAY1`: {X: 0, Y: 0},
 		`\.\DISPLAY2`: {X: 1920, Y: 0},
-		`\.\DISPLAY5`: {X: 1922, Y: -1080},
-		`\.\DISPLAY3`: {X: 2, Y: -1080},
+		`\.\DISPLAY5`: {X: 2562, Y: -1080},
+		`\.\DISPLAY3`: {X: 642, Y: -1080},
 	}
 	if got := positions(t, plan); !reflect.DeepEqual(got, want) {
 		t.Fatalf("positions = %+v, want %+v", got, want)
@@ -191,8 +196,11 @@ func TestPlanModeChangeRefusesLayoutsItCannotMakeSafe(t *testing.T) {
 			layout: withDisplays(func(d []domain.DisplayState) { d[1].Primary = true }),
 			target: `\.\DISPLAY1`,
 		},
+		// Two displays in the row above the target already overlap each other.
+		// Neither sits beyond the edge the target is moving, so no shift the plan
+		// could make separates them, and the whole plan is refused.
 		"displays would overlap": {
-			layout: withDisplays(func(d []domain.DisplayState) { d[1].Position.X = 2000 }),
+			layout: withDisplays(func(d []domain.DisplayState) { d[2].Position.X = 2000 }),
 			target: `\.\DISPLAY1`,
 		},
 	}
@@ -368,8 +376,9 @@ func assertNoOverlaps(t *testing.T, states []domain.DisplayState) {
 }
 
 // The mirror of the gap-closing case, and the one no user could reach until a mode
-// picker existed: a target that gets wider needs the space its neighbours are
-// standing in, so every display to its right moves outward by the width delta.
+// picker existed: a target that gets wider needs the space the display beyond its
+// right edge is standing in, so that display moves outward by the width delta.
+// The row above is alongside the target, not beyond the edge that moved, and stays.
 // Growing past the mode the monitor started in is not the same as restoring to it --
 // the restore has a saved arrangement to return to, this has nothing but the rule.
 func TestPlanModeChangePushesNeighboursOutwardWhenTheTargetGrows(t *testing.T) {
@@ -381,8 +390,8 @@ func TestPlanModeChangePushesNeighboursOutwardWhenTheTargetGrows(t *testing.T) {
 	want := map[string]domain.Point{
 		`\.\DISPLAY1`: {X: 0, Y: 0},
 		`\.\DISPLAY2`: {X: 3840, Y: 0},
-		`\.\DISPLAY5`: {X: 3842, Y: -1080},
-		`\.\DISPLAY3`: {X: 1922, Y: -1080},
+		`\.\DISPLAY5`: {X: 2562, Y: -1080},
+		`\.\DISPLAY3`: {X: 642, Y: -1080},
 	}
 	if got := positions(t, plan); !reflect.DeepEqual(got, want) {
 		t.Fatalf("positions = %+v, want %+v", got, want)
@@ -473,12 +482,16 @@ func TestPlanModeChangeHandlesATargetThatGrowsInOneAxisAndShrinksInTheOther(t *t
 // A purely growing target cannot produce this: with both deltas outward no pair's
 // separation ever decreases. It takes a mode that gives an axis back.
 func TestValidateArrangementNamesBothDisplaysThatWouldOverlap(t *testing.T) {
+	// DISPLAY2 stands beyond the target's right edge and overlaps its band, so the
+	// narrowing target pulls it left. DISPLAY6 is below that band and stays where it
+	// is. They clear each other now and close onto each other afterwards, which is
+	// the shape no ordering can rescue.
 	layout := domain.Layout{Displays: []domain.DisplayState{
-		{DeviceName: `\.\DISPLAY1`, Mode: miMonitorGame, Position: domain.Point{}, Primary: true},
-		{DeviceName: `\.\DISPLAY2`, Mode: portraitMode, Position: domain.Point{X: 1920, Y: 0}},
-		{DeviceName: `\.\DISPLAY6`, Mode: topMode, Position: domain.Point{X: 1920, Y: 2560}},
+		{DeviceName: `\.\DISPLAY1`, Mode: miMonitorNative, Position: domain.Point{}, Primary: true},
+		{DeviceName: `\.\DISPLAY2`, Mode: portraitMode, Position: domain.Point{X: 2560, Y: 0}},
+		{DeviceName: `\.\DISPLAY6`, Mode: topMode, Position: domain.Point{X: 640, Y: 1500}},
 	}}
-	plan, err := PlanModeChange(layout, `\.\DISPLAY1`, ultrawideMode)
+	plan, err := PlanModeChange(layout, `\.\DISPLAY1`, miMonitorGame)
 	if !errors.Is(err, ErrLayoutUnsafe) {
 		t.Fatalf("err = %v, want ErrLayoutUnsafe", err)
 	}
@@ -493,4 +506,66 @@ func TestValidateArrangementNamesBothDisplaysThatWouldOverlap(t *testing.T) {
 	if strings.Contains(err.Error(), `\.\DISPLAY1`) {
 		t.Fatalf("err = %q names a display that is not part of the collision", err)
 	}
+}
+
+// The defect found by picking the second monitor: the target is in the row above
+// the primary, and the display beside the primary sits at a larger X than it. A
+// rule that only compares coordinates pulls that display left, into the primary,
+// and every plan is refused with a message naming two displays the user never
+// touched. These are the real coordinates from the desk it was found on.
+func TestPlanModeChangeLeavesAnotherRowAloneWhenTheTargetIsNotThePrimary(t *testing.T) {
+	desktop := domain.Layout{Displays: []domain.DisplayState{
+		{DeviceName: `\.\DISPLAY1`, Mode: miMonitorNative, Position: domain.Point{X: 0, Y: 0}, Primary: true},
+		{DeviceName: `\.\DISPLAY2`, Mode: domain.Mode{Width: 3840, Height: 2160, RefreshHz: 160, BitsPerPixel: 32},
+			Position: domain.Point{X: 2560, Y: 0}},
+		{DeviceName: `\.\DISPLAY3`, Mode: topMode, Position: domain.Point{X: 636, Y: -1080}},
+		{DeviceName: `\.\DISPLAY5`, Mode: topMode, Position: domain.Point{X: 2556, Y: -1080}},
+	}}
+	narrower := domain.Mode{Width: 1440, Height: 1080, RefreshHz: 60, BitsPerPixel: 32}
+
+	plan, err := PlanModeChange(desktop, `\.\DISPLAY5`, narrower)
+	if err != nil {
+		t.Fatalf("planning a mode for the top-right monitor was refused: %v", err)
+	}
+
+	got := positions(t, plan)
+	for _, device := range []string{`\.\DISPLAY1`, `\.\DISPLAY2`, `\.\DISPLAY3`} {
+		was, _ := desktop.Find(device)
+		if got[device] != was.Position {
+			t.Fatalf("%s moved from %+v to %+v; only the target changed size",
+				device, was.Position, got[device])
+		}
+	}
+	if got[`\.\DISPLAY5`] != (domain.Point{X: 2556, Y: -1080}) {
+		t.Fatalf("the target moved to %+v; nothing stands beyond the edge it gave back", got[`\.\DISPLAY5`])
+	}
+	assertNoOverlaps(t, layoutFrom(plan, desktop).Displays)
+}
+
+// The other half of the rule. A display can sit beyond the edge that moved and
+// still have nothing to do with the target, because it stands in another band
+// entirely. Both conditions are needed: either one alone drags a display that was
+// never in the way.
+func TestPlanModeChangeOnlySlidesDisplaysInTheTargetsOwnBand(t *testing.T) {
+	desktop := domain.Layout{Displays: []domain.DisplayState{
+		{DeviceName: `\.\DISPLAY1`, Mode: miMonitorNative, Position: domain.Point{X: 0, Y: 0}, Primary: true},
+		// Beyond the target's right edge and level with it: this one slides.
+		{DeviceName: `\.\DISPLAY2`, Mode: sideMode, Position: domain.Point{X: 2560, Y: 0}},
+		// Beyond the same edge, but a whole row above: nothing opens beside it.
+		{DeviceName: `\.\DISPLAY8`, Mode: topMode, Position: domain.Point{X: 2560, Y: -1080}},
+	}}
+
+	plan, err := PlanModeChange(desktop, `\.\DISPLAY1`, miMonitorGame)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := positions(t, plan)
+	if got[`\.\DISPLAY2`] != (domain.Point{X: 1920, Y: 0}) {
+		t.Fatalf("the display level with the target is at %+v, want it to close the 640px gap", got[`\.\DISPLAY2`])
+	}
+	if got[`\.\DISPLAY8`] != (domain.Point{X: 2560, Y: -1080}) {
+		t.Fatalf("the display a row above moved to %+v; no gap opened beside it", got[`\.\DISPLAY8`])
+	}
+	assertNoOverlaps(t, layoutFrom(plan, desktop).Displays)
 }

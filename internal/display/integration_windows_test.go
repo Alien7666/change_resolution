@@ -606,11 +606,16 @@ func TestWindowsNativeApplyLayoutMovesTheOtherDisplaysFirstWhenTheTargetGrows(t 
 // before the inner ZOWIE. Moving ZOWIE first parks 640 pixels of it on the AOC and
 // gives Windows a chance to repack the desktop before the AOC's own call arrives.
 func TestWindowsNativeRestoreMovesOuterNeighboursFirstWhenTheTargetGrows(t *testing.T) {
+	// Two displays stand in a row to the right of the target, touching each other.
+	// Widening the target pushes both of them further right by the same delta, so
+	// the outer one has to move before the inner one: the other way round parks
+	// 640 px of the inner display inside the outer one, and Windows repacks a
+	// desktop it considers invalid.
 	nativeLayout := domain.Layout{Displays: []domain.DisplayState{
 		{DeviceName: `\.\DISPLAY1`, Mode: miMonitorNative, Position: domain.Point{}, Primary: true},
-		{DeviceName: `\.\DISPLAY2`, Mode: sideMode, Position: domain.Point{X: 2560, Y: 0}},
+		{DeviceName: `\.\DISPLAY2`, Mode: topMode, Position: domain.Point{X: 2560, Y: 0}},
+		{DeviceName: `\.\DISPLAY8`, Mode: topMode, Position: domain.Point{X: 4480, Y: 0}},
 		{DeviceName: `\.\DISPLAY3`, Mode: topMode, Position: domain.Point{X: 636, Y: -1080}},
-		{DeviceName: `\.\DISPLAY8`, Mode: topMode, Position: domain.Point{X: 2556, Y: -1080}},
 	}}
 	narrowPlan, err := PlanModeChange(nativeLayout, `\.\DISPLAY1`, miMonitorGame)
 	if err != nil {
@@ -634,7 +639,7 @@ func TestWindowsNativeRestoreMovesOuterNeighboursFirstWhenTheTargetGrows(t *test
 	}
 
 	assertApplySequence(t, api, restorePlan, []string{
-		`\.\DISPLAY2`, `\.\DISPLAY8`, `\.\DISPLAY3`, `\.\DISPLAY1`,
+		`\.\DISPLAY8`, `\.\DISPLAY2`, `\.\DISPLAY3`, `\.\DISPLAY1`,
 	})
 	for i, states := range intermediate {
 		if first, second, found := overlappingPair(states); found {
@@ -735,11 +740,16 @@ func TestOrderForApplyPreservesMixedAxisAndConflictingMovementOrder(t *testing.T
 }
 
 func TestWindowsNativeSortedGrowthRollsBackInReverseApplyOrder(t *testing.T) {
+	// Two displays stand in a row to the right of the target, touching each other.
+	// Widening the target pushes both of them further right by the same delta, so
+	// the outer one has to move before the inner one: the other way round parks
+	// 640 px of the inner display inside the outer one, and Windows repacks a
+	// desktop it considers invalid.
 	nativeLayout := domain.Layout{Displays: []domain.DisplayState{
 		{DeviceName: `\.\DISPLAY1`, Mode: miMonitorNative, Position: domain.Point{}, Primary: true},
-		{DeviceName: `\.\DISPLAY2`, Mode: sideMode, Position: domain.Point{X: 2560, Y: 0}},
+		{DeviceName: `\.\DISPLAY2`, Mode: topMode, Position: domain.Point{X: 2560, Y: 0}},
+		{DeviceName: `\.\DISPLAY8`, Mode: topMode, Position: domain.Point{X: 4480, Y: 0}},
 		{DeviceName: `\.\DISPLAY3`, Mode: topMode, Position: domain.Point{X: 636, Y: -1080}},
-		{DeviceName: `\.\DISPLAY8`, Mode: topMode, Position: domain.Point{X: 2556, Y: -1080}},
 	}}
 	narrowPlan, err := PlanModeChange(nativeLayout, `\.\DISPLAY1`, miMonitorGame)
 	if err != nil {
@@ -759,8 +769,8 @@ func TestWindowsNativeSortedGrowthRollsBackInReverseApplyOrder(t *testing.T) {
 		t.Fatal("a rejected display was reported as success")
 	}
 	wantCalls := []string{
-		`\.\DISPLAY2`, `\.\DISPLAY8`, `\.\DISPLAY3`,
-		`\.\DISPLAY8`, `\.\DISPLAY2`,
+		`\.\DISPLAY8`, `\.\DISPLAY2`, `\.\DISPLAY3`,
+		`\.\DISPLAY2`, `\.\DISPLAY8`,
 	}
 	if got := appliedDeviceOrder(api); !reflect.DeepEqual(got, wantCalls) {
 		t.Fatalf("calls=%v, want apply then reverse rollback %v", got, wantCalls)

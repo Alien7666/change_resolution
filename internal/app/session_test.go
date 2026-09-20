@@ -282,13 +282,18 @@ var (
 // where a width change has to leave them. Passing the game mode therefore describes
 // the desktop the tool must produce, and passing the native mode the one it must
 // come back to.
+// fixtureLayout is the desktop at a given target width. Only the display beyond the
+// target's right edge follows that width: the two above it sit alongside the target,
+// not beyond the edge that moves, so the planner leaves them alone and so does this
+// fixture. Offsetting them here as well is what made every expectation agree with a
+// planner that dragged one row into another.
 func fixtureLayout(targetMode domain.Mode) domain.Layout {
 	offset := int32(targetMode.Width) - int32(domain.LegacySeedProfile().GameMode.Width)
 	return domain.Layout{Displays: []domain.DisplayState{
 		{DeviceName: targetDevice, Mode: targetMode, Position: domain.Point{}, Primary: true},
 		{DeviceName: rightDevice, Mode: fixtureSide, Position: domain.Point{X: 1920 + offset}},
-		{DeviceName: topRight, Mode: fixtureTop, Position: domain.Point{X: 1922 + offset, Y: -1080}},
-		{DeviceName: topLeft, Mode: fixtureTop, Position: domain.Point{X: 2 + offset, Y: -1080}},
+		{DeviceName: topRight, Mode: fixtureTop, Position: domain.Point{X: 1922, Y: -1080}},
+		{DeviceName: topLeft, Mode: fixtureTop, Position: domain.Point{X: 2, Y: -1080}},
 	}}
 }
 
@@ -1063,21 +1068,27 @@ func TestEnableClosesTheGapItWouldOtherwiseOpen(t *testing.T) {
 	if got := f.desktop(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("desktop = %+v, want %+v", got, want)
 	}
-	moved := 0
+	// Only the display beyond the target's right edge has a gap to close. The two
+	// above the target are alongside it, so moving them would be moving them for no
+	// reason -- and moving them by a rule that only looks at coordinates is how a
+	// display in one row used to be pushed into a display in another.
 	for _, display := range f.desktop().Displays {
 		was, _ := before.Find(display.DeviceName)
-		if display.DeviceName == targetDevice {
+		switch display.DeviceName {
+		case targetDevice:
 			if display.Position != (domain.Point{}) {
 				t.Fatalf("the primary target moved to %+v", display.Position)
 			}
-			continue
+		case rightDevice:
+			if display.Position == was.Position {
+				t.Fatalf("%s did not close the gap the target opened", display.DeviceName)
+			}
+		default:
+			if display.Position != was.Position {
+				t.Fatalf("%s moved from %+v to %+v with no gap to close",
+					display.DeviceName, was.Position, display.Position)
+			}
 		}
-		if display.Position != was.Position {
-			moved++
-		}
-	}
-	if moved != len(before.Displays)-1 {
-		t.Fatalf("displays moved = %d, want every display beside the target", moved)
 	}
 }
 
@@ -1125,9 +1136,10 @@ func TestEnableAbortsWithoutTouchingAnUnsafeDesktop(t *testing.T) {
 			{DeviceName: targetDevice, Mode: fixtureNative, Primary: true},
 			{DeviceName: rightDevice},
 		}},
+		// Overlapping far enough in that narrowing the target cannot separate them.
 		"displays already overlap": {Displays: []domain.DisplayState{
 			{DeviceName: targetDevice, Mode: fixtureNative, Primary: true},
-			{DeviceName: rightDevice, Mode: fixtureSide, Position: domain.Point{X: 2000}},
+			{DeviceName: rightDevice, Mode: fixtureSide, Position: domain.Point{X: 1000}},
 		}},
 	}
 	for name, desktop := range unsafeDesktops {
@@ -1475,20 +1487,21 @@ func TestEnableAppliesALargerGameModeWithoutOverlappingTheNeighbours(t *testing.
 }
 
 // A picked mode can ask for an arrangement that cannot be made safe, and this is
-// the shape that does it: a mode that grows one axis while it gives the other back
-// closes the gap the display below is standing in. The session must refuse before
+// the shape that does it: the neighbour beyond the target's edge slides inward
+// while the one below the target's band holds its place, and they close onto each
+// other. No order of calls avoids it, so the plan is refused outright. The session must refuse before
 // it tests or applies anything, keep the desktop exactly as it found it, and say
 // which two displays collided -- that message is now something a user reads.
 func TestEnableAbortsWhenALargerModeHasNoSafeArrangement(t *testing.T) {
-	original := domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
+	original := domain.Mode{Width: 2560, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
 	portrait := domain.Mode{Width: 1440, Height: 2560, RefreshHz: 60, BitsPerPixel: 32}
 	desktop := domain.Layout{Displays: []domain.DisplayState{
 		{DeviceName: targetDevice, Mode: original, Position: domain.Point{}, Primary: true},
-		{DeviceName: rightDevice, Mode: portrait, Position: domain.Point{X: 1920, Y: 0}},
-		{DeviceName: belowDevice, Mode: fixtureTop, Position: domain.Point{X: 1920, Y: 2560}},
+		{DeviceName: rightDevice, Mode: portrait, Position: domain.Point{X: 2560, Y: 0}},
+		{DeviceName: belowDevice, Mode: fixtureTop, Position: domain.Point{X: 640, Y: 1500}},
 	}}
-	wider := domain.Mode{Width: 2560, Height: 1080, RefreshHz: 120, BitsPerPixel: 32}
-	f := newFixtureWith(t, profileWithGameMode(wider), original, desktop)
+	narrower := domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32}
+	f := newFixtureWith(t, profileWithGameMode(narrower), original, desktop)
 
 	err := f.s.Enable()
 	if !errors.Is(err, display.ErrLayoutUnsafe) {
