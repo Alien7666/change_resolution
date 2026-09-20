@@ -49,6 +49,14 @@ func (f *settingsDialogFlow) Gates() settingsGates {
 		modeSelected = containsMode(f.model.monitorRows[f.model.selectedMonitor].modes, f.model.Draft().GameMode)
 	}
 	ready, reason := f.model.SaveReady()
+	// Every blocked gate carries the sentence that unblocks it. SaveReady returns an
+	// empty reason once the picker is satisfied, so a draft held back only by the
+	// process choice would otherwise disable the button and say nothing at all --
+	// the control and its explanation have to come from one place or the dialog has
+	// a dead end in it.
+	if ready && !f.processChosen {
+		reason = missingProcessChoice
+	}
 	return settingsGates{
 		Mode:    monitorSelected,
 		Process: modeSelected,
@@ -103,9 +111,6 @@ func (f *settingsDialogFlow) clearProcessChoice() {
 func (f *settingsDialogFlow) Save() error {
 	gates := f.Gates()
 	if !gates.Save {
-		if gates.Reason == "" && !f.processChosen {
-			gates.Reason = "請選擇要觀察的程序，或明確選擇只用手動切換"
-		}
 		return fmt.Errorf("設定尚未可儲存：%s", gates.Reason)
 	}
 	profile, err := f.model.validatedProfile()
@@ -333,9 +338,37 @@ func (d *settingsDialog) applyGates() {
 	d.modeGroup.SetEnabled(gates.Mode)
 	d.processGroup.SetEnabled(gates.Process)
 	d.saveButton.SetEnabled(gates.Save)
-	if !gates.Save && gates.Reason != "" && d.statusLabel.Text() == "" {
-		d.setStatus(gates.Reason)
+	// A disabled section is inert: clicks, typing and list selections all do nothing,
+	// and Walk gives no sign of why. Each section therefore states its own
+	// precondition, so the answer is beside the controls that are refusing rather
+	// than only in the status line at the bottom.
+	if tip := lockedSectionTip(gates); tip != "" {
+		_ = d.processTip.SetText(tip)
+		_ = d.processTip.SetToolTipText(tip)
 	}
+	// The label tracks the gate rather than being written once: a reason that
+	// outlives the condition it described is worse than no reason, because the user
+	// fixes what it names and watches nothing change.
+	if !gates.Save {
+		d.setStatus(gates.Reason)
+	} else if d.statusLabel.Text() == gates.Reason || isGateReason(d.statusLabel.Text()) {
+		d.setStatus("")
+	}
+}
+
+// isGateReason reports whether the status currently shows a gate's explanation, so
+// clearing it cannot swallow a message that came from somewhere else -- a failed
+// save, say, which the user still needs to read.
+func isGateReason(text string) bool {
+	if text == "" {
+		return false
+	}
+	for _, reason := range gateReasons {
+		if text == reason {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *settingsDialog) onRefresh() {
@@ -695,4 +728,22 @@ func indexOfStringFold(values []string, want string) int {
 		}
 	}
 	return -1
+}
+
+// lockedSectionTip is the sentence the process section shows while it is disabled,
+// or empty when it is usable and its own tip should stand.
+//
+// The section is disabled by SetEnabled on its container, which silently makes every
+// control inside it ignore the user. Saying nothing there is what made a selection
+// that never registered look like a bug in the list rather than an unfinished step
+// above it.
+func lockedSectionTip(gates settingsGates) string {
+	switch {
+	case !gates.Mode:
+		return "請先在上方選擇一台顯示器"
+	case !gates.Process:
+		return "請先在上方選擇顯示模式"
+	default:
+		return ""
+	}
 }

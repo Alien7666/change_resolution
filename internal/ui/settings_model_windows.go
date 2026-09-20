@@ -243,31 +243,56 @@ func (m *settingsModel) Draft() domain.Profile { return m.draft.Copy() }
 
 func (m *settingsModel) LegacyPrefilled() bool { return m.legacyPrefilled }
 
+// The sentences a blocked gate shows. They are named so the dialog can tell its own
+// gate explanations apart from a message that came from somewhere else, and so the
+// reason a control is disabled has exactly one spelling.
+const (
+	reasonCatalogueUnread   = "尚未成功讀取目前的顯示器資訊"
+	reasonNoMonitorChosen   = "請選擇目前連線的顯示器"
+	reasonMonitorChanged    = "請重新選擇目前連線的顯示器"
+	reasonMonitorNotPresent = "目前顯示配置沒有這台顯示器"
+	reasonNoModesAtAll      = "此顯示器沒有可用模式"
+	reasonNoModeChosen      = "請從目前顯示器回報的模式中選擇完整模式"
+	missingProcessChoice    = "請選擇要觀察的程序，或明確選擇只用手動切換"
+)
+
+// gateReasons is every sentence above, for the one caller that has to recognise
+// them rather than produce them.
+var gateReasons = []string{
+	reasonCatalogueUnread,
+	reasonNoMonitorChosen,
+	reasonMonitorChanged,
+	reasonMonitorNotPresent,
+	reasonNoModesAtAll,
+	reasonNoModeChosen,
+	missingProcessChoice,
+}
+
 // SaveReady reports whether the current read-only catalogue still proves that this
 // draft names one attached monitor and one exact mode it reported. This is picker
 // readiness, not a second copy of configuration-schema validation.
 func (m *settingsModel) SaveReady() (bool, string) {
 	if !m.catalogueReady {
-		return false, "尚未成功讀取目前的顯示器資訊"
+		return false, reasonCatalogueUnread
 	}
 	if m.selectedMonitor < 0 || m.selectedMonitor >= len(m.monitorRows) {
-		return false, "請選擇目前連線的顯示器"
+		return false, reasonNoMonitorChosen
 	}
 	row := m.monitorRows[m.selectedMonitor]
 	if !sameInstancePath(m.draft.Monitor.InstancePath, row.Target.Identity.InstancePath) {
-		return false, "請重新選擇目前連線的顯示器"
+		return false, reasonMonitorChanged
 	}
 	if !row.HasCurrentMode {
-		return false, "目前顯示配置沒有這台顯示器"
+		return false, reasonMonitorNotPresent
 	}
 	if len(row.modes) == 0 {
 		if row.Reason != "" {
 			return false, row.Reason
 		}
-		return false, "此顯示器沒有可用模式"
+		return false, reasonNoModesAtAll
 	}
 	if !containsMode(row.modes, m.draft.GameMode) {
-		return false, "請從目前顯示器回報的模式中選擇完整模式"
+		return false, reasonNoModeChosen
 	}
 	return true, ""
 }
