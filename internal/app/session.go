@@ -557,24 +557,6 @@ func (s *Session) readDisplayBindings(layout domain.Layout) (map[string]displayB
 	return captureDisplayBindings(layout, targets)
 }
 
-func verifyDisplayBindings(saved, current map[string]displayBinding) error {
-	if len(saved) != len(current) {
-		return fmt.Errorf("%w: the saved monitor identity set changed", display.ErrLayoutUnsafe)
-	}
-	for deviceName, expected := range saved {
-		observed, ok := current[deviceName]
-		if !ok {
-			return fmt.Errorf("%w: the saved monitor identity for %s is missing",
-				display.ErrLayoutUnsafe, deviceName)
-		}
-		if observed != expected {
-			return fmt.Errorf("%w: %s now names a different physical monitor",
-				display.ErrLayoutUnsafe, deviceName)
-		}
-	}
-	return nil
-}
-
 func verifyResolvedBinding(target domain.Target, bindings map[string]displayBinding) error {
 	expected, ok := bindings[target.DeviceName]
 	if !ok {
@@ -845,9 +827,15 @@ func (s *Session) restore(allowFallback bool) error {
 
 // restoreSaved puts the desktop back exactly as this session found it: the target's
 // saved mode and every display's saved coordinate, applied together. The target is
-// resolved again rather than taken from the saved layout, and a target that is no
-// longer part of that layout aborts the restore: the displays have been renumbered
-// under the tool, so the saved coordinates belong to an arrangement that is gone.
+// resolved again rather than taken from the saved layout.
+//
+// The saved names are re-bound to the monitors that own them before anything is
+// compared against them. A DISPLAYn is a slot, not a screen, and the tool's own NVAPI
+// writes are one of the things that can move a screen between slots -- so a restore
+// that insisted on the saved numbers refused the desktop it had itself renumbered, and
+// refused it from the toggle, the restore button and the exit alike. What has to still
+// be true is that every saved monitor is still attached, which remapSavedNames checks;
+// which number it answers to now is not the tool's business.
 func (s *Session) restoreSaved() error {
 	message := "正在恢復原始顯示模式"
 	if s.recoveryPending {
@@ -858,6 +846,29 @@ func (s *Session) restoreSaved() error {
 	if err != nil {
 		return s.fail("resolve target for restore", err)
 	}
+	// A restore moves every display in the saved arrangement, not only the target, so
+	// every one of them has to still be attached. Checking the target alone let a
+	// renumbered neighbour through, and the failure then surfaced from inside the apply
+	// naming nothing the user could act on.
+	attached, err := s.displays.CurrentLayout()
+	if err != nil {
+		return s.fail("read display layout", err)
+	}
+	bindings, err := s.readDisplayBindings(attached)
+	if err != nil {
+		return s.fail("read display identities", err)
+	}
+	// Committed before the target check below, so a retry starts from names that are
+	// already current instead of re-deriving them from the stale ones every time.
+	savedLayout, savedBindings, renamed, err := remapSavedNames(s.saved, s.savedBindings, bindings)
+	if err != nil {
+		return s.fail("plan display layout", err)
+	}
+	s.saved, s.savedBindings = savedLayout, savedBindings
+	if current, known := renamed[s.managedTargetDevice]; known {
+		s.managedTargetDevice = current
+	}
+
 	if s.managedTargetDevice == "" || target.DeviceName != s.managedTargetDevice {
 		return s.fail("plan display layout", fmt.Errorf(
 			"%w: the configured monitor moved from %s to %s while its mode was managed",
@@ -868,24 +879,9 @@ func (s *Session) restoreSaved() error {
 		return s.fail("plan display layout", fmt.Errorf("%w: the saved layout does not contain %s",
 			display.ErrLayoutUnsafe, target.DeviceName))
 	}
-	// A restore moves every display in the saved arrangement, not only the target, so
-	// every one of them has to still be attached under the name it was read as.
-	// Checking the target alone let a renumbered neighbour through, and the failure
-	// then surfaced from inside the apply naming nothing the user could act on.
-	attached, err := s.displays.CurrentLayout()
-	if err != nil {
-		return s.fail("read display layout", err)
-	}
 	if missing, gone := firstMissingDisplay(s.saved, attached); gone {
 		return s.fail("plan display layout", fmt.Errorf("%w: the saved layout's %s is no longer attached",
 			display.ErrLayoutUnsafe, missing))
-	}
-	bindings, err := s.readDisplayBindings(attached)
-	if err != nil {
-		return s.fail("read display identities", err)
-	}
-	if err := verifyDisplayBindings(s.savedBindings, bindings); err != nil {
-		return s.fail("plan display layout", err)
 	}
 	if err := verifyResolvedBinding(target, bindings); err != nil {
 		return s.fail("bind target display", err)

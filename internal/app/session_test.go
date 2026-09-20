@@ -1186,7 +1186,10 @@ func TestRestoreAbortsWhenTheSavedArrangementNoLongerFitsTheDesktop(t *testing.T
 	if !errors.Is(err, display.ErrLayoutUnsafe) {
 		t.Fatalf("Disable error = %v, want display.ErrLayoutUnsafe", err)
 	}
-	assertOperations(t, f.display.takeCalls(), "resolve")
+	// The desktop and the monitor identities are read before the saved names are
+	// judged: a restore re-binds those names to the monitors that own them first, and
+	// it cannot do that without knowing what is attached now.
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "targets")
 	if !reflect.DeepEqual(f.desktop(), applied) {
 		t.Fatal("an aborted restore changed the desktop")
 	}
@@ -1225,7 +1228,12 @@ func TestRestoreRefusesWhenTheResolvedTargetNowUsesAnotherSavedDeviceName(t *tes
 	if !errors.Is(err, display.ErrLayoutUnsafe) {
 		t.Fatalf("Disable error = %v, want display.ErrLayoutUnsafe", err)
 	}
-	assertOperations(t, f.display.takeCalls(), "resolve")
+	// Re-binding the saved names happens first and finds nothing wrong: every saved
+	// monitor is still attached under the name it had. The contradiction is between
+	// the two reads themselves -- the resolver says the configured monitor answers to
+	// the neighbour's name while the enumeration still gives that name to the
+	// neighbour -- and only the target check can catch it.
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "targets")
 	if got := f.s.Snapshot(); !got.Managed || got.State != StateError {
 		t.Fatalf("an aborted restore dropped ownership: %+v", got)
 	}
@@ -1242,7 +1250,11 @@ func TestRestoreRefusesWhenTheResolvedTargetNowUsesAnotherSavedDeviceName(t *tes
 }
 
 // The configured target can keep its DISPLAYn while two neighbours exchange theirs.
-// Device-set equality cannot detect that swap; the saved per-device identities must.
+// Device-set equality cannot detect that swap; the saved per-device identities can,
+// and they carry each neighbour's saved coordinates over to the name it answers to
+// now. Here that rebuilt arrangement is one the planner will not apply -- the two
+// monitors are not the same width, so putting each back where it was puts one of them
+// on top of the target -- and the restore is refused with the displays named.
 func TestRestoreRefusesWhenNeighboursExchangeSavedDeviceNames(t *testing.T) {
 	f := newFixture(t)
 	if err := f.s.Enable(); err != nil {
@@ -1596,6 +1608,51 @@ func (f *sessionFixture) setModes(modes ...domain.Mode) {
 	f.display.modes = modes
 }
 
+// renumberTarget is renameDisplay for the configured monitor: the resolver has to
+// agree with the enumeration, or the two reads contradict each other and the restore
+// is right to refuse for a different reason entirely.
+func (f *sessionFixture) renumberTarget(from, to string) {
+	f.renameDisplay(from, to)
+	f.display.mu.Lock()
+	defer f.display.mu.Unlock()
+	f.display.target.DeviceName = to
+}
+
+// detachDisplay models a monitor being unplugged: it leaves both the desktop and the
+// identity enumeration, so nothing the session saved for it can be put back. This is
+// the case renameDisplay is deliberately not -- a screen that is gone, rather than one
+// that is still there under another number.
+// The returned function plugs it back in exactly as it was, order included, so a test
+// can go on to prove the session still owed the restore it refused.
+func (f *sessionFixture) detachDisplay(deviceName string) (reattach func()) {
+	f.display.mu.Lock()
+	defer f.display.mu.Unlock()
+	wasLayout := f.display.layout
+	wasTargets := f.display.targets
+
+	displays := make([]domain.DisplayState, 0, len(wasLayout.Displays))
+	for _, state := range wasLayout.Displays {
+		if state.DeviceName != deviceName {
+			displays = append(displays, state)
+		}
+	}
+	targets := make([]domain.Target, 0, len(wasTargets))
+	for _, target := range wasTargets {
+		if target.DeviceName != deviceName {
+			targets = append(targets, target)
+		}
+	}
+	f.display.layout = domain.Layout{Displays: displays}
+	f.display.targets = targets
+
+	return func() {
+		f.display.mu.Lock()
+		defer f.display.mu.Unlock()
+		f.display.layout = wasLayout
+		f.display.targets = wasTargets
+	}
+}
+
 // renameDisplay models a Windows renumbering: the same screen is still attached and
 // still where it was, under a name the session has never seen.
 func (f *sessionFixture) renameDisplay(from, to string) {
@@ -1860,23 +1917,88 @@ func TestManualDisableStillWorksWithNoProcessConfigured(t *testing.T) {
 }
 
 // A restore moves every display in the saved arrangement, not only the target, so
-// every one of them has to still be attached. The target-only check let a renumbered
-// neighbour through and the failure surfaced from inside the apply, naming nothing
-// the user could act on.
-func TestRestoreNamesTheNeighbourThatIsNoLongerInTheSavedLayout(t *testing.T) {
+// every one of them has to still be attached. Attached is the whole requirement: a
+// neighbour that was renumbered is still there, still where it was, and the session
+// still owes it its saved coordinates. Refusing here instead of following the new
+// number is what left a desktop the tool's own NVAPI write had renumbered with no way
+// back -- the toggle, the restore button and the exit all ran this same comparison.
+func TestRestoreFollowsANeighbourThatWasRenumbered(t *testing.T) {
 	f := newFixture(t)
 	if err := f.s.Enable(); err != nil {
 		t.Fatal(err)
 	}
 	f.display.takeCalls()
 	f.renameDisplay(rightDevice, `\.\DISPLAY9`)
+
+	if err := f.s.Disable(); err != nil {
+		t.Fatalf("a renumbered neighbour blocked the restore: %v", err)
+	}
+	if got := f.s.Snapshot(); got.Managed || got.State != StateNative {
+		t.Fatalf("snapshot after a completed restore = %+v", got)
+	}
+
+	// The arrangement is the one Enable captured, with the renumbered neighbour holding
+	// its saved coordinates under the name it answers to now.
+	want := fixtureLayout(f.original)
+	for i := range want.Displays {
+		if want.Displays[i].DeviceName == rightDevice {
+			want.Displays[i].DeviceName = `\.\DISPLAY9`
+		}
+	}
+	if got := f.desktop(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("restored desktop = %+v, want %+v", got, want)
+	}
+}
+
+// The defect itself, at the level the user met it. An NVAPI write renumbered the
+// configured monitor while the session was managing its mode, and from then on the
+// mode toggle, the restore button and the exit all refused -- the window could not
+// even be closed, because a failed shutdown restore deliberately keeps the process
+// alive. The monitor never went anywhere; only its number did.
+func TestRestoreFollowsTheConfiguredMonitorThroughARenumbering(t *testing.T) {
+	f := newFixture(t)
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.display.takeCalls()
+	f.renumberTarget(targetDevice, `\.\DISPLAY9`)
+
+	if err := f.s.Disable(); err != nil {
+		t.Fatalf("a renumbered target blocked the restore: %v", err)
+	}
+	if got := f.s.Snapshot(); got.Managed || got.State != StateNative {
+		t.Fatalf("snapshot after a completed restore = %+v", got)
+	}
+
+	want := fixtureLayout(f.original)
+	for i := range want.Displays {
+		if want.Displays[i].DeviceName == targetDevice {
+			want.Displays[i].DeviceName = `\.\DISPLAY9`
+		}
+	}
+	if got := f.desktop(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("restored desktop = %+v, want %+v", got, want)
+	}
+}
+
+// The refusal that survives, and the one the message has to be actionable for: a
+// monitor that is not attached at all. Its saved coordinates describe an arrangement
+// that cannot be rebuilt, so the restore stops and names it rather than applying a
+// partial desktop.
+func TestRestoreNamesTheNeighbourThatIsNoLongerAttached(t *testing.T) {
+	f := newFixture(t)
+	if err := f.s.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	f.display.takeCalls()
+	reattach := f.detachDisplay(rightDevice)
 	applied := f.desktop()
 
 	err := f.s.Disable()
 	if !errors.Is(err, display.ErrLayoutUnsafe) {
 		t.Fatalf("Disable error = %v, want display.ErrLayoutUnsafe", err)
 	}
-	assertOperations(t, f.display.takeCalls(), "resolve", "layout")
+	assertOperations(t, f.display.takeCalls(), "resolve", "layout", "targets")
 	got := f.s.Snapshot()
 	if !strings.Contains(got.Message, rightDevice) {
 		t.Fatalf("message = %q, which never names the display that is no longer attached", got.Message)
@@ -1888,8 +2010,9 @@ func TestRestoreNamesTheNeighbourThatIsNoLongerInTheSavedLayout(t *testing.T) {
 		t.Fatal("an aborted restore changed the desktop")
 	}
 
-	// The numbering comes back and so does the restore the session still owes.
-	f.renameDisplay(`\.\DISPLAY9`, rightDevice)
+	// Ownership survived the refusal, so plugging the monitor back in is all the
+	// restore the session still owes the user needs.
+	reattach()
 	if err := f.s.Disable(); err != nil {
 		t.Fatal(err)
 	}
