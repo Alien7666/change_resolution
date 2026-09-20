@@ -237,6 +237,9 @@ func (m *settingsModel) ProcessNames(query string) []string {
 	return names
 }
 
+// ProcessCount is how many processes were read, before any search narrows them.
+func (m *settingsModel) ProcessCount() int { return len(m.processNames) }
+
 func (m *settingsModel) ProcessError() error { return m.processErr }
 
 func (m *settingsModel) Draft() domain.Profile { return m.draft.Copy() }

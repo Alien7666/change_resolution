@@ -231,8 +231,11 @@ func (d *settingsDialog) create(owner walk.Form) error {
 			Margins: dec.Margins{Left: 12, Top: 12, Right: 12, Bottom: 12},
 			Spacing: 8,
 		},
-		DefaultButton: &d.saveButton,
-		CancelButton:  &d.cancelButton,
+		// No DefaultButton: walk hands Return straight to it from any field, so a
+		// dialog that reconfigures displays would save on an Enter meant for the
+		// search box. Without one, LineEdit asks for the key itself and publishes
+		// EditingFinished, which is what the search is wired to.
+		CancelButton: &d.cancelButton,
 		Children: []dec.Widget{
 			dec.TextLabel{AssignTo: &d.hintLabel, Text: hint, MinSize: dec.Size{Height: 32}},
 			dec.GroupBox{
@@ -291,7 +294,16 @@ func (d *settingsDialog) create(owner walk.Form) error {
 				Title:    "3. 自動恢復程序",
 				Layout:   dec.VBox{Margins: dec.Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 4},
 				Children: []dec.Widget{
-					dec.LineEdit{AssignTo: &d.processSearch, CueBanner: "搜尋目前執行中的程序", OnTextChanged: d.onProcessSearch},
+					dec.LineEdit{
+						AssignTo:  &d.processSearch,
+						CueBanner: "搜尋目前執行中的程序（按 Enter 或直接輸入）",
+						// Two triggers on purpose. Typing narrows the list as it goes,
+						// and Enter or leaving the field searches as well, so the box
+						// still works if the per-keystroke notification does not reach
+						// us for whatever reason.
+						OnTextChanged:     d.onProcessSearch,
+						OnEditingFinished: d.onProcessSearch,
+					},
 					dec.ListBox{AssignTo: &d.processList, Model: []string{}, MinSize: dec.Size{Height: 72}, OnCurrentIndexChanged: d.onProcessSelected},
 					dec.LineEdit{AssignTo: &d.processEdit, CueBanner: "程序檔名，例如 game.exe", OnTextChanged: d.onProcessTextChanged},
 					dec.CheckBox{AssignTo: &d.manualOnly, Text: "不觀察任何程序（只用手動切換）", OnCheckedChanged: d.onManualOnlyChanged},
@@ -519,14 +531,13 @@ func (d *settingsDialog) onCancel() {
 }
 
 func (d *settingsDialog) rebuildProcesses() {
-	d.processRows = d.flow.model.ProcessNames(d.processSearch.Text())
+	query := d.processSearch.Text()
+	d.processRows = d.flow.model.ProcessNames(query)
 	_ = d.processList.SetModel(d.processRows)
 	_ = d.processList.SetCurrentIndex(indexOfStringFold(d.processRows, d.flow.model.Draft().ProcessName))
-	if err := d.flow.model.ProcessError(); err != nil {
-		_ = d.processTip.SetText("無法讀取目前程序清單：" + err.Error() + "；仍可手動輸入")
-	} else {
-		_ = d.processTip.SetText("可從清單選擇、手動輸入，或明確選擇只用手動切換")
-	}
+	tip := processTipText(query, len(d.processRows), d.flow.model.ProcessCount(), d.flow.model.ProcessError())
+	_ = d.processTip.SetText(tip)
+	_ = d.processTip.SetToolTipText(tip)
 }
 
 func (d *settingsDialog) selectDraftModeRow() {
@@ -762,4 +773,20 @@ func lockedSectionTip(gates settingsGates) string {
 	default:
 		return ""
 	}
+}
+
+// processTipText says what the list is currently showing. A search that matched
+// everything and a search box that never ran look identical on screen, so the count
+// is reported rather than left to be inferred from a list the user cannot count.
+func processTipText(query string, shown, total int, err error) string {
+	if err != nil {
+		return "無法讀取目前程序清單：" + err.Error() + "；仍可手動輸入"
+	}
+	if strings.TrimSpace(query) == "" {
+		return fmt.Sprintf("目前執行中的程序共 %d 個，可從清單選擇、手動輸入，或明確選擇只用手動切換", total)
+	}
+	if shown == 0 {
+		return fmt.Sprintf("沒有程序符合「%s」（共 %d 個執行中）；仍可手動輸入完整檔名", query, total)
+	}
+	return fmt.Sprintf("符合「%s」的有 %d / %d 個", query, shown, total)
 }

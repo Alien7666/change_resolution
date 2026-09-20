@@ -397,3 +397,43 @@ func TestReopeningAManualOnlyProfileKeepsItSettled(t *testing.T) {
 		t.Fatal("a saved profile that watches nothing reopened as an unfinished step")
 	}
 }
+
+// A search that matched everything and a search box that never ran look the same on
+// screen. The tip reports the count so the difference is visible.
+func TestTheProcessTipReportsWhatTheFilterDid(t *testing.T) {
+	tests := map[string]struct {
+		query string
+		shown int
+		total int
+		err   error
+		want  string
+	}{
+		"no query": {
+			query: "", shown: 42, total: 42,
+			want: "目前執行中的程序共 42 個，可從清單選擇、手動輸入，或明確選擇只用手動切換",
+		},
+		"narrowed": {
+			query: "notepad", shown: 2, total: 42,
+			want: "符合「notepad」的有 2 / 42 個",
+		},
+		"matched everything": {
+			query: "e", shown: 42, total: 42,
+			want: "符合「e」的有 42 / 42 個",
+		},
+		"matched nothing": {
+			query: "zzz", shown: 0, total: 42,
+			want: "沒有程序符合「zzz」（共 42 個執行中）；仍可手動輸入完整檔名",
+		},
+		"listing failed": {
+			query: "notepad", shown: 0, total: 0, err: errors.New("存取被拒"),
+			want: "無法讀取目前程序清單：存取被拒；仍可手動輸入",
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := processTipText(tt.query, tt.shown, tt.total, tt.err); got != tt.want {
+				t.Fatalf("processTipText = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
