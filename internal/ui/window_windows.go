@@ -57,20 +57,22 @@ const (
 	scalingPrefix         = "GPU 縮放："
 	scalingUnreadText     = "尚未讀取"
 	scalingUnreadablePre  = "無法讀取——"
-	scalingCyclingText    = "正在變更 GPU 縮放…"
 	scalingStaticReminder = "，與恢復後的比例不同，請確認已啟用全螢幕縮放。"
 
 	// scalingOverrideNote is permanent, and it is not a note to be replaced by a
-	// feature later. The NVIDIA control panel's 「覆寫遊戲和程式所設定的縮放模式」 has no
-	// NVAPI interface at all: this tool can neither read it nor set it, and a game is
-	// free to override the value that was just written. A button that cannot promise
-	// what the user actually wants has to say so where the button is.
-	scalingOverrideNote = "若遊戲內仍有黑邊，請到 NVIDIA 控制台勾選" +
-		"「覆寫遊戲和程式所設定的縮放模式」——這一項工具無法代為設定。"
+	// feature later. A scaling value written through NVAPI is not saved to the driver's
+	// own store, so anything that re-applies a display mode -- including this tool's own
+	// toggle -- puts the control panel's value back. That was measured: turning the mode
+	// off and on again brings the black bars back every time.
+	//
+	// It used to point at 「覆寫遊戲和程式所設定的縮放模式」 instead. That checkbox governs
+	// games overriding the scaling mode and has nothing to do with the desktop, so the
+	// sentence sent the user to a setting that could not have helped them.
+	scalingOverrideNote = "這個設定只在目前這次有效。切換顯示模式後會回到 NVIDIA " +
+		"控制台裡的值，需要時請再按一次。"
 
 	scalingUnconfiguredReason = "尚未設定顯示器，無法讀取或變更 GPU 縮放。"
 	scalingUnprobedReason     = "尚未讀取 GPU 縮放設定，請按「重新整理」。"
-	scalingCycleReason        = "正在變更 GPU 縮放，請稍候。"
 	scalingRecoveryReason     = "顯示配置仍待恢復；請先恢復原始顯示模式，再變更 GPU 縮放。"
 
 	scalingApplyOperation   = "變更 GPU 縮放"
@@ -1052,16 +1054,9 @@ type controls struct {
 // deliberate contrast and stays disabled while managed, because a profile change voids
 // what the saved arrangement means while a scaling change only threatens the device
 // names inside it, which the cycle re-derives.
-//
-// While the cycle itself runs, every mutating control is off, its own button included.
-// opMu already guarantees correctness -- a second click merely queues -- but a queued
-// command against a desktop that is mid-change is not something to offer. Refresh and
-// 開啟設定檔所在資料夾 are reads; hide and show change nothing on the desktop. Exit
-// starts a shutdown workflow and is therefore mutating, so it is off too.
 func (w *window) availableControls(snapshot app.Snapshot) controls {
 	configured := w.configState == configStateConfigured
-	cycling := snapshot.State == app.StateScalingCycle
-	idle := !w.busy && !cycling
+	idle := !w.busy
 	interactive := configured && w.unavailableReason == "" && idle
 	applicable := interactive && !snapshot.RecoveryPending
 	scalable := configured && w.scalingUnavailableReason == "" && idle
@@ -1337,10 +1332,6 @@ func stateText(snapshot app.Snapshot) string {
 		return watchedProcess(snapshot) + " 已結束，等待恢復顯示模式"
 	case app.StateRestoring:
 		return "正在恢復顯示模式"
-	case app.StateScalingCycle:
-		// The session names the phase in Message for the whole of the cycle, so this
-		// is only the sentence a snapshot without one would get.
-		return scalingCyclingText
 	case app.StateError:
 		return "發生錯誤"
 	default:
@@ -1353,12 +1344,6 @@ func stateText(snapshot app.Snapshot) string {
 // true. Outside it the line is the read-back and only the read-back: a value the tool
 // asked for is not a value the driver stored, which was measured rather than assumed.
 func scalingText(snapshot app.Snapshot) string {
-	if snapshot.State == app.StateScalingCycle {
-		if message := strings.TrimSpace(snapshot.Message); message != "" {
-			return message
-		}
-		return scalingCyclingText
-	}
 	view := snapshot.Scaling
 	if view.Known {
 		return scalingPrefix + app.ScalingLabel(view.Effective)
@@ -1378,28 +1363,11 @@ func scalingButtonText(snapshot app.Snapshot) string {
 	return scalingRestoreText + "（" + app.ScalingLabel(snapshot.Scaling.Saved) + "）"
 }
 
-// scalingButtonNote is the sentence that accompanies the button: why it is off, or --
-// while the session owns a mode -- what pressing it costs. The cost is real and
-// visible, so it is stated before the press rather than explained afterwards.
+// scalingButtonNote is the sentence that accompanies the button, and today it has only
+// one thing to say: why the button is off. Pressing it no longer costs the user a trip
+// through the original arrangement and back, so there is no cost to state in advance.
 func (w *window) scalingButtonNote(snapshot app.Snapshot) string {
-	if snapshot.State == app.StateScalingCycle {
-		return scalingCycleReason
-	}
-	if w.scalingUnavailableReason != "" {
-		return w.scalingUnavailableReason
-	}
-	if snapshot.Managed {
-		return scalingManagedCostText(snapshot)
-	}
-	return ""
-}
-
-func scalingManagedCostText(snapshot app.Snapshot) string {
-	mode := snapshot.Profile.GameMode
-	if mode.Width == 0 || mode.Height == 0 {
-		return "按下後畫面會先恢復原始排列、變更縮放、再切回設定的顯示模式。"
-	}
-	return "按下後畫面會先恢復原始排列、變更縮放、再切回 " + domain.ModeLabel(mode) + "。"
+	return w.scalingUnavailableReason
 }
 
 // scalingNoteText is the block under the button: what the driver did with the last
@@ -1433,23 +1401,34 @@ func nonEmptyStrings(values ...string) []string {
 	return result
 }
 
-// scalingMismatchNote states a driver that stored something other than what was
+// scalingMismatchNote states a driver that reports something other than what was
 // written. It is not an error and is not worded as one: nothing broke and nothing needs
-// undoing. Both values are printed, because only then can the user tell which is which.
+// undoing.
+//
+// It used to say the driver had 「實際套用」 the read-back value. That was wrong, and it
+// cost hours of chasing a defect that was not there: on this hardware a set that asks
+// for full-screen scaling reads back as the aspect value while the panel is visibly
+// filled edge to edge. The read-back names what the driver has on record, and the
+// record is not the picture. The sentence now says only what was measured, and draws no
+// conclusion about black bars from it.
 func scalingMismatchNote(snapshot app.Snapshot) string {
 	view := snapshot.Scaling
 	if !view.Known || !view.RequestedKnown || view.Matched {
 		return ""
 	}
-	return "已要求「" + app.ScalingLabel(view.Requested) + "」，驅動實際套用的是「" +
-		app.ScalingLabel(view.Effective) + "」。"
+	return "已要求「" + app.ScalingLabel(view.Requested) + "」，驅動記錄的值是「" +
+		app.ScalingLabel(view.Effective) + "」。這是驅動的紀錄，不一定等於畫面實際的樣子。"
 }
 
 // scalingAspectReminder is the profile design's static "this is not your panel's shape"
-// reminder, paired with the driver setting that was read back when available. The
-// readback names a setting, not the rendered image, so a non-full-screen setting can
-// only say that black bars may appear. It never blocks the choice -- the user may want
-// the bars, or may have dealt with them elsewhere.
+// reminder, paired with the driver setting that was read back when available. It never
+// blocks the choice -- the user may want the bars, or may have dealt with them
+// elsewhere.
+//
+// What it must not do is predict the picture from the read-back. The read-back reports
+// the driver's record, and a record that says "aspect" has been observed on a panel
+// that was visibly full. So the reminder states the mode's shape and the recorded
+// setting side by side and stops there; the user can see their own screen.
 //
 // The shape it compares against is the panel's separately enumerated native mode.
 // FallbackMode cannot answer this question: it may be an explicit restore override with
@@ -1470,13 +1449,7 @@ func scalingAspectReminder(snapshot app.Snapshot) string {
 	if !snapshot.Scaling.Known {
 		return shape + scalingStaticReminder
 	}
-	effective := app.ScalingLabel(snapshot.Scaling.Effective)
-	// Compared on the geometry rather than on the raw number, and against the value
-	// this product asks for, so the display doing full-screen scaling counts too.
-	if snapshot.Scaling.Effective.Mode == app.ScalingFullScreenByGPU().Mode {
-		return shape + "，目前的 GPU 縮放是「" + effective + "」。"
-	}
-	return shape + "，而目前的 GPU 縮放是「" + effective + "」，畫面可能有黑邊。"
+	return shape + "，驅動記錄的 GPU 縮放是「" + app.ScalingLabel(snapshot.Scaling.Effective) + "」。"
 }
 
 // fitText folds a string into a fixed-width window. Wrapping is by rune count rather

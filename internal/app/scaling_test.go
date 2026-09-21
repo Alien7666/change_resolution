@@ -172,6 +172,16 @@ type task15ScalingFake struct {
 	applyResults   []task15ScalingResult
 	restoreResults []task15ScalingResult
 	calls          []task15ScalingCall
+	hook           func(string)
+}
+
+func (s *task15ScalingFake) runHook(operation string) {
+	s.mu.Lock()
+	hook := s.hook
+	s.mu.Unlock()
+	if hook != nil {
+		hook(operation)
+	}
 }
 
 var _ scaling.Controller = (*task15ScalingFake)(nil)
@@ -193,6 +203,7 @@ func (s *task15ScalingFake) Read(identity domain.MonitorIdentity) (scaling.State
 
 func (s *task15ScalingFake) Apply(identity domain.MonitorIdentity, value scaling.Value) (scaling.Outcome, error) {
 	s.recorder.record("scaling.apply")
+	s.runHook("apply")
 	result := s.nextResult("apply", identity, 0, value)
 	s.finishSet(result.outcome)
 	return result.outcome, result.err
@@ -204,6 +215,7 @@ func (s *task15ScalingFake) Restore(
 	value scaling.Value,
 ) (scaling.Outcome, error) {
 	s.recorder.record("scaling.restore")
+	s.runHook("restore")
 	result := s.nextResult("restore", identity, expectedDisplayID, value)
 	s.finishSet(result.outcome)
 	return result.outcome, result.err
@@ -604,6 +616,17 @@ func (f *scalingFixture) failAfterFirstApply(err error) {
 
 // signalOnFirstApply closes a channel the moment the cycle's first display apply
 // starts, which is how a test knows opMu is held and the cycle is under way.
+// signalOnScalingSet closes its channel as the set is entered, which is the moment the
+// session is holding opMu and a poll that came due can be proved not to interleave.
+func (f *scalingFixture) signalOnScalingSet() chan struct{} {
+	started := make(chan struct{})
+	var once sync.Once
+	f.rig.scaling.mu.Lock()
+	defer f.rig.scaling.mu.Unlock()
+	f.rig.scaling.hook = func(string) { once.Do(func() { close(started) }) }
+	return started
+}
+
 func (f *scalingFixture) signalOnFirstApply() chan struct{} {
 	started := make(chan struct{})
 	var once sync.Once
@@ -739,8 +762,11 @@ func TestEnableResolvesTheTargetAfterAnyScalingSetNotBefore(t *testing.T) {
 	}
 }
 
-// R2: leaving is the mirror of entering, so the arrangement is back before the set.
-func TestRestoreAppliesTheDisplayLayoutBeforeAnyScalingRestore(t *testing.T) {
+// The set is made where the display already is, so a scaling restore no longer takes
+// the desktop anywhere and back. What the old ordering protected against -- a saved
+// arrangement that could not be applied after a set renumbered it -- is now answered by
+// re-binding the saved names through the monitor identities captured beside them.
+func TestAScalingRestoreWhileManagedLeavesTheDisplayModeAlone(t *testing.T) {
 	f := newScalingFixture(t)
 	f.queueApplied(ScalingFullScreenByGPU())
 	if err := f.s.ApplyGPUScaling(); err != nil {
@@ -749,16 +775,26 @@ func TestRestoreAppliesTheDisplayLayoutBeforeAnyScalingRestore(t *testing.T) {
 	if err := f.s.Enable(); err != nil {
 		t.Fatal(err)
 	}
+	applied := f.desktop()
 	f.rig.recorder.take()
+	f.display.takeCalls()
 
 	f.queueRestored(f.s.scalingSaved)
 	if err := f.s.RestoreGPUScaling(); err != nil {
 		t.Fatal(err)
 	}
-	events := f.rig.recorder.take()
-	set, apply := indexOfEvent(events, "scaling.restore"), indexOfEvent(events, "display.apply")
-	if set < 0 || apply < 0 || apply > set {
-		t.Fatalf("the display restore did not precede the scaling restore: %v", events)
+
+	if applies := f.displayApplies(); applies != 0 {
+		t.Fatalf("a scaling restore changed the desktop %d times", applies)
+	}
+	if got := f.desktop(); !sameArrangement(got, applied) {
+		t.Fatalf("desktop = %+v, want the applied arrangement %+v", got, applied)
+	}
+	if !f.s.managed {
+		t.Fatal("a scaling restore gave up the display mode")
+	}
+	if f.s.scalingOwned {
+		t.Fatal("the restore button must release scaling ownership")
 	}
 }
 
@@ -1005,12 +1041,18 @@ func TestSnapshotDeviceNameIsRefreshedAfterAScalingSet(t *testing.T) {
 	}
 }
 
-// R5, happy path.
-func TestScalingWhileManagedRestoresThenSetsThenReappliesInThatOrder(t *testing.T) {
+// The happy path, and the reason the cycle went away. The value this button asks for
+// is "scale the source up to the panel's native resolution", and at the native
+// resolution there is no source to scale: a driver handed it there answers with the
+// aspect-preserving value and the desktop keeps its black bars. The old cycle restored
+// the original arrangement before the set, which put every set at exactly that useless
+// place. Measured on the hardware -- the same call at 1440x1080 fills the panel.
+func TestScalingWhileManagedSetsInPlaceWithoutTouchingTheDisplay(t *testing.T) {
 	f := newScalingFixture(t)
 	if err := f.s.Enable(); err != nil {
 		t.Fatal(err)
 	}
+	applied := f.desktop()
 	f.rig.recorder.take()
 	f.display.takeCalls()
 
@@ -1018,15 +1060,19 @@ func TestScalingWhileManagedRestoresThenSetsThenReappliesInThatOrder(t *testing.
 	if err := f.s.ApplyGPUScaling(); err != nil {
 		t.Fatal(err)
 	}
-	got := withoutEvents(f.rig.recorder.take(), "scaling.probe")
-	if want := cycleEvents("scaling.apply"); !reflect.DeepEqual(got, want) {
-		t.Fatalf("events = %v, want %v", got, want)
+
+	events := withoutEvents(f.rig.recorder.take(), "scaling.probe")
+	if len(events) == 0 || events[0] != "scaling.apply" {
+		t.Fatalf("events = %v, want the set first with no display work before it", events)
 	}
-	if applies := f.displayApplies(); applies != 2 {
-		t.Fatalf("the desktop changed %d times, want restore + re-apply", applies)
+	if applies := f.displayApplies(); applies != 0 {
+		t.Fatalf("the desktop changed %d times, want none", applies)
+	}
+	if got := f.desktop(); !sameArrangement(got, applied) {
+		t.Fatalf("desktop = %+v, want the applied arrangement %+v", got, applied)
 	}
 	if !f.s.scalingOwned || !f.s.managed {
-		t.Fatalf("cycle end: scalingOwned=%v managed=%v", f.s.scalingOwned, f.s.managed)
+		t.Fatalf("after the set: scalingOwned=%v managed=%v", f.s.scalingOwned, f.s.managed)
 	}
 	if snapshot := f.s.Snapshot(); !snapshot.Managed || !snapshot.AtGameMode ||
 		snapshot.State != StateWaitingForGame || snapshot.Err != nil {
@@ -1034,82 +1080,75 @@ func TestScalingWhileManagedRestoresThenSetsThenReappliesInThatOrder(t *testing.
 	}
 }
 
-// R5 step 4 is a redo, not a reuse -- and this is the path that makes R1 non-vacuous.
-func TestTheCycleReresolvesTheTargetAndLayoutAfterTheScalingSet(t *testing.T) {
+// A set may hand every screen a different device name, so the name the window is
+// showing has to be read again afterwards. This is the one piece of the old cycle that
+// was never about giving up the mode, and it stays.
+func TestTheTargetIsResolvedAgainAfterTheScalingSet(t *testing.T) {
 	f := newScalingFixture(t)
 	if err := f.s.Enable(); err != nil {
 		t.Fatal(err)
 	}
 	targetBefore := f.rig.currentTargetName()
-	layoutBefore := f.desktop()
 	f.rig.recorder.take()
-	f.display.takeCalls()
 
 	f.queueApplied(ScalingFullScreenByGPU())
 	if err := f.s.ApplyGPUScaling(); err != nil {
 		t.Fatal(err)
 	}
+
 	events := f.rig.recorder.take()
 	set := indexOfEvent(events, "scaling.apply")
 	if set < 0 {
 		t.Fatalf("no set recorded: %v", events)
 	}
-	if lastIndexOfEvent(events, "display.resolve") < set || lastIndexOfEvent(events, "display.layout") < set {
-		t.Fatalf("neither the target nor the layout was read again after the set: %v", events)
+	if lastIndexOfEvent(events, "display.resolve") < set {
+		t.Fatalf("the target was not resolved again after the set: %v", events)
 	}
-
-	calls := f.display.takeCalls()
-	if len(calls) != 10 {
-		t.Fatalf("calls = %d: %+v", len(calls), calls)
+	renamed := f.rig.currentTargetName()
+	if renamed == targetBefore {
+		t.Fatal("the fake did not renumber the target, so this proves nothing")
 	}
-	for _, call := range calls[5:] {
-		if call.operation == "test" && call.target.DeviceName == targetBefore {
-			t.Fatalf("the re-apply reused the pre-set target %s", targetBefore)
-		}
-		if call.operation != "apply" {
-			continue
-		}
-		for _, change := range call.plan.Changes {
-			if _, stale := layoutBefore.Find(change.DeviceName); stale {
-				t.Fatalf("the re-apply reused the pre-set layout name %s", change.DeviceName)
-			}
-		}
+	if got := f.s.Snapshot(); got.Target.DeviceName != renamed {
+		t.Fatalf("snapshot target = %s, want the post-set name %s", got.Target.DeviceName, renamed)
 	}
 }
 
-func TestTheCycleRebuildsSavedFromTheFreshLayoutNotTheConsumedOne(t *testing.T) {
+// saved keeps the names it was captured under, and nothing rewrites it when a set
+// renumbers the desktop underneath. That is only safe because restoreSaved re-binds
+// those names through the identities captured beside them -- which is exactly what
+// lets the set happen in place instead of at the native mode where it does nothing.
+func TestSavedNamesSurviveAScalingSetThroughTheIdentityRemap(t *testing.T) {
 	f := newScalingFixture(t)
 	original := f.desktop()
 	if err := f.s.Enable(); err != nil {
 		t.Fatal(err)
 	}
-	consumed := f.s.saved
+	captured := f.s.saved
+	nameBefore := f.rig.currentTargetName()
 
 	f.queueApplied(ScalingFullScreenByGPU())
 	if err := f.s.ApplyGPUScaling(); err != nil {
 		t.Fatal(err)
 	}
-	rebuilt := f.s.saved
-	if len(rebuilt.Displays) != len(consumed.Displays) {
-		t.Fatalf("saved = %+v, want %d displays", rebuilt, len(consumed.Displays))
-	}
-	for _, state := range rebuilt.Displays {
-		if _, stale := consumed.Find(state.DeviceName); stale {
-			t.Fatalf("saved still carries the pre-set name %s", state.DeviceName)
+
+	for _, state := range f.s.saved.Displays {
+		if _, kept := captured.Find(state.DeviceName); !kept {
+			t.Fatalf("saved was rewritten to %+v; it should still carry %+v", f.s.saved, captured)
 		}
 	}
-	if !sameArrangement(rebuilt, original) {
-		t.Fatalf("saved = %+v, want the arrangement the session started from %+v", rebuilt, original)
+	if f.rig.currentTargetName() == nameBefore {
+		t.Fatal("the fake did not renumber the desktop, so this proves nothing")
 	}
+
 	if err := f.s.Disable(); err != nil {
-		t.Fatalf("the rebuilt saved layout could not be restored: %v", err)
+		t.Fatalf("the renumbered desktop could not be restored: %v", err)
 	}
 	if got := f.desktop(); !sameArrangement(got, original) {
 		t.Fatalf("restored desktop = %+v, want %+v", got, original)
 	}
 }
 
-func TestTheScalingRestoreButtonRunsTheSameCycleAsTheApplyButton(t *testing.T) {
+func TestTheScalingRestoreButtonTakesTheSamePathAsTheApplyButton(t *testing.T) {
 	f := newScalingFixture(t)
 	f.queueApplied(ScalingFullScreenByGPU())
 	if err := f.s.ApplyGPUScaling(); err != nil {
@@ -1125,70 +1164,30 @@ func TestTheScalingRestoreButtonRunsTheSameCycleAsTheApplyButton(t *testing.T) {
 	if err := f.s.RestoreGPUScaling(); err != nil {
 		t.Fatal(err)
 	}
-	got := withoutEvents(f.rig.recorder.take(), "scaling.probe")
-	if want := cycleEvents("scaling.restore"); !reflect.DeepEqual(got, want) {
-		t.Fatalf("events = %v, want %v", got, want)
+
+	events := withoutEvents(f.rig.recorder.take(), "scaling.probe")
+	if len(events) == 0 || events[0] != "scaling.restore" {
+		t.Fatalf("events = %v, want the set first with no display work before it", events)
 	}
-	if applies := f.displayApplies(); applies != 2 {
-		t.Fatalf("the desktop changed %d times, want restore + re-apply", applies)
+	if applies := f.displayApplies(); applies != 0 {
+		t.Fatalf("the desktop changed %d times, want none", applies)
 	}
 	if f.s.scalingOwned {
 		t.Fatal("the restore button must release scaling ownership")
 	}
 	if !f.s.managed {
-		t.Fatal("the cycle must end owning the mode again")
+		t.Fatal("a scaling restore must not give up the display mode")
 	}
 }
 
-// Failure point 1: the display restore fails, so nothing may reach NVAPI at all.
-func TestACycleWhoseDisplayRestoreFailsNeverReachesNVAPI(t *testing.T) {
+// A failed set used to cost the user the mode they had applied, because the cycle gave
+// it up before it ever called NVAPI. In place, a failure costs nothing but the failure.
+func TestAFailedScalingSetLeavesTheDisplayModeAndOwnershipAlone(t *testing.T) {
 	f := newScalingFixture(t)
 	if err := f.s.Enable(); err != nil {
 		t.Fatal(err)
 	}
-	savedBefore := f.s.saved
-	watchers := f.clock.count()
-	failure := errors.New("display restore failed")
-	f.display.setFailure("apply", failure)
-	f.rig.recorder.take()
-	f.rig.scaling.takeCalls()
-
-	if err := f.s.ApplyGPUScaling(); !errors.Is(err, failure) {
-		t.Fatalf("error = %v", err)
-	}
-	requireNoScalingEvent(t, f.rig.recorder.take())
-	if calls := f.rig.scaling.takeCalls(); len(calls) != 0 {
-		t.Fatalf("scaling calls = %+v", calls)
-	}
-	if !f.s.managed || !reflect.DeepEqual(f.s.saved, savedBefore) {
-		t.Fatalf("ownership was not kept for a retry: managed=%v saved=%+v", f.s.managed, f.s.saved)
-	}
-	if f.s.scalingOwned {
-		t.Fatal("scaling ownership changed on a path that never called NVAPI")
-	}
-	if f.clock.count() != watchers+1 {
-		t.Fatalf("watchers = %d, want the stopped one put back", f.clock.count())
-	}
-	got := f.s.Snapshot()
-	if got.State != StateError || !got.Managed {
-		t.Fatalf("snapshot = %+v", got)
-	}
-	if !strings.Contains(got.Message, "GPU 縮放未變更") {
-		t.Fatalf("the message does not say scaling was untouched: %q", got.Message)
-	}
-	f.display.setFailure("apply", nil)
-	if err := f.s.Disable(); err != nil {
-		t.Fatalf("the toggle was not usable afterwards: %v", err)
-	}
-}
-
-// Failure point 2: the set fails, so the user is left on the restored arrangement.
-func TestACycleWhoseScalingSetFailsLeavesTheDesktopRestoredAndUnowned(t *testing.T) {
-	f := newScalingFixture(t)
-	original := f.desktop()
-	if err := f.s.Enable(); err != nil {
-		t.Fatal(err)
-	}
+	applied := f.desktop()
 	f.display.takeCalls()
 	f.rig.scaling.takeCalls()
 	failure := errors.New("NVAPI set failed")
@@ -1197,121 +1196,35 @@ func TestACycleWhoseScalingSetFailsLeavesTheDesktopRestoredAndUnowned(t *testing
 	if err := f.s.ApplyGPUScaling(); !errors.Is(err, failure) {
 		t.Fatalf("error = %v", err)
 	}
-	if applies := f.displayApplies(); applies != 1 {
-		t.Fatalf("display applies = %d, want only the restore", applies)
+	if applies := f.displayApplies(); applies != 0 {
+		t.Fatalf("display applies = %d, want none", applies)
 	}
 	calls := f.rig.scaling.takeCalls()
 	if len(calls) != 1 || calls[0].operation != "apply" {
 		t.Fatalf("scaling calls = %+v, want exactly one set", calls)
 	}
-	if f.s.managed || len(f.s.saved.Displays) != 0 {
-		t.Fatalf("display ownership was not released: managed=%v saved=%+v", f.s.managed, f.s.saved)
+	if !f.s.managed || len(f.s.saved.Displays) == 0 {
+		t.Fatalf("a failed set gave up the display mode: managed=%v saved=%+v", f.s.managed, f.s.saved)
 	}
 	if f.s.scalingOwned {
 		t.Fatal("a failed set must not take scaling ownership")
 	}
-	if got := f.desktop(); !sameArrangement(got, original) {
-		t.Fatalf("desktop = %+v, want the original arrangement %+v", got, original)
+	if got := f.desktop(); !sameArrangement(got, applied) {
+		t.Fatalf("desktop = %+v, want the applied arrangement %+v", got, applied)
 	}
-	if got := f.s.Snapshot(); got.State != StateError || got.Managed {
+	if got := f.s.Snapshot(); got.State != StateError {
 		t.Fatalf("snapshot = %+v", got)
 	}
-	if err := f.s.Enable(); err != nil {
+	if err := f.s.Disable(); err != nil {
 		t.Fatalf("the toggle was not usable afterwards: %v", err)
 	}
 }
 
-// Failure point 3: the write happened and the mode did not, and neither is faked.
-func TestACycleWhoseReapplyFailsKeepsTheScalingResultAndOwnsNoDisplayMode(t *testing.T) {
-	f := newScalingFixture(t)
-	original := f.desktop()
-	if err := f.s.Enable(); err != nil {
-		t.Fatal(err)
-	}
-	f.display.takeCalls()
-	previous := f.rig.scaling.currentState()
-	failure := errors.New("re-apply failed")
-	f.failAfterFirstApply(failure)
-	f.queueApplied(ScalingFullScreenByGPU())
-
-	if err := f.s.ApplyGPUScaling(); !errors.Is(err, failure) {
-		t.Fatalf("error = %v", err)
-	}
-	if !f.s.scalingOwned {
-		t.Fatal("the write that really happened was rolled back")
-	}
-	if f.s.scalingSaved != previous.Effective || f.s.scalingID != previous.DisplayID {
-		t.Fatalf("booked saved=%+v id=%d, want %+v / %d",
-			f.s.scalingSaved, f.s.scalingID, previous.Effective, previous.DisplayID)
-	}
-	if f.s.managed || len(f.s.saved.Displays) != 0 {
-		t.Fatalf("half ownership was taken: managed=%v saved=%+v", f.s.managed, f.s.saved)
-	}
-	if applies := f.displayApplies(); applies != 1 {
-		t.Fatalf("display applies = %d, want only the restore", applies)
-	}
-	if got := f.desktop(); !sameArrangement(got, original) {
-		t.Fatalf("desktop = %+v, want the original arrangement %+v", got, original)
-	}
-	got := f.s.Snapshot()
-	if got.State != StateError || got.Managed || !got.Scaling.Owned {
-		t.Fatalf("snapshot = %+v", got)
-	}
-	if !strings.Contains(got.Message, "GPU 縮放已變更") || !strings.Contains(got.Message, "重新套用") {
-		t.Fatalf("the message does not state both halves: %q", got.Message)
-	}
-	f.display.setFailure("test", nil)
-	if err := f.s.Enable(); err != nil {
-		t.Fatalf("the retry is an ordinary Enable and it failed: %v", err)
-	}
-}
-
-func TestACycleReapplyWithUncertainWritesKeepsExactDisplayRecovery(t *testing.T) {
-	f := newScalingFixture(t)
-	original := f.desktop()
-	if err := f.s.Enable(); err != nil {
-		t.Fatal(err)
-	}
-
-	f.display.mu.Lock()
-	f.display.hook = func(operation string) {
-		if operation != "apply" {
-			return
-		}
-		f.display.mu.Lock()
-		f.display.fail["apply"] = display.ErrLayoutNotVerified
-		f.display.applyBeforeError = true
-		f.display.hook = nil
-		f.display.mu.Unlock()
-	}
-	f.display.mu.Unlock()
-	f.queueApplied(ScalingFullScreenByGPU())
-
-	if err := f.s.ApplyGPUScaling(); !errors.Is(err, display.ErrLayoutNotVerified) {
-		t.Fatalf("ApplyGPUScaling error = %v", err)
-	}
-	got := f.s.Snapshot()
-	if got.Managed || got.AtGameMode || !got.RecoveryPending || !got.Scaling.Owned {
-		t.Fatalf("cycle snapshot = %+v", got)
-	}
-	if sameArrangement(f.desktop(), original) {
-		t.Fatal("fake did not retain the uncertain re-apply desktop")
-	}
-
-	f.display.setFailure("apply", nil)
-	f.display.applyBeforeError = false
-	if err := f.s.Disable(); err != nil {
-		t.Fatalf("display recovery: %v", err)
-	}
-	if got := f.desktop(); !sameArrangement(got, original) {
-		t.Fatalf("recovered desktop = %+v, want arrangement %+v", got, original)
-	}
-}
-
 // The generation counter, not the managed check, is what stops the poll: by the time it
-// reaches the gate the cycle has finished and s.managed is true again, so only the
-// generation can refuse it. A third desktop change would be that refusal missing.
-func TestTheWatcherCannotRestoreWhileTheCycleIsRunning(t *testing.T) {
+// reaches the gate the set has finished and s.managed was never false anyway, so only
+// the generation can refuse it. A desktop change of any kind would be that refusal
+// missing -- a scaling set writes no display mode at all.
+func TestTheWatcherCannotRestoreWhileAScalingSetIsRunning(t *testing.T) {
 	f := newScalingFixture(t)
 	if err := f.s.Enable(); err != nil {
 		t.Fatal(err)
@@ -1322,14 +1235,14 @@ func TestTheWatcherCannotRestoreWhileTheCycleIsRunning(t *testing.T) {
 		t.Fatalf("snapshot = %+v", got)
 	}
 
-	// Wake the poll that comes due mid-cycle. It blocks inside the process check until
-	// the cycle is already holding opMu, which is the "already waiting at the gate"
-	// case the generation check exists for.
+	// Wake the poll that comes due mid-set. It blocks inside the process check until the
+	// set is already holding opMu, which is the "already waiting at the gate" case the
+	// generation check exists for.
 	f.clock.tick(0, time.Unix(200, 0))
 	if name := waitValue(t, f.checker.called); name != f.profile.ProcessName {
 		t.Fatalf("watched process = %q", name)
 	}
-	started := f.signalOnFirstApply()
+	started := f.signalOnScalingSet()
 	f.display.takeCalls()
 	f.queueApplied(ScalingFullScreenByGPU())
 
@@ -1341,8 +1254,8 @@ func TestTheWatcherCannotRestoreWhileTheCycleIsRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if applies := f.displayApplies(); applies != 2 {
-		t.Fatalf("the desktop changed %d times, want exactly restore + re-apply", applies)
+	if applies := f.displayApplies(); applies != 0 {
+		t.Fatalf("the desktop changed %d times during a scaling set", applies)
 	}
 	if !f.s.managed {
 		t.Fatal("the pending restore fired and took the mode away")
@@ -1354,20 +1267,16 @@ func TestTheWatcherCannotRestoreWhileTheCycleIsRunning(t *testing.T) {
 		t.Fatal("the stopped watcher was not joined")
 	}
 	if f.clock.count() != 2 {
-		t.Fatalf("watchers = %d, want the cycle to have re-armed exactly one", f.clock.count())
+		t.Fatalf("watchers = %d, want the set to have re-armed exactly one", f.clock.count())
 	}
 }
 
-func TestAGameThatEndsDuringTheCycleStillRestoresOnAFullDelayAfterwards(t *testing.T) {
-	// The negative that makes the mechanism visible: a replacement tracker inherits the
-	// seen flag and nothing else. A carried-over countdown would restore seconds after
-	// the user asked to be back in the game mode, and a carried-over fired would never
-	// arm again at all.
-	seeded := newGameTracker(3*time.Second, true)
-	if !seeded.seen || seeded.missing || !seeded.missingAt.IsZero() || seeded.fired {
-		t.Fatalf("seeded tracker = %+v", *seeded)
-	}
-
+// A scaling set stops the watcher and starts a new one, so an observation made while
+// it ran is discarded along with the tracker that made it. The seen flag is session
+// state and survives; the countdown is the tracker's and does not. A carried-over
+// countdown would restore the desktop seconds after the user asked to stay in the game
+// mode, which is why the delay that follows has to be a full-length one.
+func TestAGameThatEndsDuringAScalingSetStillRestoresOnAFullDelayAfterwards(t *testing.T) {
 	f := newScalingFixture(t)
 	if err := f.s.Enable(); err != nil {
 		t.Fatal(err)
@@ -1379,27 +1288,27 @@ func TestAGameThatEndsDuringTheCycleStillRestoresOnAFullDelayAfterwards(t *testi
 
 	f.clock.tick(0, time.Unix(200, 0))
 	waitValue(t, f.checker.called)
-	started := f.signalOnFirstApply()
+	started := f.signalOnScalingSet()
 	f.queueApplied(ScalingFullScreenByGPU())
 	done := make(chan error, 1)
 	go func() { done <- f.s.ApplyGPUScaling() }()
 	waitValue(t, started)
-	// The game ends during the cycle. This observation is discarded, countdown and all.
+	// The game ends during the set. This observation is discarded, countdown and all.
 	f.checker.results <- processResult{}
 	if err := waitValue(t, done); err != nil {
 		t.Fatal(err)
 	}
 	if !f.s.gameSeen {
-		t.Fatal("the cycle dropped the seen flag")
+		t.Fatal("the set dropped the seen flag")
 	}
 	if f.clock.count() != 2 {
 		t.Fatalf("watchers = %d", f.clock.count())
 	}
 
-	// The first post-cycle poll that finds the process absent opens a full delay from
-	// that instant, not from anything that happened before the cycle.
+	// The first poll after the set that finds the process absent opens a full delay from
+	// that instant, not from anything that happened before it.
 	if got := f.poll(t, 1, 300, processResult{}); got.State != StateRestorePending {
-		t.Fatalf("the seeded tracker did not arm: %+v", got)
+		t.Fatalf("the replacement tracker did not arm: %+v", got)
 	}
 	f.display.takeCalls()
 	if got := f.poll(t, 1, 302, processResult{}); got.State != StateRestorePending {

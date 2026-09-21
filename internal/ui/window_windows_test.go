@@ -934,7 +934,6 @@ func TestStateTextCoversEveryState(t *testing.T) {
 	states := []app.State{
 		app.StateNative, app.StateApplying, app.StateManualOnly, app.StateWaitingForGame,
 		app.StateGameRunning, app.StateRestorePending, app.StateRestoring, app.StateError,
-		app.StateScalingCycle,
 	}
 	for _, state := range states {
 		snapshot := widescreenSnapshot()
@@ -1000,15 +999,7 @@ func TestNoRenderedStringCarriesTheSeedHardware(t *testing.T) {
 	rendered["scalingNote"] = scalingNoteText(scaled)
 	rendered["scalingReminder"] = scalingAspectReminder(scaled)
 	rendered["scalingMismatch"] = scalingMismatchNote(scaled)
-	rendered["scalingCost"] = scalingManagedCostText(scaled)
 	rendered["scalingExit"] = exitScalingWarning(scaled.Scaling)
-	cycling := scaled
-	cycling.State, cycling.Message = app.StateScalingCycle, "正在變更 GPU 縮放：寫入縮放設定…"
-	rendered["scalingCycleRow"] = scalingText(cycling)
-	cycleWindow := &window{}
-	cycleWindow.updateScalingAvailability(cycling)
-	rendered["scalingCycleBeside"] = cycleWindow.scalingButtonNote(cycling)
-	rendered["scalingCycleAdvice"] = cycleWindow.scalingAdviceText(cycling)
 	for name, view := range map[string]app.ScalingSnapshot{
 		"scalingLatch:vendor":   {Reason: "偵測到 AMD Radeon RX 7800 XT，這個功能只支援 NVIDIA。"},
 		"scalingLatch:unprobed": {},
@@ -1031,7 +1022,6 @@ func TestNoRenderedStringCarriesTheSeedHardware(t *testing.T) {
 	for _, state := range []app.State{
 		app.StateNative, app.StateApplying, app.StateManualOnly, app.StateWaitingForGame,
 		app.StateGameRunning, app.StateRestorePending, app.StateRestoring, app.StateError,
-		app.StateScalingCycle,
 	} {
 		stated := snapshot
 		stated.State = state
@@ -1262,9 +1252,10 @@ func TestAMismatchedReadBackIsShownAsBothValuesAndIsNotAnError(t *testing.T) {
 }
 
 // The profile design promised a static reminder. With a read path it is paired with
-// the driver's setting, without treating that setting as proof of the rendered image;
-// the honesty line about the one checkbox NVAPI does not expose sits beside it
-// permanently rather than as a note to fix later.
+// the driver's setting -- and stops there. Treating that setting as proof of the
+// rendered image is exactly what this stopped doing: on this hardware a full-screen set
+// reads back as the aspect value while the panel is visibly full, so any sentence
+// predicting black bars from the read-back is a guess dressed as a measurement.
 func TestNonNativeChoiceShowsTheMeasuredScalingWarning(t *testing.T) {
 	snapshot := scalingReadySnapshot()
 
@@ -1275,8 +1266,8 @@ func TestNonNativeChoiceShowsTheMeasuredScalingWarning(t *testing.T) {
 	if want := app.ScalingLabel(scalingAspectByDisplay()); !strings.Contains(measured, want) {
 		t.Errorf("reminder %q does not print the scaling value that was read back", measured)
 	}
-	if !strings.Contains(measured, "畫面可能有黑邊") {
-		t.Errorf("reminder %q does not make black bars uncertain", measured)
+	if strings.Contains(measured, "黑邊") {
+		t.Errorf("reminder %q predicts the picture from a value that does not describe it", measured)
 	}
 
 	// Full-screen scaling is stated as a fact and nothing more. The tool cannot read
@@ -1309,8 +1300,14 @@ func TestNonNativeChoiceShowsTheMeasuredScalingWarning(t *testing.T) {
 	if !strings.Contains(note, scalingOverrideNote) {
 		t.Errorf("scaling note %q drops the override-checkbox line", note)
 	}
-	if !strings.Contains(scalingOverrideNote, "工具無法代為設定") {
-		t.Errorf("override line %q does not say the tool cannot set it", scalingOverrideNote)
+	// The line used to send the user to 「覆寫遊戲和程式所設定的縮放模式」, which governs games
+	// overriding scaling and could never have helped with a desktop. What is true, and
+	// was measured, is that the write does not survive a mode change.
+	if strings.Contains(scalingOverrideNote, "覆寫遊戲") {
+		t.Errorf("override line %q still points at a checkbox that cannot help", scalingOverrideNote)
+	}
+	if !strings.Contains(scalingOverrideNote, "只在目前這次有效") {
+		t.Errorf("override line %q does not say the write is not persistent", scalingOverrideNote)
 	}
 
 	// The same measurement reaches the settings dialog's 備註 column.
@@ -1323,24 +1320,33 @@ func TestNonNativeChoiceShowsTheMeasuredScalingWarning(t *testing.T) {
 	}
 }
 
-// A normalised aspect-ratio readback tells us what the driver selected, but cannot
-// prove what an unowned game's rendered image looks like on the panel.
-func TestAspectRatioReadBackOnlySaysBlackBarsMayAppear(t *testing.T) {
+// The read-back is the driver's record and nothing else. Raw 5 is the aspect value,
+// and it was read back on a 4:3 desktop whose 16:9 panel was filled edge to edge -- so
+// neither surface may turn it into a statement about black bars. Both still print it,
+// because what the driver has on record is worth knowing.
+func TestTheReadBackIsNeverTurnedIntoAClaimAboutThePicture(t *testing.T) {
 	view := app.ScalingSnapshot{Known: true, Effective: scaling.Value{
 		Raw: 5, Mode: scaling.ModeAspectRatio, By: scaling.ByGPU,
 	}}
 	snapshot := scalingReadySnapshot()
 	snapshot.Scaling = view
+	label := app.ScalingLabel(view.Effective)
 
 	main := scalingAspectReminder(snapshot)
-	if !strings.Contains(main, "畫面可能有黑邊") || strings.Contains(main, "畫面會有黑邊") {
-		t.Errorf("main-window reminder = %q, want an uncertain black-bar warning", main)
+	if strings.Contains(main, "黑邊") {
+		t.Errorf("main-window reminder = %q, want no claim about the picture", main)
+	}
+	if !strings.Contains(main, label) {
+		t.Errorf("main-window reminder = %q, want the recorded value %q", main, label)
 	}
 
 	row := modeRow{Width: 1920, Height: 1440, Aspect: "4:3", FullScreenScalingReminder: true}
 	settings := modeNotes(row, view)
-	if !strings.Contains(settings, "畫面可能有黑邊") || strings.Contains(settings, "畫面會有黑邊") {
-		t.Errorf("settings reminder = %q, want an uncertain black-bar warning", settings)
+	if strings.Contains(settings, "黑邊") {
+		t.Errorf("settings reminder = %q, want no claim about the picture", settings)
+	}
+	if !strings.Contains(settings, label) {
+		t.Errorf("settings reminder = %q, want the recorded value %q", settings, label)
 	}
 }
 
@@ -1389,65 +1395,6 @@ func TestScalingButtonStaysEnabledWhileTheSessionOwnsAnAppliedMode(t *testing.T)
 	owned.Scaling.Owned, owned.Scaling.Saved = true, scalingAspectByDisplay()
 	if got := w.availableControls(owned); !got.scalingRestore || got.scalingApply {
 		t.Fatalf("an owned scaling value did not switch the button to restore: %+v", got)
-	}
-}
-
-func TestScalingButtonWarnsThatTheScreensChangeModeTwiceMoreWhileManaged(t *testing.T) {
-	idle := scalingReadySnapshot()
-	w := &window{}
-	w.updateScalingAvailability(idle)
-	if got := w.scalingButtonNote(idle); got != "" {
-		t.Fatalf("an unmanaged session warned about a cycle it will not run: %q", got)
-	}
-
-	managed := idle
-	managed.State, managed.Managed, managed.AtGameMode = app.StateWaitingForGame, true, true
-	got := w.scalingButtonNote(managed)
-	for _, want := range []string{"恢復原始排列", "縮放", "再切回"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("managed warning %q does not contain %q", got, want)
-		}
-	}
-	if want := domain.ModeLabel(managed.Profile.GameMode); !strings.Contains(got, want) {
-		t.Errorf("managed warning %q does not name the mode it will put back (%q)", got, want)
-	}
-}
-
-// opMu already makes a second click merely queue. Disabling is about not offering a
-// command against a desktop that is in the middle of changing.
-func TestEveryMutatingControlIsDisabledDuringTheScalingCycle(t *testing.T) {
-	snapshot := scalingReadySnapshot()
-	snapshot.State = app.StateScalingCycle
-	snapshot.Managed, snapshot.AtGameMode = true, true
-	snapshot.Message = "正在變更 GPU 縮放：寫入縮放設定…"
-
-	w := &window{}
-	w.updateAvailability(snapshot)
-	w.updateScalingAvailability(snapshot)
-
-	got := w.availableControls(snapshot)
-	if got.toggle || got.restore || got.enable || got.settings || got.reset ||
-		got.scalingApply || got.scalingRestore || got.exit {
-		t.Fatalf("a mutating control stayed live during the cycle: %+v", got)
-	}
-	// Hiding and showing the window change nothing on the desktop and stay available.
-	if !got.show || !got.hide {
-		t.Fatalf("the cycle took away a control that changes nothing: %+v", got)
-	}
-
-	// Managed is held true for the whole cycle on purpose, so nothing flickers to the
-	// unapplied rendering at the one moment pressing it would mean nothing.
-	if !snapshot.Managed {
-		t.Fatal("fixture no longer models the masked Managed flag")
-	}
-	if got := scalingText(snapshot); !strings.Contains(got, "寫入縮放設定") {
-		t.Errorf("scaling row %q does not name the phase the cycle is on", got)
-	}
-	if got := (&window{}).statusText(snapshot); !strings.Contains(got, snapshot.Message) {
-		t.Errorf("status %q does not name the phase the cycle is on", got)
-	}
-	if got := stateText(snapshot); got == string(app.StateScalingCycle) {
-		t.Errorf("StateScalingCycle falls through to the default branch: %q", got)
 	}
 }
 

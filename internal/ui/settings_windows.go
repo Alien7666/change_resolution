@@ -765,16 +765,14 @@ func modeNotes(row modeRow, view app.ScalingSnapshot) string {
 
 // modeScalingNote is the profile design's static reminder wherever the scaling value
 // could not be read, and names the read-back setting wherever it could. It never
-// invents a value or infers whether black bars are visible from that setting.
+// invents a value, and it no longer infers anything about black bars from one: the
+// read-back reports the driver's record, and that record has been observed saying
+// "aspect" while the panel was visibly filled edge to edge.
 func modeScalingNote(view app.ScalingSnapshot) string {
 	if !view.Known {
 		return "非原生比例，請確認已使用全螢幕縮放"
 	}
-	note := "非原生比例，目前 GPU 縮放：" + app.ScalingLabel(view.Effective)
-	if view.Effective.Mode == app.ScalingFullScreenByGPU().Mode {
-		return note
-	}
-	return note + "，畫面可能有黑邊"
+	return "非原生比例，驅動記錄的 GPU 縮放：" + app.ScalingLabel(view.Effective)
 }
 
 func indexOfStringFold(values []string, want string) int {
