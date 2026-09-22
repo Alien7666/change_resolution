@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -51,12 +52,44 @@ func (diskProviderStore) Path() (string, error)       { return config.Path() }
 func (diskProviderStore) Load() (config.File, error)  { return config.Load() }
 func (diskProviderStore) Save(file config.File) error { return config.Save(file) }
 func (diskProviderStore) Backup() (string, error)     { return config.Backup() }
+
+// OpenFolder shows the configuration file's directory.
+//
+// explorer.exe's exit code is not a result. It returns 1 on a perfectly successful
+// open -- it hands the path to the already-running shell process and exits -- so
+// waiting on it reported a failure dialog every single time the folder opened
+// correctly. Whether the folder exists is a question this side can answer properly,
+// and it is the only failure a user can act on, so it is asked here instead.
 func (diskProviderStore) OpenFolder(path string) error {
-	directory := filepath.Dir(path)
-	if err := exec.Command("explorer.exe", directory).Run(); err != nil {
+	directory, err := folderToOpen(path)
+	if err != nil {
+		return err
+	}
+	command := exec.Command("explorer.exe", directory)
+	if err := command.Start(); err != nil {
 		return fmt.Errorf("開啟設定檔資料夾 %s 失敗：%w", directory, err)
 	}
+	// Reaped rather than waited on: the handle has to be released, and the status it
+	// carries has to be ignored.
+	go func() { _ = command.Wait() }()
 	return nil
+}
+
+// folderToOpen is the part of showing a folder that can be decided and tested without
+// a shell: which directory is meant, and whether it is there to be shown.
+func folderToOpen(path string) (string, error) {
+	directory := filepath.Dir(path)
+	if strings.TrimSpace(directory) == "" || directory == "." {
+		return "", fmt.Errorf("無法從 %s 決定設定檔資料夾", path)
+	}
+	info, err := os.Stat(directory)
+	if err != nil {
+		return "", fmt.Errorf("開啟設定檔資料夾 %s 失敗：%w", directory, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("開啟設定檔資料夾 %s 失敗：那不是資料夾", directory)
+	}
+	return directory, nil
 }
 
 // Provider owns the currently configured Session and the state in which there is

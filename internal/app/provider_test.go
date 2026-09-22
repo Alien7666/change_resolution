@@ -3,6 +3,8 @@ package app
 import (
 	"errors"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -818,5 +820,48 @@ func TestAFailedWatchedProcessWriteChangesNothing(t *testing.T) {
 	}
 	if got := p.Snapshot().Profile.ProcessName; got != profile.ProcessName {
 		t.Fatalf("a failed write still rewrote the snapshot: %q", got)
+	}
+}
+
+// explorer.exe returns 1 on a perfectly successful open, so its exit code was never a
+// result to report. Waiting on it put a failure dialog on screen every single time the
+// folder opened correctly. What can be decided honestly is whether the directory is
+// there, and that is the only failure the user can act on.
+func TestTheConfigFolderIsCheckedForExistenceNotForAnExitCode(t *testing.T) {
+	dir := t.TempDir()
+
+	got, err := folderToOpen(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatalf("an existing folder was refused: %v", err)
+	}
+	if got != dir {
+		t.Fatalf("folder = %q, want %q", got, dir)
+	}
+}
+
+func TestAMissingConfigFolderIsNamedInTheFailure(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "never-created")
+
+	_, err := folderToOpen(filepath.Join(missing, "config.json"))
+	if err == nil {
+		t.Fatal("a folder that is not there was reported as openable")
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Fatalf("error = %v, which never names the folder", err)
+	}
+}
+
+// A path whose parent is a file, not a directory. Handing that to the shell opens
+// whatever it feels like; the tool says what is wrong instead.
+func TestAConfigPathInsideAFileIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "not-a-folder")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := folderToOpen(filepath.Join(file, "config.json"))
+	if err == nil {
+		t.Fatal("a file standing in for a folder was accepted")
 	}
 }
