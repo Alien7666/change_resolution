@@ -156,7 +156,7 @@ func (d *watchedDialog) build() error {
 				Children: []dec.Widget{
 					dec.HSpacer{},
 					dec.PushButton{AssignTo: &save, Text: watchedSaveText, OnClicked: d.onSave},
-					dec.PushButton{AssignTo: &cancel, Text: watchedCancelText, OnClicked: d.dialog.Cancel},
+					dec.PushButton{AssignTo: &cancel, Text: watchedCancelText, OnClicked: d.onCancel},
 				},
 			},
 		},
@@ -256,6 +256,13 @@ func (d *watchedDialog) onBrowse() {
 	})
 	d.rebuild()
 }
+
+// onCancel exists rather than a direct d.dialog.Cancel in the declaration above. A
+// method value is bound where it is written, and d.dialog is still nil there -- Create
+// is what fills it in -- so binding it early captured a nil receiver and took the whole
+// process down the first time anyone pressed 取消 or closed the window. A method on d
+// is safe to bind early because d is never nil.
+func (d *watchedDialog) onCancel() { d.dialog.Cancel() }
 
 func (d *watchedDialog) onSave() {
 	name, err := watchedResult(d.edit.Text(), d.manualOnly.Checked())
