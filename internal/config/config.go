@@ -566,3 +566,11 @@ func afterLastByteLineColumn(data []byte) (line, column int) {
 	}
 	return line, column
 }
+
+// ValidateProcessName is the file schema's rule applied to one value on its own. The
+// settings dialog reaches these checks through Save, which validates the whole file,
+// but a watched process can now be changed on a live session without going through a
+// file at all -- and a name that could never match a Toolhelp entry must not reach one.
+func ValidateProcessName(name string) error {
+	return validateProcessName(strings.TrimSpace(name))
+}

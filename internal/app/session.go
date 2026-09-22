@@ -749,6 +749,77 @@ func (s *Session) ensureWatcher() {
 	s.startWatcher()
 }
 
+// ChangeWatchedProcess points this session at another executable without disturbing
+// anything else it owns. The profile names one game because that is the one the user
+// plays most; changing it used to mean the whole settings dialog, which is disabled
+// for good reason while a mode is applied -- so the only way to swap games was to give
+// the mode up, reconfigure, and apply it again.
+//
+// The display is not touched at all. The monitor and the mode stay locked because the
+// reasons they are locked have not changed: this session owns an applied arrangement
+// and a saved one to put back.
+//
+// The seen flag is dropped, and that is the whole of why this is not just an
+// assignment. gameSeen means "the watched process has been seen running", and it was
+// the previous process that was seen. Carried over, the first poll after the change
+// finds the new game absent, reads that as the game having ended, and starts counting
+// down to a restore -- while the user is still on their way to launching it.
+//
+// The caller validates the name. Provider does that against the same rules the config
+// file is held to, so a value that could never match a Toolhelp entry is refused
+// before it reaches a live session.
+func (s *Session) ChangeWatchedProcess(name string) error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	if s.recoveryPending {
+		return ErrDisplayRecoveryPending
+	}
+
+	next := strings.TrimSpace(name)
+	if next == s.profile.ProcessName {
+		// Not a restart. A restart would throw away a seen flag that is still true of
+		// this very process, and the countdown armed behind it, so pressing the button
+		// twice would silently disarm the automatic restore the user already had.
+		return nil
+	}
+
+	// Stopped and replaced inside opMu, and never joined: a watcher goroutine cannot be
+	// the caller here, but a poll already blocked on the gate must not be able to act on
+	// the old name after this returns. stopWatcher bumps the generation, which is what
+	// makes such a poll a no-op when it finally acquires opMu.
+	watcher := s.stopWatcher()
+	s.profile.ProcessName = next
+	s.gameSeen = false
+	s.ensureWatcher()
+
+	state, message := s.watchedProcessResult()
+	s.updateSnapshot(func(snapshot *Snapshot) {
+		snapshot.Profile.ProcessName = next
+		snapshot.State, snapshot.Message, snapshot.Err = state, message, nil
+	})
+	joinWatcher(watcher)
+	return nil
+}
+
+// watchedProcessResult is what the window says after the watched process changed. An
+// unmanaged session has no applied mode to describe, so it reports only the new
+// configuration; a managed one is back to waiting, because nothing has been seen yet.
+func (s *Session) watchedProcessResult() (State, string) {
+	if s.profile.ProcessName == "" {
+		if !s.managed {
+			return StateNative, "已設定為不監看任何程式，只手動切換"
+		}
+		return StateManualOnly, s.gameModeLabel() + " 已套用（未設定要監看的程式，不會自動恢復）"
+	}
+	if !s.managed {
+		return StateNative, "已改為監看 " + s.profile.ProcessName
+	}
+	return StateWaitingForGame, s.waitingMessage()
+}
+
 func (s *Session) Disable() error {
 	s.opMu.Lock()
 	if s.closed {

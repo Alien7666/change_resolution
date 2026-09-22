@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"io/fs"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -740,3 +741,82 @@ func TestFailedShutdownLeavesTheProviderRetryable(t *testing.T) {
 type stubProviderChecker struct{}
 
 func (stubProviderChecker) Running(string) (bool, error) { return false, nil }
+
+// The entry point for "I am playing something else today". It writes one field and
+// leaves the rest of the profile, and the live session, exactly as they were.
+func TestChangingTheWatchedProcessPersistsOnlyThatField(t *testing.T) {
+	profile := providerProfile("swap", `\?\DISPLAY#ONE`)
+	store := &fakeProviderStore{path: `C:\scratch\config.json`, file: config.FromProfile(profile)}
+	p := newProvider(providerDisplay(profile), stubProviderChecker{}, store)
+	defer p.Shutdown()
+	before := config.FromProfile(profile)
+
+	if err := p.ChangeWatchedProcess("  OtherGame.exe  "); err != nil {
+		t.Fatal(err)
+	}
+
+	saved := store.lastSaved()
+	if saved.Watch.ProcessName != "OtherGame.exe" {
+		t.Fatalf("saved watch.processName = %q", saved.Watch.ProcessName)
+	}
+	want := before
+	want.Watch.ProcessName = saved.Watch.ProcessName
+	if !reflect.DeepEqual(saved, want) {
+		t.Fatalf("saved config changed more than the watched process:\n got %+v\nwant %+v", saved, want)
+	}
+	if got := p.Snapshot().Profile.ProcessName; got != "OtherGame.exe" {
+		t.Fatalf("snapshot profile names %q", got)
+	}
+	if got := p.Session().profile.ProcessName; got != "OtherGame.exe" {
+		t.Fatalf("live session watches %q", got)
+	}
+}
+
+// A name that could never match a Toolhelp entry is refused before the session hears
+// about it, so nothing is written and nothing is live that would never fire.
+func TestChangingTheWatchedProcessRefusesANameThatCouldNeverMatch(t *testing.T) {
+	profile := providerProfile("swap", `\?\DISPLAY#ONE`)
+	store := &fakeProviderStore{path: `C:\scratch\config.json`, file: config.FromProfile(profile)}
+	p := newProvider(providerDisplay(profile), stubProviderChecker{}, store)
+	defer p.Shutdown()
+	saves, _ := store.counts()
+
+	err := p.ChangeWatchedProcess(`C:\Games\Other\Game.exe`)
+	if !errors.Is(err, config.ErrOutOfRange) {
+		t.Fatalf("error = %v, want config.ErrOutOfRange", err)
+	}
+	if got, _ := store.counts(); got != saves {
+		t.Fatalf("a refused name was written: %d saves, want %d", got, saves)
+	}
+	if got := p.Session().profile.ProcessName; got != profile.ProcessName {
+		t.Fatalf("a refused name reached the live session: %q", got)
+	}
+}
+
+// Nothing here is broken by a refusal, so a change the next start would forget is not
+// worth making. The file is written first and the session only hears about it once
+// that succeeded.
+func TestAFailedWatchedProcessWriteChangesNothing(t *testing.T) {
+	profile := providerProfile("swap", `\?\DISPLAY#ONE`)
+	store := &fakeProviderStore{
+		path:    `C:\scratch\config.json`,
+		file:    config.FromProfile(profile),
+		saveErr: errors.New("disk full"),
+	}
+	p := newProvider(providerDisplay(profile), stubProviderChecker{}, store)
+	defer p.Shutdown()
+
+	err := p.ChangeWatchedProcess("OtherGame.exe")
+	if err == nil {
+		t.Fatal("a failed write was reported as success")
+	}
+	if !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("error = %v, want the cause named", err)
+	}
+	if got := p.Session().profile.ProcessName; got != profile.ProcessName {
+		t.Fatalf("a failed write still reached the live session: %q", got)
+	}
+	if got := p.Snapshot().Profile.ProcessName; got != profile.ProcessName {
+		t.Fatalf("a failed write still rewrote the snapshot: %q", got)
+	}
+}

@@ -303,6 +303,81 @@ func (p *Provider) SaveAndReplace(profile domain.Profile) error {
 	return err
 }
 
+// ChangeWatchedProcess swaps the executable the live session watches and writes the
+// new name to config.json, leaving every other part of the profile and the session
+// itself alone. It is the entry point for "I am playing something else today": the
+// settings dialog cannot answer that question, because it is disabled for as long as a
+// mode is applied -- which is exactly when the question is asked.
+//
+// The name is validated first, against the same rule the file is held to. A value that
+// could never match a Toolhelp entry is refused before the session hears about it, so a
+// rejected name leaves both the session and the file exactly as they were.
+//
+// The file is written before the session is told, and a write failure leaves both
+// alone. That is the same bargain SaveAndReplace makes: nothing here is broken by a
+// refusal, so a change the next start would forget is not worth making. The session's
+// own guards are checked first, so the ordinary refusals -- a pending display recovery,
+// a closed session -- happen before anything is written.
+func (p *Provider) ChangeWatchedProcess(name string) error {
+	if err := config.ValidateProcessName(name); err != nil {
+		return err
+	}
+	next := strings.TrimSpace(name)
+
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	if p.isClosed() {
+		return ErrClosed
+	}
+	session := p.Session()
+	if session == nil {
+		return ErrClosed
+	}
+	if p.Snapshot().RecoveryPending {
+		return ErrDisplayRecoveryPending
+	}
+	if err := p.persistWatchedProcess(next); err != nil {
+		return err
+	}
+	// The file already names this process, so a failure here is the next start's
+	// answer rather than a lost choice. Session only refuses when it is closed or
+	// recovering, both of which were just checked.
+	return session.ChangeWatchedProcess(next)
+}
+
+// persistWatchedProcess writes the one field and leaves the rest of the file alone.
+// The caller holds opMu; writeMu is what keeps this from interleaving with the rebind
+// write, which edits a different field of the same file.
+func (p *Provider) persistWatchedProcess(next string) error {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
+	p.mu.Lock()
+	configured := p.state == providerConfigured
+	file := p.configFile
+	p.mu.Unlock()
+	if !configured {
+		// Nothing was loaded from a file, so there is no file to keep in step and no
+		// write to make. The session still takes the change.
+		return nil
+	}
+	if file.Watch.ProcessName == next {
+		return nil
+	}
+	file.Watch.ProcessName = next
+
+	if err := p.store.Save(file); err != nil {
+		return fmt.Errorf("無法將要監看的程式寫入設定檔，已維持原設定：%w", err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.configFile = file
+	p.configErr = nil
+	p.snapshot.Profile.ProcessName = next
+	p.snapshot.Revision++
+	return nil
+}
+
 func (p *Provider) replace(profile domain.Profile, file config.File) error {
 	old := p.Session()
 	if err := p.retireForReplacement(old, nil); err != nil {

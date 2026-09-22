@@ -78,6 +78,7 @@ const (
 	scalingApplyOperation   = "變更 GPU 縮放"
 	scalingRestoreOperation = "還原 GPU 縮放設定"
 	exitScalingOperation    = "結束前還原 GPU 縮放設定"
+	watchedChangeOperation  = "變更要監看的程式"
 
 	// restoreButtonText carries no numbers. The mode a restore applies depends on the
 	// profile and on what the monitor reports, so it is rendered into the button's
@@ -167,6 +168,7 @@ type window struct {
 	scalingOverride  *walk.TextLabel
 	settingsReason   *walk.TextLabel
 	settingsButton   *walk.PushButton
+	watchedButton    *walk.PushButton
 	refreshButton    *walk.PushButton
 	openFolderButton *walk.PushButton
 	resetButton      *walk.PushButton
@@ -281,7 +283,19 @@ func (w *window) buildMainWindow() error {
 				Text:             "套用設定的顯示模式",
 				OnCheckedChanged: w.onToggled,
 			},
-			dec.Label{AssignTo: &w.autoRestoreLabel, Text: "自動恢復：讀取中"},
+			dec.Composite{
+				Layout: dec.HBox{MarginsZero: true, Spacing: 8},
+				Children: []dec.Widget{
+					dec.Label{AssignTo: &w.autoRestoreLabel, Text: "自動恢復：讀取中"},
+					dec.HSpacer{},
+					// The settings dialog is disabled for as long as a mode is applied,
+					// and "I am playing something else today" is asked precisely then.
+					// This is the one field that is safe to change while managed, so it
+					// gets its own entry point instead of living only behind a button
+					// the user cannot press.
+					dec.PushButton{AssignTo: &w.watchedButton, Text: watchedChangeText, OnClicked: w.onChangeWatched},
+				},
+			},
 			dec.Label{AssignTo: &w.scalingLabel, Text: scalingPrefix + scalingUnreadText},
 			dec.Composite{
 				Layout: dec.HBox{MarginsZero: true, Spacing: 8},
@@ -567,6 +581,43 @@ func (w *window) onReset() {
 		w.runOperation(refreshOperation, w.refresh)
 	}
 }
+
+// watchedButtonReason explains a disabled 變更要監看的程式… button. There is only one
+// reason it can be off that the user can act on, and the action is on another button.
+func watchedButtonReason(snapshot app.Snapshot) string {
+	if snapshot.RecoveryPending {
+		return watchedLockedReason
+	}
+	return ""
+}
+
+// onChangeWatched is the whole of the feature from the window's side: read the process
+// list, ask, and hand the answer to the provider. No display state is involved, so
+// nothing here has to be ordered against the mode toggle.
+func (w *window) onChangeWatched() {
+	if w.busy {
+		return
+	}
+	snapshot := w.provider.Snapshot()
+	names, err := w.processes.Names()
+	// A list that could not be read is not a refusal. The dialog says so and still
+	// takes a typed name, which is the only thing that works when Toolhelp will not
+	// answer at all.
+	chosen, accepted, dlgErr := runWatchedDialog(w.mw, watchedList{names: names, err: err}, snapshot.Profile.ProcessName)
+	if dlgErr != nil {
+		w.reportError(watchedChangeOperation, dlgErr, snapshot)
+		return
+	}
+	if !accepted {
+		return
+	}
+	if err := w.provider.ChangeWatchedProcess(chosen); err != nil {
+		w.reportError(watchedChangeOperation, err, w.provider.Snapshot())
+		return
+	}
+	w.render(w.provider.Snapshot())
+}
+
 func (w *window) onSettings(firstRun bool) {
 	if w.busy {
 		return
@@ -1029,6 +1080,7 @@ type controls struct {
 	settings       bool
 	scalingApply   bool
 	scalingRestore bool
+	watched        bool
 	hide           bool
 	show           bool
 	exit           bool
@@ -1071,9 +1123,15 @@ func (w *window) availableControls(snapshot app.Snapshot) controls {
 			w.configState != configStateReadOnly,
 		scalingApply:   scalable && !snapshot.RecoveryPending && !snapshot.Scaling.Owned,
 		scalingRestore: scalable && !snapshot.RecoveryPending && snapshot.Scaling.Owned,
-		hide:           true,
-		show:           true,
-		exit:           idle,
+		// Deliberately not conditioned on Managed. Changing the watched process is
+		// the one profile field that is safe while a mode is applied -- it writes no
+		// display state and voids nothing the saved arrangement means -- and while
+		// managed is exactly when the user needs it. RecoveryPending still refuses:
+		// nothing may be reconfigured against a desktop the tool cannot describe.
+		watched: interactive && !snapshot.RecoveryPending,
+		hide:    true,
+		show:    true,
+		exit:    idle,
 	}
 }
 
@@ -1087,6 +1145,8 @@ func (w *window) applyEnabled(snapshot app.Snapshot) {
 	w.resetButton.SetEnabled(available.reset)
 	w.resetButton.SetVisible(w.configState == configStateReadOnly)
 	w.settingsButton.SetEnabled(available.settings)
+	w.watchedButton.SetEnabled(available.watched)
+	_ = w.watchedButton.SetToolTipText(watchedButtonReason(snapshot))
 	w.scalingButton.SetEnabled(available.scalingApply || available.scalingRestore)
 	w.hideButton.SetEnabled(available.hide)
 
