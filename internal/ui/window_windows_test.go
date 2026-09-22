@@ -359,9 +359,15 @@ func TestFirstRunSettingsUsesABlankDraftInTheSharedDialog(t *testing.T) {
 			if !model.firstRun {
 				t.Fatal("absent configuration did not open first-run mode")
 			}
+			// The watched process is seeded on every first run; what must not be
+			// inherited is the monitor and the mode of a configuration that is not
+			// there.
 			draft := model.Draft()
-			if draft.Monitor.InstancePath != "" || draft.Monitor.HardwareID != "" || draft.GameMode != (domain.Mode{}) || draft.ProcessName != "" {
+			if draft.Monitor.InstancePath != "" || draft.Monitor.HardwareID != "" || draft.GameMode != (domain.Mode{}) {
 				t.Fatalf("first-run draft inherited a configured profile: %#v", draft)
+			}
+			if draft.ProcessName != domain.LegacySeedProfile().ProcessName {
+				t.Fatalf("first-run draft process = %q, want the seed's", draft.ProcessName)
 			}
 			if replace == nil {
 				t.Fatal("shared dialog was not given Provider.Replace")

@@ -8,16 +8,39 @@
 package main
 
 import (
+	"errors"
 	"log"
 
 	"github.com/Alien7666/change_resolution/internal/app"
 	"github.com/Alien7666/change_resolution/internal/display"
 	processcheck "github.com/Alien7666/change_resolution/internal/process"
 	"github.com/Alien7666/change_resolution/internal/scaling"
+	"github.com/Alien7666/change_resolution/internal/singleton"
 	"github.com/Alien7666/change_resolution/internal/ui"
 )
 
+// singletonName is this product's name in the session's kernel namespace. It is not
+// the window title and must not be derived from one: a name a user could change would
+// stop being the same name to the copy that is already running.
+const singletonName = "ResolutionTray.SingleInstance"
+
 func main() {
+	// Before anything is constructed, and especially before anything reads the
+	// desktop. Two copies would each record an "original" arrangement to restore to,
+	// and the second one's original would be the first one's changed desktop -- so
+	// whichever exits last puts back a layout that was never the user's.
+	release, err := singleton.Acquire(singletonName)
+	if err != nil {
+		if errors.Is(err, singleton.ErrAlreadyRunning) {
+			// A tray application is usually hidden, so a silent exit looks exactly
+			// like the launcher having done nothing. Show the copy that is running.
+			singleton.ActivateExisting(ui.WindowTitle)
+			return
+		}
+		log.Fatal(err)
+	}
+	defer release()
+
 	displays := display.NewWindowsController()
 	processes := processcheck.NewToolhelpChecker()
 	// The scaling controller resolves monitor identities through the display

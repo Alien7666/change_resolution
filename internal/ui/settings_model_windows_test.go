@@ -62,9 +62,15 @@ func TestWizardStartsBlankWhenTheOriginalMonitorIsAbsent(t *testing.T) {
 		modes:   map[string][]domain.Mode{target.DeviceName: {{Width: 1920, Height: 1080, RefreshHz: 60, BitsPerPixel: 32}}},
 	})
 
+	// The watched process is seeded on every first run and is not part of what this
+	// test is about: prefillLegacy wants a particular panel running a particular mode,
+	// and neither is here, so the monitor and the mode must still be unchosen.
 	draft := model.Draft()
-	if draft.Monitor.InstancePath != "" || draft.GameMode != (domain.Mode{}) || draft.ProcessName != "" {
-		t.Fatalf("Draft() = %#v, want blank first-run selection", draft)
+	if draft.Monitor.InstancePath != "" || draft.GameMode != (domain.Mode{}) {
+		t.Fatalf("Draft() = %#v, want a blank first-run monitor and mode", draft)
+	}
+	if draft.ProcessName != domain.LegacySeedProfile().ProcessName {
+		t.Fatalf("draft process = %q, want the seed's", draft.ProcessName)
 	}
 	if model.LegacyPrefilled() {
 		t.Fatal("LegacyPrefilled() = true, want false")
@@ -494,4 +500,36 @@ type fakeSettingsLister struct {
 func (l *fakeSettingsLister) Names() ([]string, error) {
 	l.calls++
 	return append([]string(nil), l.names...), nil
+}
+
+// A first run opens with the watched process already filled in. It is a starting
+// point rather than a decision -- the monitor and the mode are still unchosen and the
+// dialog still refuses to save until they are -- but it spares the common case a trip
+// through the process list for a name that was never going to change.
+func TestAFirstRunSeedsTheWatchedProcess(t *testing.T) {
+	model := newSettingsModel(&fakeSettingsDisplay{}, &fakeSettingsLister{}, domain.Profile{}, app.ScalingSnapshot{}, true)
+
+	want := domain.LegacySeedProfile().ProcessName
+	if got := model.Draft().ProcessName; got != want {
+		t.Fatalf("draft process = %q, want the seed's %q", got, want)
+	}
+	// Seeding one field is not choosing the rest.
+	if ready, reason := model.SaveReady(); ready || reason == "" {
+		t.Fatalf("a seeded process made the draft saveable: ready=%v reason=%q", ready, reason)
+	}
+}
+
+// A profile that was loaded from a file is not a first run, and its own answer wins --
+// including the deliberate empty one that means "watch nothing, manual only".
+func TestALoadedProfileIsNeverReseeded(t *testing.T) {
+	loaded := domain.Profile{
+		Monitor:     domain.MonitorIdentity{InstancePath: `\?\DISPLAY#SOME`, Label: "kept"},
+		GameMode:    domain.Mode{Width: 1920, Height: 1440, RefreshHz: 180, BitsPerPixel: 32},
+		ProcessName: "",
+	}
+	model := newSettingsModel(&fakeSettingsDisplay{}, &fakeSettingsLister{}, loaded, app.ScalingSnapshot{}, false)
+
+	if got := model.Draft().ProcessName; got != "" {
+		t.Fatalf("draft process = %q, want the loaded profile's manual-only choice kept", got)
+	}
 }

@@ -162,18 +162,21 @@ type window struct {
 	autoRestoreLabel *walk.Label
 	statusLabel      *walk.TextLabel
 	scalingLabel     *walk.Label
-	scalingButton    *walk.PushButton
-	scalingAdvice    *walk.TextLabel
-	scalingDetails   *walk.TextLabel
-	scalingOverride  *walk.TextLabel
 	settingsReason   *walk.TextLabel
 	settingsButton   *walk.PushButton
-	watchedButton    *walk.PushButton
-	refreshButton    *walk.PushButton
-	openFolderButton *walk.PushButton
-	resetButton      *walk.PushButton
 	hideButton       *walk.PushButton
-	restoreButton    *walk.PushButton
+
+	// Menu counterparts of the commands that left the main surface. Every one of them
+	// is still reachable in one click from the menu bar, and every one of them still
+	// has a tray action of its own; these are the third copy, and the only reason
+	// there are three is that a tray application is used from three places.
+	menuRestoreAction  *walk.Action
+	menuRefreshAction  *walk.Action
+	menuScalingAction  *walk.Action
+	menuSettingsAction *walk.Action
+	menuWatchedAction  *walk.Action
+	menuOpenAction     *walk.Action
+	menuResetAction    *walk.Action
 
 	showAction     *walk.Action
 	enableAction   *walk.Action
@@ -275,6 +278,35 @@ func (w *window) buildMainWindow() error {
 			Spacing: 8,
 		},
 		OnSizeChanged: w.onSizeChanged,
+		// The main surface carries the state a person reads and the one control they
+		// reach for; everything else is a command, and commands live in the menu. The
+		// window used to stack eleven buttons and three paragraphs, which made the
+		// checkbox -- the thing the tool exists to toggle -- the hardest item to find.
+		MenuItems: []dec.MenuItem{
+			dec.Menu{
+				Text: "顯示(&D)",
+				Items: []dec.MenuItem{
+					dec.Action{AssignTo: &w.menuRestoreAction, Text: restoreButtonText, OnTriggered: w.onRestore},
+					dec.Action{AssignTo: &w.menuRefreshAction, Text: refreshText, OnTriggered: w.onRefresh},
+				},
+			},
+			dec.Menu{
+				Text: "GPU 縮放(&G)",
+				Items: []dec.MenuItem{
+					dec.Action{AssignTo: &w.menuScalingAction, Text: scalingMenuText, OnTriggered: w.onScalingMenu},
+				},
+			},
+			dec.Menu{
+				Text: "設定(&S)",
+				Items: []dec.MenuItem{
+					dec.Action{AssignTo: &w.menuSettingsAction, Text: settingsText, OnTriggered: func() { w.onSettings(false) }},
+					dec.Action{AssignTo: &w.menuWatchedAction, Text: watchedChangeText, OnTriggered: w.onChangeWatched},
+					dec.Separator{},
+					dec.Action{AssignTo: &w.menuOpenAction, Text: openConfigFolderText, OnTriggered: w.onOpenFolder},
+					dec.Action{AssignTo: &w.menuResetAction, Text: resetConfigText, OnTriggered: w.onReset},
+				},
+			},
+		},
 		Children: []dec.Widget{
 			dec.Label{AssignTo: &w.targetLabel, Text: "目標螢幕：讀取中"},
 			dec.Label{AssignTo: &w.modeLabel, Text: "目前模式：讀取中"},
@@ -283,64 +315,24 @@ func (w *window) buildMainWindow() error {
 				Text:             "套用設定的顯示模式",
 				OnCheckedChanged: w.onToggled,
 			},
-			dec.Composite{
-				Layout: dec.HBox{MarginsZero: true, Spacing: 8},
-				Children: []dec.Widget{
-					dec.Label{AssignTo: &w.autoRestoreLabel, Text: "自動恢復：讀取中"},
-					dec.HSpacer{},
-					// The settings dialog is disabled for as long as a mode is applied,
-					// and "I am playing something else today" is asked precisely then.
-					// This is the one field that is safe to change while managed, so it
-					// gets its own entry point instead of living only behind a button
-					// the user cannot press.
-					dec.PushButton{AssignTo: &w.watchedButton, Text: watchedChangeText, OnClicked: w.onChangeWatched},
-				},
-			},
+			dec.Label{AssignTo: &w.autoRestoreLabel, Text: "自動恢復：讀取中"},
 			dec.Label{AssignTo: &w.scalingLabel, Text: scalingPrefix + scalingUnreadText},
-			dec.Composite{
-				Layout: dec.HBox{MarginsZero: true, Spacing: 8},
-				Children: []dec.Widget{
-					dec.PushButton{AssignTo: &w.scalingButton, Text: scalingApplyText, OnClicked: w.onScaling},
-					dec.HSpacer{},
-				},
-			},
-			// The reason a disabled button is disabled, and the measured reminder, share
-			// one full-width label directly under the button. They are beside the button
-			// in the sense the spec means -- on screen next to it, never only in a
-			// tooltip -- and putting them in the button's own row instead would not fit:
-			// the restore caption already carries a scaling value, and an NVAPI rejection
-			// is a whole sentence. This is also the layout the spec's own sketch shows.
-			dec.TextLabel{AssignTo: &w.scalingAdvice, Text: "", MinSize: dec.Size{Height: 64}},
-			dec.TextLabel{AssignTo: &w.scalingDetails, Text: "", MinSize: dec.Size{Height: 80}},
-			dec.TextLabel{AssignTo: &w.scalingOverride, Text: scalingOverrideNote, MinSize: dec.Size{Height: 48}},
 			dec.TextLabel{
 				AssignTo: &w.statusLabel,
 				Text:     "狀態：啟動中",
 				MinSize:  dec.Size{Height: 48},
 			},
-			dec.Composite{
-				Layout: dec.HBox{MarginsZero: true, Spacing: 8},
-				Children: []dec.Widget{
-					dec.PushButton{AssignTo: &w.settingsButton, Text: settingsText, OnClicked: func() { w.onSettings(false) }},
-					dec.TextLabel{AssignTo: &w.settingsReason, Text: "", MinSize: dec.Size{Height: 24}},
-				},
-			},
-			dec.Composite{
-				Layout: dec.HBox{MarginsZero: true, Spacing: 8},
-				Children: []dec.Widget{
-					dec.PushButton{AssignTo: &w.openFolderButton, Text: openConfigFolderText, OnClicked: w.onOpenFolder},
-					dec.PushButton{AssignTo: &w.resetButton, Text: resetConfigText, OnClicked: w.onReset},
-					dec.HSpacer{},
-				},
-			},
+			// A blocked gate still explains itself on screen rather than only in a
+			// tooltip. That was defect 2: the button went grey and the sentence that
+			// would have unblocked it lived in the handler the button could not call.
+			dec.TextLabel{AssignTo: &w.settingsReason, Text: "", MinSize: dec.Size{Height: 24}},
 			dec.VSpacer{},
 			dec.Composite{
 				Layout: dec.HBox{MarginsZero: true, Spacing: 8},
 				Children: []dec.Widget{
 					dec.HSpacer{},
-					dec.PushButton{AssignTo: &w.refreshButton, Text: refreshText, OnClicked: w.onRefresh},
+					dec.PushButton{AssignTo: &w.settingsButton, Text: settingsText, OnClicked: func() { w.onSettings(false) }},
 					dec.PushButton{AssignTo: &w.hideButton, Text: hideText, OnClicked: w.onHide},
-					dec.PushButton{AssignTo: &w.restoreButton, Text: restoreButtonText, OnClicked: w.onRestore},
 				},
 			},
 		},
@@ -880,12 +872,15 @@ func (w *window) render(snapshot app.Snapshot) {
 	_ = w.statusLabel.SetText(fitText(status, reasonLineBudget, statusLineLimit))
 	_ = w.statusLabel.SetToolTipText(status)
 	w.renderScaling(snapshot)
-	_ = w.restoreButton.SetToolTipText(restoreTooltip(snapshot))
-	_ = w.refreshButton.SetText(w.refreshCaption())
+	_ = w.menuRestoreAction.SetToolTip(restoreTooltip(snapshot))
+	_ = w.menuRefreshAction.SetText(w.refreshCaption())
+	_ = w.menuScalingAction.SetToolTip(w.scalingButtonNote(snapshot))
+	_ = w.menuWatchedAction.SetToolTip(watchedButtonReason(snapshot))
 	settingsReason := settingsDisabledReason(snapshot)
 	_ = w.settingsReason.SetText(settingsReason)
 	w.settingsReason.SetVisible(settingsReason != "")
 	_ = w.settingsButton.SetToolTipText(settingsReason)
+	_ = w.menuSettingsAction.SetToolTip(settingsReason)
 
 	_ = w.enableAction.SetText(trayEnableText(snapshot))
 	_ = w.refreshAction.SetText(w.refreshCaption())
@@ -1038,32 +1033,21 @@ func unresolvedTarget(snapshot app.Snapshot) bool {
 		errors.Is(snapshot.Err, display.ErrTargetMirrored)
 }
 
+// renderScaling is now one line on the main surface. Everything the tool has to admit
+// about GPU scaling is a paragraph, and the three of them together were most of what
+// made this window unreadable; they moved, whole, into the dialog the menu opens, which
+// is where the button is too. The rule they exist for is unchanged -- the admissions
+// are beside the control, not hidden in a tooltip -- only the surface is.
 func (w *window) renderScaling(snapshot app.Snapshot) {
 	line := scalingText(snapshot)
 	_ = w.scalingLabel.SetText(fitText(line, reasonLineBudget, 1))
 	_ = w.scalingLabel.SetToolTipText(line)
-
-	_ = w.scalingButton.SetText(scalingButtonText(snapshot))
-	_ = w.scalingButton.SetToolTipText(w.scalingButtonNote(snapshot))
-
-	advice := w.scalingAdviceText(snapshot)
-	_ = w.scalingAdvice.SetText(fitText(advice, reasonLineBudget, adviceLineLimit))
-	_ = w.scalingAdvice.SetToolTipText(advice)
-	w.scalingAdvice.SetVisible(advice != "")
-
-	details := scalingDetailsText(snapshot)
-	_ = w.scalingDetails.SetText(fitText(details, reasonLineBudget, detailLineLimit))
-	_ = w.scalingDetails.SetToolTipText(details)
-	w.scalingDetails.SetVisible(details != "")
-
-	override := scalingOverrideText()
-	_ = w.scalingOverride.SetText(fitText(override, reasonLineBudget, overrideLineLimit))
-	_ = w.scalingOverride.SetToolTipText(override)
+	_ = w.menuScalingAction.SetText(scalingMenuText)
 }
 
 // scalingAdviceText is the button's own explanation. Scaling measurements and the
-// permanent override warning have dedicated visible rows so neither can be pushed into
-// a tooltip by a long driver refusal.
+// permanent override warning have dedicated visible rows in the dialog, so neither can
+// be pushed into a tooltip by a long driver refusal.
 func (w *window) scalingAdviceText(snapshot app.Snapshot) string {
 	return w.scalingButtonNote(snapshot)
 }
@@ -1139,16 +1123,17 @@ func (w *window) applyEnabled(snapshot app.Snapshot) {
 	available := w.availableControls(snapshot)
 
 	w.toggle.SetEnabled(available.toggle)
-	w.restoreButton.SetEnabled(available.restore)
-	w.refreshButton.SetEnabled(available.refresh)
-	w.openFolderButton.SetEnabled(available.openFolder)
-	w.resetButton.SetEnabled(available.reset)
-	w.resetButton.SetVisible(w.configState == configStateReadOnly)
 	w.settingsButton.SetEnabled(available.settings)
-	w.watchedButton.SetEnabled(available.watched)
-	_ = w.watchedButton.SetToolTipText(watchedButtonReason(snapshot))
-	w.scalingButton.SetEnabled(available.scalingApply || available.scalingRestore)
 	w.hideButton.SetEnabled(available.hide)
+
+	_ = w.menuRestoreAction.SetEnabled(available.restore)
+	_ = w.menuRefreshAction.SetEnabled(available.refresh)
+	_ = w.menuScalingAction.SetEnabled(available.scalingApply || available.scalingRestore)
+	_ = w.menuSettingsAction.SetEnabled(available.settings)
+	_ = w.menuWatchedAction.SetEnabled(available.watched)
+	_ = w.menuOpenAction.SetEnabled(available.openFolder)
+	_ = w.menuResetAction.SetEnabled(available.reset)
+	_ = w.menuResetAction.SetVisible(w.configState == configStateReadOnly)
 
 	_ = w.showAction.SetEnabled(available.show)
 	_ = w.enableAction.SetEnabled(available.enable)
@@ -1556,3 +1541,9 @@ func watchedProcess(snapshot app.Snapshot) string {
 	}
 	return "監看的程式"
 }
+
+// WindowTitle is the main window's caption, exported for the single-instance check in
+// the composition root: a second copy finds the first one by it and brings it forward
+// rather than exiting silently, which from the outside is indistinguishable from the
+// launcher having done nothing at all.
+const WindowTitle = windowTitle

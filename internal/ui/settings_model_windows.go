@@ -89,7 +89,16 @@ func newSettingsModel(
 		selectedMonitor: -1,
 	}
 	if profile.Monitor.InstancePath == "" && profile.Monitor.HardwareID == "" {
-		model.draft.RestoreDelay = domain.LegacySeedProfile().RestoreDelay
+		seed := domain.LegacySeedProfile()
+		model.draft.RestoreDelay = seed.RestoreDelay
+		// The watched process is seeded on a first run whatever monitors are attached.
+		// prefillLegacy only fires on the machine the tool was written for -- it wants a
+		// particular panel running a particular mode -- and the executable has nothing
+		// to do with either. It is a starting point the user edits, not a decision:
+		// every other field still has to be chosen before the dialog will save.
+		if strings.TrimSpace(model.draft.ProcessName) == "" {
+			model.draft.ProcessName = seed.ProcessName
+		}
 	}
 	return model
 }

@@ -120,3 +120,46 @@ func TestAnUnreadableProcessListStillExplainsItself(t *testing.T) {
 		t.Fatalf("a typed name was refused when the list was unreadable: %q %v", name, err)
 	}
 }
+
+// The three things the tool has to admit about GPU scaling moved off the main window
+// and into the dialog the menu opens. They must arrive there whole: the rule was never
+// "put them on the main window", it was "put them where the control is", and a dialog
+// that dropped one would be the tooltip-only failure that rule exists to prevent.
+func TestTheScalingDialogCarriesEveryAdmissionTheButtonOwes(t *testing.T) {
+	w := &window{configState: configStateConfigured}
+	snapshot := scalingReadySnapshot()
+	snapshot.Managed, snapshot.AtGameMode = true, true
+	w.updateScalingAvailability(snapshot)
+
+	view := w.scalingViewFor(snapshot)
+
+	if view.value != scalingText(snapshot) {
+		t.Fatalf("value = %q, want the read-back line", view.value)
+	}
+	if view.button != scalingButtonText(snapshot) {
+		t.Fatalf("button = %q", view.button)
+	}
+	if view.details != scalingDetailsText(snapshot) || view.details == "" {
+		t.Fatalf("details = %q, want the measured reminder", view.details)
+	}
+	if view.override != scalingOverrideNote {
+		t.Fatalf("override = %q, want the non-persistence note", view.override)
+	}
+	if !view.enabled {
+		t.Fatal("an applied mode disabled the scaling action, which is when it is for")
+	}
+}
+
+// The dialog's action is disabled for the same reasons the button was. A dialog that
+// offered the write anyway would run it and have it refused somewhere the user cannot
+// see the reason.
+func TestTheScalingDialogActionIsOffWhileRecoveryIsPending(t *testing.T) {
+	w := &window{configState: configStateConfigured}
+	snapshot := scalingReadySnapshot()
+	snapshot.RecoveryPending = true
+	w.updateScalingAvailability(snapshot)
+
+	if view := w.scalingViewFor(snapshot); view.enabled {
+		t.Fatal("a pending display recovery left the scaling action live")
+	}
+}

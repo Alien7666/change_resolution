@@ -40,8 +40,16 @@ func TestSettingsSectionsUnlockOnlyAfterThePreviousChoiceIsValid(t *testing.T) {
 	if err := flow.SelectMode(mode); err != nil {
 		t.Fatalf("SelectMode: %v", err)
 	}
-	if gates := flow.Gates(); !gates.Mode || !gates.Process || gates.Save {
+	// A first run opens with the watched process seeded, so the last gate is already
+	// satisfied by the time the mode is chosen. The chain is still a chain -- the
+	// process section stayed locked until the mode was valid -- and the case where
+	// nothing is chosen is covered by clearing it below.
+	if gates := flow.Gates(); !gates.Mode || !gates.Process || !gates.Save {
 		t.Fatalf("mode-selected gates = %+v", gates)
+	}
+	flow.SetProcessName("")
+	if gates := flow.Gates(); gates.Save || gates.Reason != missingProcessChoice {
+		t.Fatalf("an emptied process left save unlocked: %+v", gates)
 	}
 	flow.UseManualOnly()
 	if gates := flow.Gates(); !gates.Save {
@@ -188,6 +196,9 @@ func TestBlockedSaveAlwaysCarriesTheSentenceThatUnblocksIt(t *testing.T) {
 	if err := flow.SelectMode(mode); err != nil {
 		t.Fatalf("SelectMode: %v", err)
 	}
+	// The seeded name is cleared, which is what a user who does not want it does.
+	// That is the state this test is about: blocked, and saying so.
+	flow.SetProcessName("")
 
 	gates := flow.Gates()
 	if gates.Save {
@@ -343,7 +354,9 @@ func TestADraftCarryingAProcessNameCountsAsChosenHoweverItGotThere(t *testing.T)
 }
 
 // An empty name is ambiguous on its own: it is either "watch nothing" or "not there
-// yet". Only the deliberate choice unlocks save.
+// yet". Only the deliberate choice unlocks save. A first run opens with the process
+// seeded, so reaching that ambiguity means clearing it -- which is exactly what a user
+// who does not want the seeded game does.
 func TestAnEmptyProcessNameOnlyCountsWhenItWasChosenDeliberately(t *testing.T) {
 	model, _, mode := dialogFlowFixture(t)
 	flow := newSettingsDialogFlow(model, func(domain.Profile) error { return nil })
@@ -353,9 +366,10 @@ func TestAnEmptyProcessNameOnlyCountsWhenItWasChosenDeliberately(t *testing.T) {
 	if err := flow.SelectMode(mode); err != nil {
 		t.Fatalf("SelectMode: %v", err)
 	}
+	flow.SetProcessName("")
 
 	if gates := flow.Gates(); gates.Save {
-		t.Fatalf("an untouched process step unlocked save: %+v", gates)
+		t.Fatalf("an emptied process step unlocked save: %+v", gates)
 	}
 
 	flow.UseManualOnly()
